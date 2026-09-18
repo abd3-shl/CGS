@@ -1,7 +1,7 @@
 """
 Punto di ingresso dell'applicazione: interfaccia grafica Tkinter che
 permette di caricare uno script testuale e generare un video con audio
-narrato (ElevenLabs) e sottotitoli sincronizzati (Groq Whisper + Pillow),
+narrato (ElevenLabs) e sottotitoli animati per-parola (Groq Whisper + Pillow),
 composto sullo sfondo del tema tramite ffmpeg.
 
 Pipeline eseguita in un thread separato per non bloccare la GUI:
@@ -10,10 +10,11 @@ Pipeline eseguita in un thread separato per non bloccare la GUI:
   3. Generazione audio (ElevenLabs)
   4. Trascrizione con timestamp parola-per-parola (Groq Whisper)
   5. Allineamento trascrizione allo script originale (corregge errori Whisper)
+  5.5 Pianificazione personaggi 2D (Groq + fallback deterministico, non bloccante)
   6. Raggruppamento in chunk da 2-3 parole per enfasi (LLM + fallback)
   7. Estrazione parole chiave (Groq gpt-oss-120b) con colori del tema
-  8. Rendering PNG dei sottotitoli (Pillow)
-  9. Composizione video finale (ffmpeg)
+  8. Rendering frame animati per-parola (Pillow + easing, Fase 3)
+  9. Composizione video finale (ffmpeg: micro-video WebM per chunk + overlay unico)
 """
 
 import os
@@ -27,9 +28,15 @@ from core.transcription import transcribe_audio, TranscriptionError
 from core.alignment import align_transcript, AlignmentError
 from core.theme import generate_theme, hex_to_rgba
 from core.emphasis_grouping import group_words_by_emphasis
+from core.character_selector import (
+    enrich_chunks_with_characters,
+    plan_character_layout,
+)
 from core.keywords import extract_keywords, KeywordError
 from core.renderer import render_all_subtitles
+from core.text_animator import render_all_chunks_animated, TextAnimationError
 from core.video_builder import build_video, cleanup_temp_files, VideoBuildError
+from config import TEMP_DIR, VIDEO_FPS, TEXT_ANIMATION_ENABLED, CHARACTER_ENABLED
 
 
 class VideoGeneratorApp:
@@ -194,6 +201,27 @@ class VideoGeneratorApp:
             chunks = group_words_by_emphasis(words, on_attempt=self._log_attempt)
             self._log(f"      Creati {len(chunks)} blocchi di sottotitoli.")
 
+            self._log("[5.5/8] Pianificazione personaggi 2D (pose/layout)...")
+            if CHARACTER_ENABLED:
+                try:
+                    character_plan = plan_character_layout(
+                        chunks, script_text, on_attempt=self._log_attempt
+                    )
+                    chunks = enrich_chunks_with_characters(chunks, character_plan)
+                    for entry in character_plan[:10]:
+                        self._log(
+                            f"      chunk {entry['chunk_index']}: posa {entry['pose']} "
+                            f"({entry.get('layout_preset', entry.get('position'))}, "
+                            f"{entry.get('transition_in', entry.get('transition'))})"
+                        )
+                    if len(character_plan) > 10:
+                        self._log(f"      ... (+{len(character_plan) - 10} chunk)")
+                except Exception as e:
+                    # Non bloccante: il video viene generato senza personaggi.
+                    self._log(f"      ⚠️ Personaggi saltati ({e}), proseguo senza overlay.")
+            else:
+                self._log("      Personaggi disabilitati (CHARACTER_ENABLED=0).")
+
             self._log("[6/8] Estrazione parole chiave (Groq gpt-oss-120b)...")
             try:
                 keyword_colors = extract_keywords(
@@ -207,11 +235,33 @@ class VideoGeneratorApp:
                 self._log(f"      ⚠️ Keyword saltate ({e}), proseguo senza evidenziazioni.")
                 keyword_colors = {}
 
-            self._log("[7/8] Rendering immagini sottotitoli (Pillow)...")
-            enriched_chunks = render_all_subtitles(chunks, keyword_colors, text_rgba)
-            self._log("      Immagini generate.")
+            self._log("[7/8] Rendering sottotitoli animati per-parola (Pillow+easing)...")
+            if TEXT_ANIMATION_ENABLED:
+                try:
+                    def _on_chunk_done(done: int, total: int):
+                        # Log leggero ogni 10 chunk per non spammare la GUI.
+                        if done == 1 or done == total or done % 10 == 0:
+                            self._log(f"      ... chunk animato {done}/{total}")
+                    enriched_chunks = render_all_chunks_animated(
+                        chunks,
+                        background_color=theme["background_color"],
+                        text_color=theme["text_color"],
+                        keyword_colors=keyword_colors,
+                        output_dir=TEMP_DIR,
+                        fps=VIDEO_FPS,
+                        on_chunk=_on_chunk_done,
+                    )
+                    total_frames = sum(len(c.get("frames", [])) for c in enriched_chunks)
+                    self._log(f"      Frame animati generati: {total_frames} ({len(enriched_chunks)} chunk).")
+                except TextAnimationError as e:
+                    self._log(f"      ⚠️ Animazione fallita ({e}), fallback a PNG statici.")
+                    enriched_chunks = render_all_subtitles(chunks, keyword_colors, text_rgba)
+                    self._log("      Immagini statiche generate (fallback).")
+            else:
+                enriched_chunks = render_all_subtitles(chunks, keyword_colors, text_rgba)
+                self._log("      Immagini statiche generate (animazioni disabilitate).")
 
-            self._log("[8/8] Composizione video finale con ffmpeg...")
+            self._log("[8/8] Composizione video finale con ffmpeg (micro-video + overlay)...")
             output_path = build_video(
                 audio_path, enriched_chunks,
                 background_color=theme["background_color"],
@@ -222,19 +272,22 @@ class VideoGeneratorApp:
             self._log("File temporanei rimossi.")
 
             self._log("\n✅ Video generato con successo!")
-            self.root.after(0, lambda: messagebox.showinfo(
-                "Completato",
-                f"Video generato con successo:\n{output_path}"
-            ))
+            done_msg = f"Video generato con successo:\n{output_path}"
+            self.root.after(0, lambda msg=done_msg: messagebox.showinfo("Completato", msg))
 
         except (TTSError, TranscriptionError, VideoBuildError) as e:
-            self._log(f"\n❌ Errore: {e}")
-            self.root.after(0, lambda: messagebox.showerror("Errore", str(e)))
+            # NOTA: `e` viene cancellata all'uscita dell'except (del implicito di
+            # Python): la lambda di root.after gira DOPO, quindi il messaggio va
+            # catturato subito in una variabile locale (niente late binding su `e`).
+            err_msg = str(e)
+            self._log(f"\n❌ Errore: {err_msg}")
+            self.root.after(0, lambda msg=err_msg: messagebox.showerror("Errore", msg))
 
         except Exception as e:
             tb = traceback.format_exc()
-            self._log(f"\n❌ Errore inatteso: {e}\n{tb}")
-            self.root.after(0, lambda: messagebox.showerror("Errore inatteso", str(e)))
+            err_msg = str(e)  # vedi nota sopra: cattura eager, `e` non sopravvive all'except
+            self._log(f"\n❌ Errore inatteso: {err_msg}\n{tb}")
+            self.root.after(0, lambda msg=err_msg: messagebox.showerror("Errore inatteso", msg))
 
         finally:
             self._set_ui_busy(False)

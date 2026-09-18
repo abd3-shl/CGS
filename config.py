@@ -11,6 +11,7 @@ Priorità dei valori:
 
 import os
 import sys
+from pathlib import Path
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 ENV_PATH = os.path.join(BASE_DIR, ".env")
@@ -63,6 +64,13 @@ _load_env_file()
 def _get_int(key: str, default: int) -> int:
     try:
         return int(os.environ.get(key, default))
+    except (TypeError, ValueError):
+        return default
+
+
+def _get_float(key: str, default: float) -> float:
+    try:
+        return float(os.environ.get(key, default))
     except (TypeError, ValueError):
         return default
 
@@ -199,6 +207,28 @@ SUBTITLE_STROKE_COLOR = _get_tuple("SUBTITLE_STROKE_COLOR", (0, 0, 0, 255))  # c
 SUBTITLE_STROKE_WIDTH = _get_int("SUBTITLE_STROKE_WIDTH", 0)  # 0 = nessun contorno sul testo
 SUBTITLE_MAX_CHARS = _get_int("SUBTITLE_MAX_CHARS", 38)   # lunghezza massima approx per chunk di sottotitolo
 SUBTITLE_MAX_WORDS = _get_int("SUBTITLE_MAX_WORDS", 7)    # numero massimo di parole per chunk
+
+# ---- Animazioni testo per-parola (Fase 3) ----
+TEXT_ANIMATION_ENABLED = os.environ.get("TEXT_ANIMATION_ENABLED", "1").strip().lower() not in ("0", "false", "no", "off", "")
+TEXT_ANIMATION_ENTRY_DURATION = _get_float("TEXT_ANIMATION_ENTRY_DURATION", 0.18)  # secondi, durata entrata singola parola
+TEXT_ANIMATION_EXIT_DURATION = _get_float("TEXT_ANIMATION_EXIT_DURATION", 0.15)  # secondi, durata fade-out di gruppo
+KEYWORD_ENTRY_SCALE_FROM = _get_float("KEYWORD_ENTRY_SCALE_FROM", 0.7)  # scala iniziale entrata keyword (0.7 -> 1.0)
+
+# ---- Personaggi 2D "Character-Driven Overlay" ----
+# 1 = personaggi sovrapposti tra sfondo e sottotitoli, 0 = video senza personaggi.
+CHARACTER_ENABLED = os.environ.get("CHARACTER_ENABLED", "1").strip().lower() not in ("0", "false", "no", "off", "")
+# Cartella asset personaggi (pose 1.jpg ... 5.jpg; supportati anche .png/.jpeg).
+CHARACTERS_DIR = Path(BASE_DIR) / "assets" / "characters"
+# Posizionamenti e transizioni validi (cfr. core/character_selector.py).
+CHARACTER_VALID_POSITIONS: list[str] = ["bottom_center", "bottom_left", "bottom_right", "side_left", "side_right"]
+CHARACTER_VALID_TRANSITIONS: list[str] = ["slide_up", "slide_side", "fade", "none"]
+# N. pose disponibili (1.jpg ... 5.jpg) e scala relativa all'altezza 1920px.
+CHARACTER_POSE_COUNT = _get_int("CHARACTER_POSE_COUNT", 5)
+CHARACTER_SCALE_MIN = _get_float("CHARACTER_SCALE_MIN", 0.65)
+CHARACTER_SCALE_MAX = _get_float("CHARACTER_SCALE_MAX", 0.90)
+# Alias storici (retrocompatibilita').
+CHARACTER_POSITIONS = CHARACTER_VALID_POSITIONS
+CHARACTER_TRANSITIONS = CHARACTER_VALID_TRANSITIONS
 
 # ---- Percorsi progetto ----
 OUTPUT_DIR = os.environ.get("OUTPUT_DIR", os.path.join(BASE_DIR, "outputs"))

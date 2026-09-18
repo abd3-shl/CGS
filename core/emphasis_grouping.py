@@ -41,10 +41,20 @@ def _is_weak(word: str) -> bool:
 
 
 def _make_chunk(group: list[dict]) -> dict:
+    """Crea un chunk con testo/timing + parole individuali timestampate.
+
+    La chiave "words" (lista di {"word", "start", "end"}) serve alla Fase 3
+    (animazioni per-parola in core/text_animator.py): ogni parola entra
+    al suo timestamp individuale, il layout resta fisso.
+    """
     return {
         "text": " ".join(w["word"].strip() for w in group),
         "start": group[0]["start"],
         "end": group[-1]["end"],
+        "words": [
+            {"word": w["word"], "start": w["start"], "end": w["end"]}
+            for w in group
+        ],
     }
 
 
@@ -109,7 +119,9 @@ def group_words_by_emphasis(
 ) -> list[dict]:
     """Raggruppa le parole timestampate in chunk brevi (2-3 parole) per enfasi.
 
-    Stesso formato di output di subtitle_grouping.group_words_into_subtitles.
+    Stesso formato di output di subtitle_grouping.group_words_into_subtitles,
+    piu' la chiave "words" con le singole parole timestampate
+    ({"word", "start", "end"}) per le animazioni per-parola (Fase 3).
     Non solleva mai per errori API/validazione: usa il fallback deterministico.
     """
     if not words:
