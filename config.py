@@ -230,6 +230,35 @@ CHARACTER_SCALE_MAX = _get_float("CHARACTER_SCALE_MAX", 0.90)
 CHARACTER_POSITIONS = CHARACTER_VALID_POSITIONS
 CHARACTER_TRANSITIONS = CHARACTER_VALID_TRANSITIONS
 
+# ---- Semantic Typography Engine v1 ----
+# 1 = font/colori/dimensioni per nicchia + tagging LLM (base/impact/accent),
+# 0 = path legacy (singolo font + keyword palette).
+# Look pulito stile TikTok: NESSUN contorno nero (stroke=0) e NESSUNA ombra
+# di default. La leggibilità è garantita dal contrasto tema (sfondo/testo
+# validato in core/theme.py) + pill semi-trasparente sul preset punch-in.
+TYPOGRAPHY_ENGINE_ENABLED = os.environ.get("TYPOGRAPHY_ENGINE_ENABLED", "1").strip().lower() not in ("0", "false", "no", "off", "")
+TYPOGRAPHY_BASE_FONT_SIZE = _get_int("TYPOGRAPHY_BASE_FONT_SIZE", 60)  # px, prima di font_scale del preset
+TYPOGRAPHY_IMPACT_SCALE = _get_float("TYPOGRAPHY_IMPACT_SCALE", 1.4)  # 1.3x-1.5x da spec
+TYPOGRAPHY_ACCENT_SCALE = _get_float("TYPOGRAPHY_ACCENT_SCALE", 1.1)
+TYPOGRAPHY_STROKE_WIDTH = _get_int("TYPOGRAPHY_STROKE_WIDTH", 0)  # 0 = nessun contorno (look pulito)
+TYPOGRAPHY_SHADOW_ENABLED = os.environ.get("TYPOGRAPHY_SHADOW_ENABLED", "0").strip().lower() not in ("0", "false", "no", "off", "")
+TYPOGRAPHY_SHADOW_OFFSET = _get_tuple("TYPOGRAPHY_SHADOW_OFFSET", (3, 3))
+TYPOGRAPHY_SHADOW_FILL = _get_tuple("TYPOGRAPHY_SHADOW_FILL", (0, 0, 0, 180))
+# Cartella font scaricati (vedi core/font_manager.py).
+FONTS_DIR = Path(BASE_DIR) / "assets" / "fonts"
+
+# ---- Struttura narrativa hook / corpo a beat / CTA ----
+# 1 = il video viene letto come struttura in 3 atti (hook, corpo a beat,
+# CTA-outro) con tecniche dedicate per atto e finale stabilizzato;
+# 0 = pipeline piatta legacy (nessuna differenziazione).
+NARRATIVE_ENABLED = os.environ.get("NARRATIVE_ENABLED", "1").strip().lower() not in ("0", "false", "no", "off", "")
+NARRATIVE_HOOK_MAX_CHUNKS = _get_int("NARRATIVE_HOOK_MAX_CHUNKS", 3)  # hook = prime 1-3 caption
+NARRATIVE_CTA_MAX_CHUNKS = _get_int("NARRATIVE_CTA_MAX_CHUNKS", 4)  # CTA = ultime 1-4 caption con segnali
+NARRATIVE_CTA_CARD = os.environ.get("NARRATIVE_CTA_CARD", "1").strip().lower() not in ("0", "false", "no", "off", "")
+NARRATIVE_CTA_CARD_MAX_WORDS = _get_int("NARRATIVE_CTA_CARD_MAX_WORDS", 14)  # card persistente solo se CTA breve
+NARRATIVE_HOOK_ENTRY_MULT = _get_float("NARRATIVE_HOOK_ENTRY_MULT", 0.7)  # hook più scattante (0.7x durata entrata)
+NARRATIVE_HOOK_POP_FROM = _get_float("NARRATIVE_HOOK_POP_FROM", 0.55)  # pop hook più marcato (0.55 -> 1.0)
+
 # ---- Percorsi progetto ----
 OUTPUT_DIR = os.environ.get("OUTPUT_DIR", os.path.join(BASE_DIR, "outputs"))
 TEMP_DIR = os.environ.get("TEMP_DIR", os.path.join(BASE_DIR, "temp"))

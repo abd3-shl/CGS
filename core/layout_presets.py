@@ -1,35 +1,50 @@
 """
-Dynamic Layout & Smart Subtitles: preset di scena a "zone" (1080x1920).
+Dynamic Layout & Smart Text Zones: preset di scena a "zone" (1080x1920).
 
-Il personaggio e il testo si spartiscono lo schermo: ogni preset definisce
-l'altezza del personaggio, il suo ancoraggio (anche fuori campo per l'effetto
-"mezzo busto") e la Text Safe Area in cui i sottotitoli vengono wrappati e
-centrati, senza mai sovrapporsi al viso/petto del personaggio.
+Niente figura intera: i personaggi sono ingranditi in scala su larghezza
+(120-180% dello schermo) e ancorati dal basso con le gambe fuori inquadratura
+(i piedi non sono MAI visibili, la testa resta sempre in campo con una
+headroom configurabile). Il cropping e' solo compositivo: le coordinate
+(X, Y) possono uscire dal canvas e il paste ritaglia il visibile.
 
-Preset (vedi `LAYOUT_PRESETS`):
-- `layout_split_left`:   personaggio grande a sinistra (spalla tagliata fuori
-  campo), testo nella meta' destra. Transizione naturale: slide_from_left.
-- `layout_split_right`:  speculare (personaggio a destra, testo a sinistra).
-  Ideale con la posa 4 ("indicare"): il personaggio indica verso il testo.
-- `layout_bottom_focus`: figura intera in basso al centro, testo nella meta'
-  superiore (Y 200-800). Transizione naturale: slide_up.
-- `layout_closeup_center`: busto/testa massicci al centro, testo in
-  sovrimpressione bassa con pill semi-trasparente per la leggibilita'.
+Preset (canvas 1080x1920, asset di riferimento 768x1376 figura intera):
+- `layout_center_standard`: 125% larghezza, centrato in basso (mezza figura,
+  testa-busto-fianchi). Testo in alto (Y 150-900).
+- `layout_center_punch_in`: 170% larghezza (primo piano busto/testa).
+  Testo nel terzo superiore in sovrimpressione con pill ad alto contrasto.
+- `layout_split_left`: 130% larghezza, spalla sinistra fuori campo
+  (overhang negativo). Testo a destra (X 640-1000, banda centrale).
+- `layout_split_right`: speculare (testo a sinistra, X 80-420).
+  Con la posa 4 ("indicare") il personaggio indica verso il testo.
 
-Il cropping e' solo compositivo: le coordinate (X, Y) possono uscire dal
-canvas (X < 0, X + W > 1080, Y + H > 1920) e il paste ritaglia il visibile,
-creando il "mezzo busto" senza tagliare fisicamente l'asset.
+Punch-in: flag per-chunk (jump-cut con ingrandimento improvviso per enfasi,
+max 2 per video). Su un preset normale applica PUNCH_IN_FACTOR alle
+dimensioni; sul preset punch_in la scala e' gia' ravvicinata.
+
+Geometria misurata sugli asset (testa src x300-470/y130-340, spalle da y380):
+le safe area sono scelte per non sovrapporsi mai al volto/busto; il text
+engine e il character engine risolvono entrambi da `resolve_chunk_layout`
+(vedi core/character_selector.py), quindi non possono divergere.
+
+Margini/padding configurabili: SPLIT_OVERHANG_X, SAFE_AREA inset nei box,
+TEXT_PILL_*.
 """
 
 from config import VIDEO_HEIGHT, VIDEO_WIDTH
 
 # Nomi preset validi (ordine stabile, usato anche dal fallback deterministico).
 VALID_LAYOUT_PRESETS: list[str] = [
+    "layout_center_standard",
+    "layout_center_punch_in",
     "layout_split_left",
     "layout_split_right",
-    "layout_bottom_focus",
-    "layout_closeup_center",
 ]
+
+# Vecchi nomi (sistema a zone v1): ancora accettati, mappati sui nuovi.
+DEPRECATED_PRESET_ALIASES: dict[str, str] = {
+    "layout_bottom_focus": "layout_center_standard",
+    "layout_closeup_center": "layout_center_punch_in",
+}
 
 # Transizioni di ingresso valide (nuovo sistema a zone).
 VALID_TRANSITION_IN: list[str] = [
@@ -51,57 +66,79 @@ LEGACY_TRANSITION_MAP: dict[str, str | None] = {
 }
 
 # Posizioni legacy v1 -> preset piu' vicino (per output LLM in formato vecchio
-# o chunk arricchiti senza layout_preset: nessuna regressione).
+# o chunk arricchiti senza layout: nessuna regressione).
 LEGACY_POSITION_TO_PRESET: dict[str, str] = {
     "bottom_left": "layout_split_left",
     "side_left": "layout_split_left",
     "bottom_right": "layout_split_right",
     "side_right": "layout_split_right",
-    "bottom_center": "layout_bottom_focus",
+    "bottom_center": "layout_center_standard",
 }
 
-# Altezze personaggio dettate dai preset (px su canvas 1920).
-PRESET_CHAR_HEIGHT: dict[str, int] = {
-    "layout_split_left": 1300,
-    "layout_split_right": 1300,
-    "layout_bottom_focus": 1000,
-    "layout_closeup_center": 1600,
+# --- Scala personaggio: percentuale della LARGHEZZA schermo ---
+PRESET_WIDTH_PCT: dict[str, float] = {
+    "layout_center_standard": 1.25,
+    "layout_center_punch_in": 1.70,
+    "layout_split_left": 1.30,
+    "layout_split_right": 1.30,
 }
 
-# Text Safe Area per preset: (x_min, y_min, x_max, y_max) sul canvas 1080x1920.
+# Moltiplicatore punch-in su preset normali (jump-cut di ingrandimento).
+PUNCH_IN_FACTOR: float = 1.35
+# Max punch-in per video (frasi chiave / rivelazioni / CTA finali).
+MAX_PUNCH_INS_PER_VIDEO: int = 2
+
+# --- Ancoraggio verticale: headroom px dal bordo superiore al top asset ---
+# (il fondo esce sempre sotto canvas_h: gambe/piedi fuori inquadratura).
+PRESET_HEADROOM_PX: dict[str, int] = {
+    "layout_center_standard": 500,
+    "layout_center_punch_in": 110,
+    "layout_split_left": 250,
+    "layout_split_right": 250,
+}
+
+# --- Ancoraggio orizzontale split: spalla fuori campo (px su 1080) ---
+SPLIT_OVERHANG_X: int = 420
+
+# Text Safe Area per preset: (x_min, y_min, x_max, y_max) su 1080x1920.
 PRESET_SAFE_AREA: dict[str, tuple[int, int, int, int]] = {
-    "layout_split_left": (560, 480, 1040, 1440),    # meta' destra
-    "layout_split_right": (40, 480, 520, 1440),     # meta' sinistra
-    "layout_bottom_focus": (90, 200, 990, 800),     # meta' superiore
-    "layout_closeup_center": (90, 1500, 990, 1820),  # fascia bassa estrema
+    "layout_center_standard": (90, 150, 990, 900),    # meta' superiore
+    "layout_center_punch_in": (90, 150, 990, 640),    # terzo superiore (+pill)
+    "layout_split_left": (640, 560, 1000, 940),       # destra, banda centrale
+    "layout_split_right": (80, 560, 420, 940),        # sinistra, banda centrale
+}
+
+# Scala font per preset (box stretti degli split -> testo leggermente minore).
+PRESET_FONT_SCALE: dict[str, float] = {
+    "layout_center_standard": 1.0,
+    "layout_center_punch_in": 1.0,
+    "layout_split_left": 0.9,
+    "layout_split_right": 0.9,
 }
 
 # Lato del personaggio (guida le transizioni direzionali e gli exit).
 PRESET_SIDE: dict[str, str] = {
+    "layout_center_standard": "center",
+    "layout_center_punch_in": "center",
     "layout_split_left": "left",
     "layout_split_right": "right",
-    "layout_bottom_focus": "center",
-    "layout_closeup_center": "center",
 }
 
 # Transizione di ingresso di default per preset.
 PRESET_DEFAULT_TRANSITION_IN: dict[str, str] = {
+    "layout_center_standard": "slide_up",
+    "layout_center_punch_in": "fade",
     "layout_split_left": "slide_from_left",
     "layout_split_right": "slide_from_right",
-    "layout_bottom_focus": "slide_up",
-    "layout_closeup_center": "fade",
 }
 
-# Preset che richiedono la pill semi-trasparente dietro il testo.
+# Preset che richiedono la pill ad alto contrasto dietro il testo.
 PRESET_TEXT_BACKGROUND: dict[str, bool] = {
+    "layout_center_standard": False,
+    "layout_center_punch_in": True,
     "layout_split_left": False,
     "layout_split_right": False,
-    "layout_bottom_focus": False,
-    "layout_closeup_center": True,
 }
-
-# Offset orizzontale fuori campo per gli split (spalla tagliata).
-_SPLIT_OFFSCREEN_X = 180
 
 # Colore/alpha della pill dietro il testo (nero semi-trasparente).
 TEXT_PILL_FILL: tuple[int, int, int, int] = (0, 0, 0, 170)
@@ -110,22 +147,47 @@ TEXT_PILL_RADIUS: int = 36
 
 
 def is_valid_preset(name) -> bool:
-    """Vero se `name` e' un layout preset noto."""
-    return name in VALID_LAYOUT_PRESETS
+    """Vero se `name` e' un layout preset noto (inclusi gli alias deprecati)."""
+    return name in VALID_LAYOUT_PRESETS or name in DEPRECATED_PRESET_ALIASES
 
 
-def normalize_preset(name, fallback: str = "layout_bottom_focus") -> str:
-    """Normalizza il preset (legacy position mappate, ignoti -> fallback)."""
+def normalize_preset(name, fallback: str = "layout_center_standard") -> str:
+    """Normalizza il preset (alias deprecati e position legacy mappate).
+
+    Ritorna sempre un nome canonico di VALID_LAYOUT_PRESETS.
+    """
     if name in VALID_LAYOUT_PRESETS:
         return name
+    if isinstance(name, str) and name in DEPRECATED_PRESET_ALIASES:
+        return DEPRECATED_PRESET_ALIASES[name]
     if isinstance(name, str) and name in LEGACY_POSITION_TO_PRESET:
         return LEGACY_POSITION_TO_PRESET[name]
-    return fallback
+    return fallback if fallback in VALID_LAYOUT_PRESETS else "layout_center_standard"
 
 
-def preset_char_height(name: str) -> int:
-    """Altezza personaggio (px) dettata dal preset."""
-    return PRESET_CHAR_HEIGHT.get(normalize_preset(name), 1000)
+def preset_width_pct(name: str, punch_in: bool = False) -> float:
+    """Percentuale larghezza schermo per il preset (punch_in la amplifica)."""
+    preset = normalize_preset(name)
+    pct = PRESET_WIDTH_PCT.get(preset, 1.25)
+    if punch_in and preset != "layout_center_punch_in":
+        pct *= PUNCH_IN_FACTOR
+    return pct
+
+
+def preset_headroom_px(name: str, canvas_h: int = VIDEO_HEIGHT) -> int:
+    """Headroom (px) per il preset, scalato su canvas diversi da 1080x1920."""
+    preset = normalize_preset(name)
+    base = PRESET_HEADROOM_PX.get(preset, 500)
+    if canvas_h == VIDEO_HEIGHT:
+        return base
+    return int(round(base * canvas_h / VIDEO_HEIGHT))
+
+
+def preset_overhang_x(canvas_w: int = VIDEO_WIDTH) -> int:
+    """Overhang laterale degli split (px), scalato sulla larghezza canvas."""
+    if canvas_w == VIDEO_WIDTH:
+        return SPLIT_OVERHANG_X
+    return int(round(SPLIT_OVERHANG_X * canvas_w / VIDEO_WIDTH))
 
 
 def preset_safe_area(
@@ -138,7 +200,8 @@ def preset_safe_area(
     Le aree sono disegnate per 1080x1920; su canvas diversi vengono scalate
     proporzionalmente (i default di canvas coincidono con le costanti sopra).
     """
-    box = PRESET_SAFE_AREA.get(normalize_preset(name), PRESET_SAFE_AREA["layout_bottom_focus"])
+    box = PRESET_SAFE_AREA.get(
+        normalize_preset(name), PRESET_SAFE_AREA["layout_center_standard"])
     if canvas_w == VIDEO_WIDTH and canvas_h == VIDEO_HEIGHT:
         return box
     sx, sy = canvas_w / VIDEO_WIDTH, canvas_h / VIDEO_HEIGHT
@@ -146,6 +209,14 @@ def preset_safe_area(
         int(round(box[0] * sx)), int(round(box[1] * sy)),
         int(round(box[2] * sx)), int(round(box[3] * sy)),
     )
+
+
+def preset_font_scale(name: str) -> float:
+    """Moltiplicatore dimensione font per il preset (1.0 default)."""
+    try:
+        return float(PRESET_FONT_SCALE.get(normalize_preset(name), 1.0))
+    except (TypeError, ValueError):
+        return 1.0
 
 
 def preset_side(name: str) -> str:
@@ -159,11 +230,11 @@ def preset_default_transition(name: str) -> str:
 
 
 def preset_needs_text_background(name: str) -> bool:
-    """Vero se il testo va protetto con la pill semi-trasparente."""
+    """Vero se il testo va protetto con la pill ad alto contrasto."""
     return bool(PRESET_TEXT_BACKGROUND.get(normalize_preset(name), False))
 
 
-def normalize_transition_in(value, preset_name: str = "layout_bottom_focus") -> str:
+def normalize_transition_in(value, preset_name: str = "layout_center_standard") -> str:
     """Normalizza una transizione al vocabolario del nuovo sistema.
 
     Accetta i nomi nuovi e quelli legacy v1 (slide_up/slide_side/fade/none):
@@ -203,40 +274,18 @@ def legacy_position(preset_name: str) -> str:
     mapping = {
         "layout_split_left": "bottom_left",
         "layout_split_right": "bottom_right",
-        "layout_bottom_focus": "bottom_center",
-        "layout_closeup_center": "bottom_center",
+        "layout_center_standard": "bottom_center",
+        "layout_center_punch_in": "bottom_center",
     }
     return mapping.get(normalize_preset(preset_name), "bottom_center")
-
-
-def layout_character_xy(
-    preset_name: str,
-    image_size: tuple[int, int],
-    canvas_w: int = VIDEO_WIDTH,
-    canvas_h: int = VIDEO_HEIGHT,
-) -> tuple[int, int]:
-    """Coordinate (X, Y) di overlay del personaggio per il preset.
-
-    Possono uscire dal canvas (X < 0, X + W > canvas_w, Y + H > canvas_h):
-    il paste ritaglia il visibile (effetto "mezzo busto" compositivo,
-    nessun taglio fisico dell'asset).
-    """
-    preset = normalize_preset(preset_name)
-    img_w, img_h = int(image_size[0]), int(image_size[1])
-    if preset == "layout_split_left":
-        return (-_SPLIT_OFFSCREEN_X, canvas_h - img_h)
-    if preset == "layout_split_right":
-        return (canvas_w - img_w + _SPLIT_OFFSCREEN_X, canvas_h - img_h)
-    # bottom_focus e closeup: centrati orizzontalmente, ancorati in basso.
-    return ((canvas_w - img_w) // 2, canvas_h - img_h)
 
 
 def describe_preset(name: str) -> str:
     """Riga descrittiva del preset (per prompt LLM e logging)."""
     info = {
-        "layout_split_left": "personaggio grande a SINISTRA (h=1300px), testo a DESTRA",
-        "layout_split_right": "personaggio grande a DESTRA (h=1300px), testo a SINISTRA (ideale posa 4: indica il testo)",
-        "layout_bottom_focus": "figura intera in basso al centro (h=1000px), testo in ALTO (y 200-800)",
-        "layout_closeup_center": "primo piano centrale massiccio (h=1600px, busto/testa), testo in BASSO con sfondo semi-trasparente",
+        "layout_center_standard": "mezza figura centrata in basso (125% larghezza), testo in ALTO (y 150-900)",
+        "layout_center_punch_in": "PRIMO PIANO busto/testa (170% larghezza), testo nel terzo superiore con sfondo ad alto contrasto",
+        "layout_split_left": "personaggio a SINISTRA (130%, spalla fuori campo), testo a DESTRA (ideale posa 4: indica il testo)",
+        "layout_split_right": "personaggio a DESTRA (130%), testo a SINISTRA",
     }
-    return info.get(normalize_preset(name), name)
+    return info.get(normalize_preset(name), str(name))

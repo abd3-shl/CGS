@@ -25,17 +25,18 @@ class KeywordError(Exception):
     pass
 
 
-# Palette storica in hex ("#RRGGBB", mai gialli): usata come default e come
-# integrazione per core/theme.py (importata come _FALLBACK_PALETTE_HEX).
+# Palette premium in hex ("#RRGGBB", mai neon/arcobaleno): usata come default
+# e come integrazione per core/theme.py (importata come _FALLBACK_PALETTE_HEX).
+# Toni smorzati e armonici su sfondi scuri (ori/sky/lavanda/rosa/menta).
 _FALLBACK_PALETTE_HEX: list[str] = [
-    "#00E5FF",  # ciano
-    "#00E676",  # verde
-    "#FF4081",  # magenta
-    "#FF9100",  # arancione
-    "#B388FF",  # viola
-    "#FF5252",  # rosso
-    "#40C4FF",  # azzurro
-    "#64FFDA",  # verde acqua
+    "#D4AF37",  # oro smorzato (hero premium)
+    "#7DD3FC",  # sky soft
+    "#A78BFA",  # lavanda
+    "#FF8FA3",  # rosa soft
+    "#00E5FF",  # ciano tech
+    "#34D399",  # menta
+    "#FFD166",  # oro caldo chiaro
+    "#F5D67B",  # oro tint
 ]
 
 

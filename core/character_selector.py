@@ -3,19 +3,20 @@ Character-Driven Overlay + Dynamic Layout: selezione dinamica dei personaggi 2D.
 
 - `plan_character_layout(chunks, script_text, on_attempt=None)`: usa l'LLM Groq
   (stesso failover multi-key di core/keywords.py) per assegnare a OGNI chunk
-  posa (1-5), `layout_preset` (zona dello schermo, vedi core/layout_presets.py)
-  e `transition_in`. Se l'LLM fallisce o il JSON non e' valido, usa un fallback
-  deterministico. Ogni voce resta retrocompatibile con la v1 (position /
-  transition / scale derivati dal preset).
+  posa (1-5), `layout` (zona dello schermo, vedi core/layout_presets.py) e
+  `punch_in` (bool, jump-cut di ingrandimento per le frasi chiave, max 2 per
+  video). Se l'LLM fallisce o il JSON non e' valido, usa un fallback
+  deterministico. Ogni voce resta retrocompatibile (layout_preset alias,
+  transition_in derivata, position/transition/scale legacy).
 - `resolve_chunk_layout(chunk)`: risolve i metadati effettivi di un chunk
   arricchito (preset -> geometria via layout_presets, oppure legacy v1).
-- `load_and_process_character_image(pose_number, target_height)`: carica
-  `assets/characters/{pose}.jpg` (.png/.jpeg accettati), rimuove lo sfondo
-  nero opaco (RGB < (15,15,15) -> alpha 0) e ridimensiona mantenendo l'aspect
-  ratio in base a `target_height`.
+- `load_character_original(pose_number)`: asset RGBA originale pulito e cachato
+  (base per `calculate_character_transform` in core/renderer.py).
+- `load_and_process_character_image(pose_number, target_height)`: legacy v1
+  (scala su altezza), mantenuto per compatibilita'.
 - `calculate_character_bbox(image_size, position_name, ...)`: posizionamento
   legacy v1 (mantenuto per compatibilita'; col preset si usa
-  `layout_presets.layout_character_xy`).
+  `core/renderer.calculate_character_transform`, width-based).
 
 Mappatura pose (vedi prompt LLM):
   1 (braccia incrociate): presentazioni, hook, affermazioni di fatto.
@@ -23,7 +24,7 @@ Mappatura pose (vedi prompt LLM):
   3 (pollice in su):      soluzioni, conclusioni, cose positive, CTA.
   4 (indicare):           punti chiave, dati, numeri, keyword importanti
                           (SEMPRE con layout_split_left/right: indica il testo).
-  5 (mano al mento):      domande, dubbi, problemi, riflessioni.
+  5 (mano al mento):      domande, dubbi, problemi, riflessioni (prediligi split).
 """
 
 import json
@@ -48,6 +49,7 @@ from config import (
     VIDEO_WIDTH,
 )
 from core.layout_presets import (
+    MAX_PUNCH_INS_PER_VIDEO,
     VALID_LAYOUT_PRESETS,
     legacy_position,
     legacy_transition,
@@ -204,36 +206,34 @@ def _remove_black_background(img_rgba: Image.Image) -> Image.Image:
     return fresh
 
 
-def load_and_process_character_image(pose_number: int, target_height: int) -> Image.Image:
-    """Carica, pulisce (sfondo nero -> trasparente) e ridimensiona la posa.
+# Cache asset originali puliti: {pose: PIL.Image RGBA a dimensione nativa}.
+_original_cache: dict[int, Image.Image] = {}
 
-    Args:
-        pose_number: intero 1..CHARACTER_POSE_COUNT (1.jpg ... 5.jpg).
-        target_height: altezza desiderata in px (larghezza segue l'aspect ratio).
 
-    Returns:
-        Copia PIL.Image RGBA pronta per il paste con maschera.
-
-    Raises:
-        CharacterError: posa fuori range, asset mancante o immagine illeggibile.
-    """
+def _validate_pose(pose_number) -> int:
+    """Valida la posa (solleva CharacterError se fuori range)."""
     try:
         pose = int(pose_number)
     except (TypeError, ValueError):
         raise CharacterError(f"Posa non valida: {pose_number!r}")
     if pose < 1 or pose > CHARACTER_POSE_COUNT:
         raise CharacterError(f"Posa {pose} fuori range 1..{CHARACTER_POSE_COUNT}")
-    try:
-        th = int(target_height)
-    except (TypeError, ValueError):
-        raise CharacterError(f"target_height non valido: {target_height!r}")
-    if th <= 0:
-        raise CharacterError(f"target_height deve essere > 0 (ricevuto {target_height!r})")
+    return pose
 
-    cached = _image_cache.get((pose, th))
+
+def load_character_original(pose_number: int) -> Image.Image:
+    """Carica l'asset RGBA originale (pulito, dimensione nativa), cachato.
+
+    Base per `core/renderer.calculate_character_transform` (scala width-based
+    del sistema a zone). Ritorna una copia; l'originale resta in cache.
+
+    Raises:
+        CharacterError: posa fuori range, asset mancante o illeggibile.
+    """
+    pose = _validate_pose(pose_number)
+    cached = _original_cache.get(pose)
     if cached is not None:
         return cached.copy()
-
     path = resolve_character_path(pose)
     if path is None:
         searched = str(Path(CHARACTERS_DIR) / f"{pose}.jpg")
@@ -247,12 +247,41 @@ def load_and_process_character_image(pose_number: int, target_height: int) -> Im
             img.load()
     except Exception as e:
         raise CharacterError(f"Impossibile leggere {path}: {e}")
-
+    if img.size[0] <= 0 or img.size[1] <= 0:
+        raise CharacterError(f"Dimensioni immagine non valide per posa {pose}: {img.size}")
     img = _remove_black_background(img)
+    _original_cache[pose] = img
+    return img.copy()
+
+
+def load_and_process_character_image(pose_number: int, target_height: int) -> Image.Image:
+    """Carica, pulisce (sfondo nero -> trasparente) e ridimensiona la posa.
+
+    Args:
+        pose_number: intero 1..CHARACTER_POSE_COUNT (1.jpg ... 5.jpg).
+        target_height: altezza desiderata in px (larghezza segue l'aspect ratio).
+
+    Returns:
+        Copia PIL.Image RGBA pronta per il paste con maschera.
+
+    Raises:
+        CharacterError: posa fuori range, asset mancante o immagine illeggibile.
+    """
+    pose = _validate_pose(pose_number)
+    try:
+        th = int(target_height)
+    except (TypeError, ValueError):
+        raise CharacterError(f"target_height non valido: {target_height!r}")
+    if th <= 0:
+        raise CharacterError(f"target_height deve essere > 0 (ricevuto {target_height!r})")
+
+    cached = _image_cache.get((pose, th))
+    if cached is not None:
+        return cached.copy()
+
+    img = load_character_original(pose)
 
     w, h = img.size
-    if h <= 0 or w <= 0:
-        raise CharacterError(f"Dimensioni immagine non valide per posa {pose}: {img.size}")
     if h != th:
         ratio = th / float(h)
         new_w = max(1, int(round(w * ratio)))
@@ -267,8 +296,9 @@ def load_and_process_character_image(pose_number: int, target_height: int) -> Im
 
 
 def clear_character_cache() -> None:
-    """Svuota la cache immagini (utile nei test)."""
+    """Svuota le cache immagini (originali + ridimensionate, utile nei test)."""
     _image_cache.clear()
+    _original_cache.clear()
 
 
 # ------------------------------------------------------------ Validazione piano
@@ -284,27 +314,214 @@ def _clamp_scale(value) -> float:
 def _preset_for_pose(pose: int, alternate: int = 0) -> str:
     """Preset deterministico per posa (fallback e normalizzazione).
 
-    Posa 4 -> split alternati (indica il testo); posa 3 -> closeup d'enfasi;
-    posa 5 -> figura intera con testo in alto; altre -> rotazione split/bottom.
+    Posa 4 -> split alternati (indica il testo); posa 5 -> split laterali;
+    posa 3 -> mezza figura centrale; altre -> rotazione standard/split.
     """
     if pose == 4:
         return "layout_split_right" if alternate % 2 == 0 else "layout_split_left"
-    if pose == 3:
-        return "layout_closeup_center"
     if pose == 5:
-        return "layout_bottom_focus"
-    cycle = ["layout_split_left", "layout_split_right", "layout_bottom_focus"]
+        return "layout_split_left" if alternate % 2 == 0 else "layout_split_right"
+    if pose == 3:
+        return "layout_center_standard"
+    cycle = ["layout_center_standard", "layout_split_left", "layout_split_right"]
     return cycle[alternate % len(cycle)]
+
+
+def _parse_punch_in(raw: dict) -> bool:
+    """Estrae il flag punch-in (accetta `punch_in` o alias `punch`, truthy)."""
+    if not isinstance(raw, dict):
+        return False
+    val = raw.get("punch_in", raw.get("punch", False))
+    if isinstance(val, str):
+        return val.strip().lower() in ("1", "true", "yes", "si", "y")
+    return bool(val)
+
+
+def _cap_punch_ins(plan: list[dict], max_n: int = MAX_PUNCH_INS_PER_VIDEO) -> list[dict]:
+    """Limita i punch-in a max_n per video (stacco enfasi raro e prezioso).
+
+    Tiene gli ULTIMI max_n (rivelazioni/CTA finali) e spegne gli altri.
+    Non solleva mai; ritorna lo stesso piano (modificato in place).
+    """
+    try:
+        idx = [i for i, p in enumerate(plan) if isinstance(p, dict) and p.get("punch_in")]
+    except Exception:
+        return plan
+    if len(idx) <= max_n:
+        return plan
+    for i in idx[:-max_n] if max_n > 0 else idx:
+        try:
+            plan[i]["punch_in"] = False
+        except Exception:
+            pass
+    return plan
+
+
+def _chunk_role(chunk: dict | None) -> str | None:
+    """Ruolo narrativo del chunk ('hook'/'body'/'cta') o None se assente."""
+    try:
+        role = (chunk or {}).get("narrative_role")
+        return role if role in ("hook", "body", "cta") else None
+    except Exception:
+        return None
+
+
+def _apply_narrative_locks(plan: list[dict], chunks: list[dict]) -> list[dict]:
+    """Blocchi deterministici per atto (stabilita' garantita anche se l'LLM varia).
+
+    - HOOK: primo chunk posa 1 + center_standard + slide_up; punch sul climax
+      (ultimo chunk hook). Transizioni pulite in ingresso.
+    - CORPO: dentro ogni beat (stesso narrative_beat) UNA sola identita'
+      (posa+layout del primo chunk del beat); i cambi avvengono solo ai
+      confini di beat con slide piena (niente dissolvenze a meta' pensiero).
+    - CTA: TUTTI i chunk su un'unica identita' (forte: posa 3; debole: posa 2),
+      center_standard, punch=False, scala 0.75, ingresso fade sul primo.
+      Il personaggio resta pixel-identico fino alla dissolvenza finale.
+    Non solleva mai; senza ruoli sui chunk restituisce il piano invariato.
+    """
+    try:
+        if not plan or not chunks or len(plan) != len(chunks):
+            return plan
+        if not any(_chunk_role(c) for c in chunks):
+            return plan
+    except Exception:
+        return plan
+    try:
+        hook_idx = [i for i, c in enumerate(chunks) if _chunk_role(c) == "hook"]
+        cta_idx = [i for i, c in enumerate(chunks) if _chunk_role(c) == "cta"]
+        # --- HOOK ---
+        if hook_idx:
+            first = hook_idx[0]
+            try:
+                plan[first]["pose"] = 1
+                plan[first]["layout"] = "layout_center_standard"
+                plan[first]["layout_preset"] = "layout_center_standard"
+                plan[first]["transition_in"] = "slide_up"
+                plan[first]["position"] = legacy_position("layout_center_standard")
+                plan[first]["transition"] = legacy_transition("slide_up")
+            except Exception:
+                pass
+            if len(hook_idx) > 1:
+                try:
+                    plan[hook_idx[0]]["punch_in"] = False
+                except Exception:
+                    pass
+            try:
+                plan[hook_idx[-1]]["punch_in"] = True  # climax hook: stacco
+            except Exception:
+                pass
+        # --- CORPO: lock per beat ---
+        beats: dict[int, list[int]] = {}
+        for i, c in enumerate(chunks):
+            if _chunk_role(c) != "body":
+                continue
+            try:
+                b = int((c or {}).get("narrative_beat", -1))
+            except Exception:
+                b = -1
+            beats.setdefault(b, []).append(i)
+        for beat in beats.values():
+            if len(beat) < 2:
+                continue
+            try:
+                ref = plan[beat[0]]
+                ref_pose, ref_layout = ref.get("pose", 2), ref.get("layout", "layout_center_standard")
+                ref_punch = bool(ref.get("punch_in", False))
+            except Exception:
+                continue
+            for j in beat[1:]:
+                try:
+                    plan[j]["pose"] = ref_pose
+                    plan[j]["layout"] = ref_layout
+                    plan[j]["layout_preset"] = ref_layout
+                    plan[j]["position"] = legacy_position(ref_layout)
+                    plan[j]["punch_in"] = ref_punch
+                    plan[j]["scale"] = ref.get("scale", 0.75)
+                except Exception:
+                    continue
+        # --- CTA: lock totale ---
+        # CTA forte (segnali d'azione) -> posa 3 celebrativa; outro debole
+        # (finale senza segnali) -> posa 2 aperta, neutra su qualsiasi tono.
+        if cta_idx:
+            try:
+                strong = str((chunks[cta_idx[0]] or {}).get("cta_strength", "strong")) == "strong"
+            except Exception:
+                strong = True
+            pose = 3 if strong else 2
+            for k, j in enumerate(cta_idx):
+                try:
+                    plan[j]["pose"] = pose
+                    plan[j]["layout"] = "layout_center_standard"
+                    plan[j]["layout_preset"] = "layout_center_standard"
+                    plan[j]["punch_in"] = False
+                    plan[j]["scale"] = 0.75
+                    plan[j]["position"] = legacy_position("layout_center_standard")
+                    plan[j]["transition_in"] = "fade" if k == 0 else plan[j].get("transition_in", "fade")
+                    plan[j]["transition"] = legacy_transition(plan[j]["transition_in"])
+                except Exception:
+                    continue
+    except Exception:
+        pass
+    return plan
+
+
+def _cap_punch_ins_narrative(plan: list[dict], chunks: list[dict]) -> list[dict]:
+    """Cap punch-in per atto: hook max 1 (climax), corpo max 1 (ultimo), CTA 0.
+
+    Lo stacco resta raro e prezioso, e il finale non ha mai salti di scala
+    (causa n.1 del flicker CTA). Senza ruoli, delega al cap globale storico.
+    """
+    try:
+        if not any(_chunk_role(c) for c in (chunks or [])):
+            return _cap_punch_ins(plan)
+    except Exception:
+        return _cap_punch_ins(plan)
+    try:
+        hook_idx = [i for i, c in enumerate(chunks) if _chunk_role(c) == "hook"]
+        body_idx = [i for i, c in enumerate(chunks) if _chunk_role(c) == "body"]
+        cta_idx = [i for i, c in enumerate(chunks) if _chunk_role(c) == "cta"]
+        for j in cta_idx:
+            try:
+                plan[j]["punch_in"] = False
+            except Exception:
+                pass
+        if hook_idx:
+            for j in hook_idx[:-1]:
+                try:
+                    plan[j]["punch_in"] = False
+                except Exception:
+                    pass
+        body_punch = [j for j in body_idx
+                      if isinstance(plan[j], dict) and plan[j].get("punch_in")]
+        for j in body_punch[:-1]:
+            try:
+                plan[j]["punch_in"] = False
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return plan
+
+
+def _finalize_character_plan(plan: list[dict], chunks: list[dict]) -> list[dict]:
+    """Lock narrativi + cap per atto (o cap globale legacy senza ruoli)."""
+    try:
+        if any(_chunk_role(c) for c in (chunks or [])):
+            return _cap_punch_ins_narrative(_apply_narrative_locks(plan, chunks), chunks)
+    except Exception:
+        pass
+    return _cap_punch_ins(plan)
 
 
 def _normalize_entry(raw: dict, chunk_index: int, chunk_text: str = "") -> dict:
     """Normalizza una singola voce LLM in un piano valido (mai eccezioni).
 
-    Schema nuovo: {"pose", "layout_preset", "transition_in"}; restano accettati
-    i campi legacy v1 {"position", "transition"} (mappati sul preset piu'
-    vicino). Ritorna sempre ENTRAMBI i vocabolari + scale (compatibilita'):
-    {"chunk_index", "pose", "layout_preset", "transition_in",
-     "position", "transition", "scale"}.
+    Schema: {"pose", "layout", "punch_in"}; restano accettati "layout_preset"
+    (alias), i campi legacy v1 {"position", "transition"} (mappati sul preset
+    piu' vicino) e "transition_in" esplicito. Ritorna SEMPRE il vocabolario
+    completo (compatibilita'):
+    {"chunk_index", "pose", "layout", "layout_preset", "punch_in",
+     "transition_in", "position", "transition", "scale"}.
     """
     if not isinstance(raw, dict):
         raw = {}
@@ -314,19 +531,23 @@ def _normalize_entry(raw: dict, chunk_index: int, chunk_text: str = "") -> dict:
         pose = 1
     pose = min(CHARACTER_POSE_COUNT, max(1, pose))
 
-    # Preset: campo nuovo, altrimenti mappa dalla position legacy, altrimenti
-    # euristica per posa (la posa 4 indica -> split anche se l'LLM sbaglia).
-    preset_raw = raw.get("layout_preset", raw.get("layout"))
-    if isinstance(preset_raw, str) and (
-        preset_raw in VALID_LAYOUT_PRESETS
-        or preset_raw in ("bottom_center", "bottom_left", "bottom_right", "side_left", "side_right")
+    # Layout: campo nuovo "layout", alias "layout_preset", altrimenti mappa
+    # dalla position legacy, altrimenti euristica per posa (la posa 4 indica
+    # -> split anche se l'LLM sbaglia; la posa 5 predilige i laterali).
+    layout_raw = raw.get("layout", raw.get("layout_preset"))
+    if isinstance(layout_raw, str) and (
+        layout_raw in VALID_LAYOUT_PRESETS
+        or layout_raw in ("bottom_center", "bottom_left", "bottom_right", "side_left", "side_right")
+        or layout_raw in ("layout_bottom_focus", "layout_closeup_center")
     ):
-        preset = normalize_preset(preset_raw, _preset_for_pose(pose, chunk_index))
+        preset = normalize_preset(layout_raw, _preset_for_pose(pose, chunk_index))
     elif raw.get("position") is not None:
         preset = normalize_preset(raw.get("position"), _preset_for_pose(pose, chunk_index))
     else:
         preset = _preset_for_pose(pose, chunk_index)
     if pose == 4 and preset not in ("layout_split_left", "layout_split_right"):
+        preset = _preset_for_pose(pose, chunk_index)
+    if pose == 5 and preset not in ("layout_split_left", "layout_split_right"):
         preset = _preset_for_pose(pose, chunk_index)
 
     transition_raw = raw.get("transition_in", raw.get("transition", None))
@@ -338,7 +559,9 @@ def _normalize_entry(raw: dict, chunk_index: int, chunk_text: str = "") -> dict:
     return {
         "chunk_index": int(chunk_index),
         "pose": pose,
-        "layout_preset": preset,
+        "layout": preset,
+        "layout_preset": preset,  # alias (compatibilita' sistema a zone v1)
+        "punch_in": _parse_punch_in(raw),
         "transition_in": transition_in,
         # Derivati legacy v1 (renderer/video vecchio stile + logging).
         "position": legacy_position(preset),
@@ -348,11 +571,14 @@ def _normalize_entry(raw: dict, chunk_index: int, chunk_text: str = "") -> dict:
 
 
 def _fallback_plan(chunks: list[dict]) -> list[dict]:
-    """Piano deterministico senza LLM (sistema a zone + campi legacy).
+    """Piano deterministico senza LLM (sistema a zone + punch-in + legacy).
 
-    - Primo chunk: posa 1, layout_bottom_focus, slide_up, scala 0.75.
-    - Successivi: "?" -> posa 5, "!" -> posa 3, altrimenti ciclo 1 -> 2 -> 4.
-      Il preset segue la posa (posa 4 -> split alternati per indicare il testo).
+    - Primo chunk: posa 1, layout_center_standard, slide_up, scala 0.75.
+    - Successivi: "?" -> posa 5 (split), "!" -> posa 3 + punch_in (enfasi),
+      altrimenti ciclo 1 -> 2 -> 4 (posa 4 -> split alternati per indicare).
+    - Con ruoli narrativi: niente punch in CTA (finale stabile) e lock
+      per atto applicati in finalize (vedi _apply_narrative_locks).
+    - I punch_in sono limitati per atto (vedi _cap_punch_ins_narrative).
     """
     cycle_poses = [1, 2, 4]
     plan: list[dict] = []
@@ -360,18 +586,26 @@ def _fallback_plan(chunks: list[dict]) -> list[dict]:
     split_flip = 0
     for i, chunk in enumerate(chunks):
         text = str((chunk or {}).get("text", ""))
+        punch_in = False
+        is_cta = _chunk_role(chunk) == "cta"
         if i == 0:
-            pose, preset, transition_in = 1, "layout_bottom_focus", "slide_up"
+            pose, preset, transition_in = 1, "layout_center_standard", "slide_up"
         else:
             if "?" in text:
                 pose = 5
-            elif "!" in text:
+            elif "!" in text and not is_cta:
                 pose = 3
+                punch_in = True  # enfasi: jump-cut (mai in CTA: stabile)
+            elif "!" in text:
+                pose = 3  # CTA/outro: posa giusta, senza stacco
             else:
                 pose = cycle_poses[cycle_i % len(cycle_poses)]
                 cycle_i += 1
             if pose == 4:
                 preset = "layout_split_right" if split_flip % 2 == 0 else "layout_split_left"
+                split_flip += 1
+            elif pose == 5:
+                preset = "layout_split_left" if split_flip % 2 == 0 else "layout_split_right"
                 split_flip += 1
             else:
                 preset = _preset_for_pose(pose, i)
@@ -381,13 +615,15 @@ def _fallback_plan(chunks: list[dict]) -> list[dict]:
         plan.append({
             "chunk_index": i,
             "pose": pose,
+            "layout": preset,
             "layout_preset": preset,
+            "punch_in": punch_in,
             "transition_in": transition_in,
             "position": legacy_position(preset),
             "transition": legacy_transition(transition_in),
             "scale": 0.75,
         })
-    return plan
+    return _finalize_character_plan(plan, chunks)
 
 
 def _parse_plan(content: str, n: int) -> list[dict] | None:
@@ -467,16 +703,17 @@ _POSE_RULES = (
 )
 
 _LAYOUT_RULES = (
-    "Layout disponibili (personaggio e testo NON devono mai sovrapporsi):\n"
-    "- layout_split_left: personaggio grande a SINISTRA (h=1300px, spalla fuori campo), testo a DESTRA.\n"
-    "- layout_split_right: personaggio grande a DESTRA (h=1300px), testo a SINISTRA.\n"
-    "- layout_bottom_focus: figura intera in basso al centro (h=1000px), testo in ALTO (y 200-800).\n"
-    "- layout_closeup_center: primo piano centrale massiccio (h=1600px), testo in BASSO su sfondo semi-trasparente.\n"
+    "Layout disponibili (niente figura intera: mezzo busto/mezza figura, gambe fuori campo; "
+    "personaggio e testo NON devono mai sovrapporsi):\n"
+    "- layout_center_standard: mezza figura centrata in basso (125% larghezza), testo in ALTO (y 150-900).\n"
+    "- layout_center_punch_in: PRIMO PIANO busto/testa (170% larghezza), testo nel terzo superiore con sfondo ad alto contrasto.\n"
+    "- layout_split_left: personaggio a SINISTRA (130%, spalla fuori campo), testo a DESTRA (x 640-1000).\n"
+    "- layout_split_right: personaggio a DESTRA (130%), testo a SINISTRA (x 80-420).\n"
     "REGOLA OBBLIGATORIA: con la Posa 4 (indicare) usa SEMPRE layout_split_left o layout_split_right, "
     "scegliendo il lato in modo che il personaggio indichi verso il testo.\n"
-    "Transizioni (transition_in): 'slide_from_left' / 'slide_from_right' per gli split laterali, "
-    "'slide_up' per layout_bottom_focus, 'fade' per cambi morbidi o closeup, 'none' se preset e posa "
-    "restano identici al chunk precedente."
+    "Con la Posa 5 (pensare) prediligi i layout laterali (split_left/split_right).\n"
+    "PUNCH-IN (jump-cut con ingrandimento improvviso, stacco di camera televisivo): metti punch_in=true "
+    "SOLO per frasi chiave, rivelazioni o call to action finali, MAX 1-2 volte in TUTTO il video."
 )
 
 
@@ -485,7 +722,7 @@ def plan_character_layout(
     script_text: str,
     on_attempt: Callable[[int, int, bool, str], None] | None = None,
 ) -> list[dict]:
-    """Assegna a ogni chunk posa/layout_preset/transition_in del personaggio.
+    """Assegna a ogni chunk posa/layout/punch_in del personaggio.
 
     Usa l'LLM Groq con rotazione delle chiavi (come core/keywords.py).
     Non solleva mai per errori API/validazione: in quel caso restituisce il
@@ -498,9 +735,10 @@ def plan_character_layout(
 
     Returns:
         Lista lunga quanto `chunks`, un dict per chunk:
-        {"chunk_index": int, "pose": 1-5, "layout_preset": str,
-         "transition_in": str, "position": str, "transition": str,
-         "scale": 0.65-0.90} (gli ultimi tre sono derivati legacy v1).
+        {"chunk_index": int, "pose": 1-5, "layout": str, "punch_in": bool,
+         "layout_preset": str, "transition_in": str, "position": str,
+         "transition": str, "scale": 0.65-0.90} (dopo "punch_in" sono alias
+        e derivati per compatibilita'; i punch_in sono limitati a max 2).
     """
     if not chunks:
         return []
@@ -514,6 +752,13 @@ def plan_character_layout(
         return _fallback_plan(chunks)
 
     n = len(chunks)
+    # Ruoli narrativi (se classificati a monte): guidano regia dedicata per atto
+    # e stabilizzano il finale (i lock deterministici a valle li garantiscono
+    # anche se l'LLM li ignora).
+    has_narrative = any(
+        isinstance(ch, dict) and ch.get("narrative_role") in ("hook", "body", "cta")
+        for ch in chunks
+    )
     # Contesto compatto: indice + testo per chunk (i chunk sono da 2-3 parole,
     # quindi il prompt resta leggero anche con decine di chunk).
     lines = []
@@ -521,32 +766,49 @@ def plan_character_layout(
         text = str((ch or {}).get("text", "")).strip().replace("\n", " ")
         if len(text) > 200:
             text = text[:200] + "..."
-        lines.append(f"{i}: {text}")
+        if has_narrative and isinstance(ch, dict):
+            role = str(ch.get("narrative_role", "body"))
+            tag = {"hook": "HOOK", "body": "CORPO", "cta": "CTA"}.get(role, "CORPO")
+            lines.append(f"{i} [{tag}]: {text}")
+        else:
+            lines.append(f"{i}: {text}")
     chunk_block = "\n".join(lines)
     script_snippet = (script_text or "").strip().replace("\n", " ")
     if len(script_snippet) > 1500:
         script_snippet = script_snippet[:1500] + "..."
 
+    narrative_rules = ""
+    if has_narrative:
+        narrative_rules = (
+            "\nREGOLE NARRATIVE (hook/corpo/CTA, tag [HOOK]/[CORPO]/[CTA]):\n"
+            "- Chunk [HOOK]: posa 1 assertiva, layout_center_standard; punch_in=true "
+            "SOLO sull'ultimo chunk hook (picco di attenzione).\n"
+            "- Chunk [CORPO]: UNA sola identità per beat (stessa posa+layout per "
+            "tutti i chunk dello stesso pensiero); cambia solo ai confini di beat. "
+            "Domande → posa 5 split, dati/numeri → posa 4 split, resto → posa 2.\n"
+            "- Chunk [CTA]: posa 3, layout_center_standard, punch_in=false SEMPRE "
+            "(il finale deve restare perfettamente stabile, niente stacchi).\n"
+        )
     system = (
         "Sei un regista che assegna un personaggio 2D ai sottotitoli di un video breve. "
         "Rispondi SOLO con JSON valido, senza testo extra."
     )
     user = (
-        "Analizza il tono di ogni chunk e assegna personaggio/layout/transizione.\n\n"
+        "Analizza il tono di ogni chunk e assegna personaggio/layout/punch-in.\n\n"
         "REGOLE POSE:\n" + _POSE_RULES + "\n\n"
         "REGOLE LAYOUT E REGIA:\n" + _LAYOUT_RULES + "\n"
         "- Cambia posa/layout SOLO quando il concetto o il tono cambia davvero: "
         "se il discorso e' continuo, mantieni stessa posa e stesso layout dei chunk "
         "precedenti (non cambiare ad ogni chunk di 2 parole).\n"
-        "- Alterna i lati degli split (sinistra/destra) per dare ritmo visivo.\n\n"
-        f"LAYOUT VALIDI: {', '.join(VALID_LAYOUT_PRESETS)}\n"
-        "TRANSIZIONI VALIDE: slide_from_left, slide_from_right, slide_up, fade, none\n\n"
+        "- Alterna i lati degli split (sinistra/destra) per dare ritmo visivo.\n"
+        + narrative_rules + "\n"
+        f"LAYOUT VALIDI: {', '.join(VALID_LAYOUT_PRESETS)}\n\n"
         f"SCRIPT (contesto):\n{script_snippet}\n\n"
         f"CHUNK ({n} totali, 'indice: testo'):\n{chunk_block}\n\n"
         "Rispondi SOLO con un array JSON con ESATTAMENTE "
         f"{n} oggetti in ordine di chunk_index, cosi': "
-        '[{"chunk_index": 0, "pose": 4, '
-        '"layout_preset": "layout_split_left", "transition_in": "slide_from_left"}]'
+        '[{"chunk_index": 0, "pose": 1, '
+        '"layout": "layout_split_right", "punch_in": false}]'
     )
 
     total = len(GROQ_API_KEYS)
@@ -601,14 +863,15 @@ def plan_character_layout(
                 pass
         return _fallback_plan(chunks)
 
-    plan = [
+    plan = _finalize_character_plan([
         _normalize_entry(entry, i, str((chunks[i] or {}).get("text", "")))
         for i, entry in enumerate(raw_entries)
-    ]
+    ], chunks)
     if on_attempt is not None:
         try:
             poses = ", ".join(
-                f"chunk {p['chunk_index']}: posa {p['pose']} ({p['layout_preset']}, {p['transition_in']})"
+                f"chunk {p['chunk_index']}: posa {p['pose']} ({p['layout']}"
+                f"{' +PUNCH' if p['punch_in'] else ''})"
                 for p in plan[:8]
             )
             more = f" ... (+{len(plan) - 8})" if len(plan) > 8 else ""
@@ -626,10 +889,12 @@ def resolve_chunk_layout(chunk: dict) -> dict | None:
 
     Returns:
         None se il chunk non ha personaggio, altrimenti
-        {"pose": int, "use_preset": bool, "layout_preset": str,
-         "transition_in": str, "position": str, "transition": str, "scale": float}.
-        Con preset valido: il render usa altezza/XY/safe-area del preset.
-        Senza preset (chunk legacy v1): altezza da scale, XY da position bbox.
+        {"pose": int, "use_preset": bool, "layout": str, "layout_preset": str,
+         "punch_in": bool, "transition_in": str, "position": str,
+         "transition": str, "scale": float}.
+        Con preset valido: il render usa scala width-based/ancoraggio/safe-area
+        del preset (punch_in amplifica). Senza preset (chunk legacy v1):
+        altezza da scale, XY da position bbox.
     """
     if not isinstance(chunk, dict) or chunk.get("pose") is None:
         return None
@@ -639,14 +904,17 @@ def resolve_chunk_layout(chunk: dict) -> dict | None:
         return None
     if pose < 1 or pose > CHARACTER_POSE_COUNT:
         return None
-    raw_preset = chunk.get("layout_preset", chunk.get("layout"))
-    use_preset = isinstance(raw_preset, str) and raw_preset in VALID_LAYOUT_PRESETS
+    raw_preset = chunk.get("layout", chunk.get("layout_preset"))
+    use_preset = isinstance(raw_preset, str) and (
+        raw_preset in VALID_LAYOUT_PRESETS
+        or raw_preset in ("layout_bottom_focus", "layout_closeup_center")
+    )
     if use_preset:
-        preset = raw_preset
+        preset = normalize_preset(raw_preset)
     else:
         # Chunk legacy v1 (solo position): mappa sul preset vicino ma il render
         # resta in modalita' legacy per non alterare il look esistente.
-        preset = normalize_preset(chunk.get("position", "bottom_center"), "layout_bottom_focus")
+        preset = normalize_preset(chunk.get("position", "bottom_center"), "layout_center_standard")
     transition_in = normalize_transition_in(
         chunk.get("transition_in", chunk.get("transition")), preset
     )
@@ -661,7 +929,9 @@ def resolve_chunk_layout(chunk: dict) -> dict | None:
     return {
         "pose": pose,
         "use_preset": bool(use_preset),
-        "layout_preset": preset,
+        "layout": preset,
+        "layout_preset": preset,  # alias (compatibilita' sistema a zone v1)
+        "punch_in": _parse_punch_in(chunk),
         "transition_in": transition_in,
         "position": position,
         "transition": legacy_transition(transition_in),
@@ -673,11 +943,12 @@ def enrich_chunks_with_characters(
     chunks: list[dict],
     plan: list[dict] | None,
 ) -> list[dict]:
-    """Arricchisce i chunk con i metadati character (preset + legacy v1).
+    """Arricchisce i chunk con i metadati character (layout/punch_in + alias).
 
-    Copia pose/layout_preset/transition_in (+ position/transition/scale derivati).
-    Se `plan` e' None/vuoto o la lunghezza non coincide, i chunk restano
-    invariati (pipeline senza personaggio). Non solleva mai.
+    Copia pose/layout/punch_in (+ layout_preset alias, transition_in derivata,
+    position/transition/scale legacy). Se `plan` e' None/vuoto o la lunghezza
+    non coincide, i chunk restano invariati (pipeline senza personaggio).
+    Non solleva mai.
     """
     if not plan or len(plan) != len(chunks):
         return chunks

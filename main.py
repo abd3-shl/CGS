@@ -13,7 +13,8 @@ Pipeline eseguita in un thread separato per non bloccare la GUI:
   5.5 Pianificazione personaggi 2D (Groq + fallback deterministico, non bloccante)
   6. Raggruppamento in chunk da 2-3 parole per enfasi (LLM + fallback)
   7. Estrazione parole chiave (Groq gpt-oss-120b) con colori del tema
-  8. Rendering frame animati per-parola (Pillow + easing, Fase 3)
+  6.5 Analisi tipografica (Semantic Typography Engine v1: nicchia -> font -> tagging base/impact/accent)
+  8. Rendering frame animati per-parola (Pillow + easing + multi-style tipografico, Fase 3)
   9. Composizione video finale (ffmpeg: micro-video WebM per chunk + overlay unico)
 """
 
@@ -33,10 +34,11 @@ from core.character_selector import (
     plan_character_layout,
 )
 from core.keywords import extract_keywords, KeywordError
+from core.narrative_structure import classify_narrative
 from core.renderer import render_all_subtitles
 from core.text_animator import render_all_chunks_animated, TextAnimationError
 from core.video_builder import build_video, cleanup_temp_files, VideoBuildError
-from config import TEMP_DIR, VIDEO_FPS, TEXT_ANIMATION_ENABLED, CHARACTER_ENABLED
+from config import TEMP_DIR, VIDEO_FPS, TEXT_ANIMATION_ENABLED, CHARACTER_ENABLED, TYPOGRAPHY_ENGINE_ENABLED, NARRATIVE_ENABLED
 
 
 class VideoGeneratorApp:
@@ -201,6 +203,28 @@ class VideoGeneratorApp:
             chunks = group_words_by_emphasis(words, on_attempt=self._log_attempt)
             self._log(f"      Creati {len(chunks)} blocchi di sottotitoli.")
 
+            self._log("[5.2/8] Struttura narrativa (hook / corpo a beat / CTA)...")
+            narrative_sections: dict = {}
+            if NARRATIVE_ENABLED:
+                try:
+                    narrative_sections, chunks = classify_narrative(
+                        chunks, script_text, on_attempt=self._log_attempt
+                    )
+                    beats = narrative_sections.get("body_beats", [])
+                    self._log(
+                        f"      Hook: {narrative_sections.get('hook', [])} | "
+                        f"Corpo: {len(beats)} beat "
+                        f"{[len(b) for b in beats] if beats else []} | "
+                        f"CTA: {narrative_sections.get('cta', [])} "
+                        f"({narrative_sections.get('cta_strength', 'none')}/"
+                        f"{narrative_sections.get('cta_mode', 'none')})"
+                    )
+                except Exception as e_narr:
+                    self._log(f"      ⚠️ Struttura narrativa saltata ({e_narr}), video piatto.")
+                    narrative_sections = {}
+            else:
+                self._log("      Struttura narrativa disabilitata (NARRATIVE_ENABLED=0).")
+
             self._log("[5.5/8] Pianificazione personaggi 2D (pose/layout)...")
             if CHARACTER_ENABLED:
                 try:
@@ -209,10 +233,16 @@ class VideoGeneratorApp:
                     )
                     chunks = enrich_chunks_with_characters(chunks, character_plan)
                     for entry in character_plan[:10]:
+                        punch = " +PUNCH-IN" if entry.get("punch_in") else ""
+                        try:
+                            _role = str((chunks[entry['chunk_index']] or {}).get("narrative_role", ""))
+                            _tag = f"[{_role.upper()}] " if _role in ("hook", "body", "cta") else ""
+                        except Exception:
+                            _tag = ""
                         self._log(
-                            f"      chunk {entry['chunk_index']}: posa {entry['pose']} "
-                            f"({entry.get('layout_preset', entry.get('position'))}, "
-                            f"{entry.get('transition_in', entry.get('transition'))})"
+                            f"      {_tag}chunk {entry['chunk_index']}: posa {entry['pose']} "
+                            f"({entry.get('layout', entry.get('layout_preset', entry.get('position')))}"
+                            f"{punch}, {entry.get('transition_in', entry.get('transition'))})"
                         )
                     if len(character_plan) > 10:
                         self._log(f"      ... (+{len(character_plan) - 10} chunk)")
@@ -235,6 +265,54 @@ class VideoGeneratorApp:
                 self._log(f"      ⚠️ Keyword saltate ({e}), proseguo senza evidenziazioni.")
                 keyword_colors = {}
 
+            self._log("[6.5/8] Analisi tipografica (Semantic Typography Engine v1)...")
+            typography_niche: str | None = None
+            if TYPOGRAPHY_ENGINE_ENABLED:
+                try:
+                    from core.text_tagger import enrich_chunks_with_typography
+                    from core.typography_presets import get_preset
+                    from core.font_manager import FontManager
+                    typography_niche, chunks = enrich_chunks_with_typography(
+                        chunks, script_text, on_attempt=self._log_attempt
+                    )
+                    self._log(f"      Nicchia identificata: {typography_niche}")
+                    try:
+                        _fm = FontManager()
+                        _preset = get_preset(typography_niche)
+                        _paths = _fm.ensure_preset_fonts(_preset)
+                        for _role in ("base", "impact", "accent"):
+                            _p = _paths.get(_role, "")
+                            _name = _preset["fonts"].get(_role, ["?"])[0] if _preset["fonts"].get(_role) else "?"
+                            self._log(f"      Font { _role} ({_name}): {_p if _p else '(fallback di sistema)'}")
+                        self._log(
+                            f"      Colori: base {_preset['colors'].get('base')}, "
+                            f"highlight {_preset['colors'].get('highlight')}, "
+                            f"accent {_preset['colors'].get('accent')} "
+                            f"(contorno: nessuno, stroke=0)"
+                        )
+                    except Exception as e_font:
+                        self._log(f"      ⚠️ Font scaricati/caricati con fallback ({e_font}).")
+                    try:
+                        _counts = {"base": 0, "impact": 0, "accent": 0}
+                        for _ch in chunks:
+                            for _w in (_ch.get("styled_words") or []):
+                                _st = _w.get("style", "base")
+                                if _st in _counts:
+                                    _counts[_st] += 1
+                        self._log(
+                            f"      Tagging parole completato: "
+                            f"{_counts['base']} base, {_counts['impact']} impact, "
+                            f"{_counts['accent']} accent ({len(chunks)} chunk)."
+                        )
+                    except Exception:
+                        self._log("      Tagging parole completato.")
+                except Exception as e_typo:
+                    # Non bloccante: rendering legacy senza stili.
+                    self._log(f"      ⚠️ Tipografia saltata ({e_typo}), proseguo con rendering legacy.")
+                    typography_niche = None
+            else:
+                self._log("      Tipografia disabilitata (TYPOGRAPHY_ENGINE_ENABLED=0).")
+
             self._log("[7/8] Rendering sottotitoli animati per-parola (Pillow+easing)...")
             if TEXT_ANIMATION_ENABLED:
                 try:
@@ -250,6 +328,7 @@ class VideoGeneratorApp:
                         output_dir=TEMP_DIR,
                         fps=VIDEO_FPS,
                         on_chunk=_on_chunk_done,
+                        typography_niche=typography_niche,
                     )
                     total_frames = sum(len(c.get("frames", [])) for c in enriched_chunks)
                     self._log(f"      Frame animati generati: {total_frames} ({len(enriched_chunks)} chunk).")

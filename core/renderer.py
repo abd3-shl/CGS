@@ -12,8 +12,11 @@ animato `core/text_animator.py` (pre-calcolo layout fisso + frame per-parola).
 
 Dynamic Layout: `compute_word_layout` accetta una Text Safe Area
 `(x_min, y_min, x_max, y_max)` e centra il testo dentro quel box (wrapping
-sulla sua larghezza); col preset `layout_closeup_center` il testo e'
-protetto da una pill semi-trasparente (`draw_text_background`).
+sulla sua larghezza, con rete anti-sconfinamento); col preset punch-in il
+testo e' protetto da una pill ad alto contrasto (`draw_text_background`).
+`calculate_character_transform` scala su larghezza (120-180%) con ancoraggio
+dal basso: niente figura intera, piedi mai visibili (`get_character_layer`
+cachato, usato da statico e animato).
 """
 
 import os
@@ -43,10 +46,17 @@ from core.layout_presets import (
     TEXT_PILL_FILL,
     TEXT_PILL_PAD,
     TEXT_PILL_RADIUS,
-    layout_character_xy,
+    normalize_preset,
+    preset_font_scale,
+    preset_headroom_px,
     preset_needs_text_background,
+    preset_overhang_x,
     preset_safe_area,
+    preset_width_pct,
 )
+
+# Cache layer personaggio width-based: {(pose, new_w, new_h): PIL.Image RGBA}.
+_character_layer_cache: dict[tuple[int, int, int], Image.Image] = {}
 
 # Font di sistema comuni, usati come fallback se non specificato in config.
 _FALLBACK_FONTS = [
@@ -186,6 +196,13 @@ def compute_word_layout(
     y = start_y
     for line_words, lw, lh in zip(lines, line_widths, line_heights):
         x = center_x - lw / 2.0
+        if use_area:
+            # Rete di sicurezza: la riga non sconfina mai a sinistra nella zona
+            # personaggio (parole singole piu' larghe del box slitta a destra,
+            # verso il margine schermo che e' sempre zona sicura del testo).
+            x = max(float(ax0), x)
+            if x + lw > VIDEO_WIDTH - 8:
+                x = max(float(ax0), VIDEO_WIDTH - 8 - lw)
         for j, word in enumerate(line_words):
             w = draw.textlength(word, font=font)
             layout.append({
@@ -301,14 +318,106 @@ def _paste_character_clipped(canvas: Image.Image, char_img: Image.Image, x: int,
         canvas.paste(cropped, (fx0, fy0), cropped)
 
 
+def calculate_character_transform(
+    image_size: tuple[int, int],
+    layout_preset: str,
+    is_punch_in: bool = False,
+    canvas_w: int = VIDEO_WIDTH,
+    canvas_h: int = VIDEO_HEIGHT,
+) -> tuple[int, int, int, int]:
+    """Calcola dimensioni e coordinate di overlay del personaggio (width-based).
+
+    Niente figura intera: la larghezza scala al 120-180% dello schermo
+    (vedi PRESET_WIDTH_PCT in core/layout_presets.py, amplificata da
+    PUNCH_IN_FACTOR se `is_punch_in` su preset normale), l'altezza segue
+    l'aspect ratio dell'asset e l'ancoraggio e' dal basso con headroom
+    configurabile: il bordo inferiore scende SEMPRE oltre `canvas_h`
+    (gambe/piedi fuori inquadratura, testa sempre in campo).
+
+    Args:
+        image_size: (w, h) dell'asset originale.
+        layout_preset: uno di VALID_LAYOUT_PRESETS (alias deprecati e position
+            legacy tollerati via normalize_preset).
+        is_punch_in: jump-cut di ingrandimento per enfasi.
+        canvas_w/canvas_h: dimensioni canvas (default 1080x1920).
+
+    Returns:
+        (new_w, new_h, paste_x, paste_y): dimensioni scalate e angolo
+        superiore-sinistro di incollaggio. Le coordinate possono uscire dal
+        canvas (crop compositivo "mezzo busto", nessun taglio fisico).
+    """
+    try:
+        src_w, src_h = int(image_size[0]), int(image_size[1])
+    except (TypeError, ValueError):
+        src_w, src_h = VIDEO_WIDTH, VIDEO_HEIGHT
+    if src_w <= 0 or src_h <= 0:
+        src_w, src_h = VIDEO_WIDTH, VIDEO_HEIGHT
+
+    preset = normalize_preset(layout_preset)
+    new_w = max(1, int(round(canvas_w * preset_width_pct(preset, bool(is_punch_in)))))
+    new_h = max(1, int(round(src_h * new_w / float(src_w))))
+
+    side_map = {"layout_split_left": "left", "layout_split_right": "right"}
+    side = side_map.get(preset, "center")
+    if side == "left":
+        paste_x = -preset_overhang_x(canvas_w)
+    elif side == "right":
+        paste_x = canvas_w - new_w + preset_overhang_x(canvas_w)
+    else:
+        paste_x = (canvas_w - new_w) // 2
+
+    paste_y = preset_headroom_px(preset, canvas_h)
+    # Invariante spec: il bordo inferiore coincide con canvas_h o scende oltre
+    # (mai piedi visibili, mai spazio vuoto sotto il personaggio).
+    if paste_y + new_h < canvas_h:
+        paste_y = canvas_h - new_h
+    return (int(new_w), int(new_h), int(paste_x), int(paste_y))
+
+
+def get_character_layer(
+    pose: int,
+    layout_preset: str,
+    is_punch_in: bool = False,
+    canvas_w: int = VIDEO_WIDTH,
+    canvas_h: int = VIDEO_HEIGHT,
+) -> tuple[Image.Image, int, int]:
+    """Ritorna (immagine ridimensionata LANCZOS con alpha, paste_x, paste_y).
+
+    Layer pronto per il paste con maschera, cachato per (posa, dimensioni).
+    Solleva CharacterError se l'asset manca (il chiamante decide se e'
+    bloccante: i render lo trattano come non-bloccante).
+    """
+    from core.character_selector import load_character_original
+    original = load_character_original(pose)
+    new_w, new_h, px, py = calculate_character_transform(
+        original.size, layout_preset, is_punch_in, canvas_w, canvas_h)
+    key = (int(pose), new_w, new_h)
+    cached = _character_layer_cache.get(key)
+    if cached is None:
+        try:
+            resample = Image.Resampling.LANCZOS
+        except AttributeError:  # Pillow < 9.1
+            resample = Image.LANCZOS
+        cached = original.resize((new_w, new_h), resample)
+        if cached.mode != "RGBA":
+            cached = cached.convert("RGBA")
+        _character_layer_cache[key] = cached
+    return cached.copy(), px, py
+
+
+def clear_character_layer_cache() -> None:
+    """Svuota la cache dei layer ridimensionati (utile nei test)."""
+    _character_layer_cache.clear()
+
+
 def _draw_character_static(img: Image.Image, character: dict | None) -> None:
     """Disegna il personaggio sul frame (Z-index: sopra lo sfondo, sotto i sottotitoli).
 
     `character` e' un dict di metadati come arricchito in main.py via
     core/character_selector.enrich_chunks_with_characters (oppure il chunk
     stesso). La risoluzione passa da `resolve_chunk_layout`: col preset valido
-    si usano altezza/XY del preset (coordinate anche fuori campo -> crop
-    compositivo "mezzo busto"), altrimenti il posizionamento legacy v1.
+    si usa `get_character_layer` (scala width-based + ancoraggio dal basso,
+    punch_in amplificato), altrimenti il posizionamento legacy v1.
     Errori non bloccanti (asset mancante, posa invalida): nessun disegno.
     """
     if not CHARACTER_ENABLED:
@@ -321,14 +430,15 @@ def _draw_character_static(img: Image.Image, character: dict | None) -> None:
     if info is None:
         return
     try:
-        from core.character_selector import load_and_process_character_image
-        from core.layout_presets import preset_char_height
         if info["use_preset"]:
-            target_h = preset_char_height(info["layout_preset"])
-            char_img = load_and_process_character_image(info["pose"], target_h)
-            x, y = layout_character_xy(info["layout_preset"], char_img.size, VIDEO_WIDTH, VIDEO_HEIGHT)
+            char_img, x, y = get_character_layer(
+                info["pose"], info["layout"], info.get("punch_in", False),
+                VIDEO_WIDTH, VIDEO_HEIGHT)
         else:
-            from core.character_selector import character_target_height
+            from core.character_selector import (
+                character_target_height,
+                load_and_process_character_image,
+            )
             target_h = character_target_height(info["scale"], VIDEO_HEIGHT)
             char_img = load_and_process_character_image(info["pose"], target_h)
             x, y = calculate_character_bbox(char_img.size, info["position"], VIDEO_WIDTH, VIDEO_HEIGHT)
@@ -340,19 +450,21 @@ def _draw_character_static(img: Image.Image, character: dict | None) -> None:
 def _resolve_safe_area(
     character: dict | None,
     safe_area: tuple[int, int, int, int] | None,
-) -> tuple[tuple[int, int, int, int] | None, bool]:
-    """Safe area effettiva + flag pill per il testo.
+    text_safe_area: tuple[int, int, int, int] | None = None,
+) -> tuple[tuple[int, int, int, int] | None, bool, float]:
+    """Safe area effettiva + flag pill + scala font per il testo.
 
-    Precedenza: `safe_area` esplicito > preset del character > None (centro
-    schermo storico). Ritorna (area_o_None, needs_pill).
+    Precedenza: `text_safe_area` > `safe_area` > preset del character >
+    None (centro schermo storico). Ritorna (area_o_None, needs_pill, font_scale).
     """
-    if safe_area is not None:
-        try:
-            box = (int(safe_area[0]), int(safe_area[1]), int(safe_area[2]), int(safe_area[3]))
-            if box[2] > box[0] and box[3] > box[1]:
-                return box, False
-        except (TypeError, ValueError, IndexError):
-            pass
+    for explicit in (text_safe_area, safe_area):
+        if explicit is not None:
+            try:
+                box = (int(explicit[0]), int(explicit[1]), int(explicit[2]), int(explicit[3]))
+                if box[2] > box[0] and box[3] > box[1]:
+                    return box, False, 1.0
+            except (TypeError, ValueError, IndexError):
+                pass
     if isinstance(character, dict):
         try:
             from core.character_selector import resolve_chunk_layout as _resolve
@@ -360,9 +472,11 @@ def _resolve_safe_area(
         except Exception:
             info = None
         if info is not None and info["use_preset"]:
-            return preset_safe_area(info["layout_preset"], VIDEO_WIDTH, VIDEO_HEIGHT), \
-                preset_needs_text_background(info["layout_preset"])
-    return None, False
+            preset = info["layout"]
+            return (preset_safe_area(preset, VIDEO_WIDTH, VIDEO_HEIGHT),
+                    preset_needs_text_background(preset),
+                    preset_font_scale(preset))
+    return None, False, 1.0
 
 
 def _character_info_from_chunk(chunk: dict) -> dict | None:
@@ -376,8 +490,12 @@ def _character_info_from_chunk(chunk: dict) -> dict | None:
         "scale": chunk.get("scale", 0.75),
     }
     # Chiavi del sistema a zone (se presenti, il render le preferisce).
+    if chunk.get("layout") is not None:
+        info["layout"] = chunk.get("layout")
     if chunk.get("layout_preset") is not None:
         info["layout_preset"] = chunk.get("layout_preset")
+    if chunk.get("punch_in") is not None:
+        info["punch_in"] = chunk.get("punch_in")
     if chunk.get("transition_in") is not None:
         info["transition_in"] = chunk.get("transition_in")
     return info
@@ -390,10 +508,11 @@ def render_subtitle_image(
     text_color: tuple | None = None,
     character: dict | None = None,
     safe_area: tuple[int, int, int, int] | None = None,
+    text_safe_area: tuple[int, int, int, int] | None = None,
 ) -> str:
     """
     Genera un'immagine PNG trasparente (stesse dimensioni del video) con il
-    testo del sottotitolo centrato orizzontalmente e verticalmente.
+    testo del sottotitolo confinato nella Text Safe Area del layout.
 
     Args:
         text: testo del sottotitolo da renderizzare.
@@ -401,14 +520,15 @@ def render_subtitle_image(
         keyword_colors: mappa {parola_normalizzata: colore_RGBA} per
             evidenziare le parole chiave (vedi core/keywords.py).
         text_color: colore RGBA del testo base (default: SUBTITLE_COLOR).
-            Con chunk da 2-3 parole il font resta fisso: il risultato visivo
-            è già proporzionato senza scaling adattivo.
-        character: metadati character {"pose","layout_preset",...}
+        character: metadati character {"pose","layout","punch_in",...}
             (opzionale, cfr. core/character_selector.py). Z-index: il
             personaggio e' disegnato PRIMA del testo (tra sfondo e sottotitoli).
-            Col preset valido, altezza/posa e safe area seguono il preset.
+            Col preset valido, scala width-based/ancoraggio/safe area seguono
+            il preset (punch_in amplificato).
         safe_area: Text Safe Area esplicita (x_min, y_min, x_max, y_max);
             se assente si usa quella del preset, altrimenti centro schermo.
+        text_safe_area: alias di `safe_area` (nome da spec); se fornito,
+            ha precedenza.
 
     Returns:
         Percorso assoluto del file PNG generato.
@@ -417,15 +537,19 @@ def render_subtitle_image(
     # Z-index 2: personaggio (lo sfondo tinta unita e' applicato da ffmpeg).
     if character is not None:
         _draw_character_static(img, character)
-    area, needs_pill = _resolve_safe_area(character, safe_area)
+    area, needs_pill, font_scale = _resolve_safe_area(character, safe_area, text_safe_area)
 
-    font = load_font(SUBTITLE_FONT_SIZE)
+    try:
+        font_size = max(24, int(round(SUBTITLE_FONT_SIZE * float(font_scale))))
+    except (TypeError, ValueError):
+        font_size = SUBTITLE_FONT_SIZE
+    font = load_font(font_size)
 
     max_text_width = int(VIDEO_WIDTH * 0.85)
     words = text.split()
     layout = compute_word_layout(words, font, max_text_width, area=area)
 
-    # Z-index 2.5: pill protettiva (solo closeup), sotto il testo.
+    # Z-index 2.5: pill protettiva (preset punch-in), sotto il testo.
     if needs_pill:
         draw_text_background(img, layout)
 
@@ -455,13 +579,14 @@ def render_all_subtitles(
     text_color: tuple | None = None,
     character_plan: list[dict] | None = None,
     safe_area: tuple[int, int, int, int] | None = None,
+    text_safe_area: tuple[int, int, int, int] | None = None,
 ) -> list[dict]:
     """
     Renderizza tutte le immagini dei sottotitoli per la lista di chunk.
 
     Args:
         chunks: lista di dict {"text", "start", "end", ...}. Se i chunk sono
-            gia' arricchiti con pose/layout_preset/transition_in (vedi
+            gia' arricchiti con pose/layout/punch_in (vedi
             core/character_selector.enrich_chunks_with_characters), il
             personaggio viene disegnato sotto il testo (Z-index corretto) e il
             testo e' confinato nella safe area del preset.
@@ -472,6 +597,8 @@ def render_all_subtitles(
             gia' presenti nei chunk.
         safe_area: Text Safe Area esplicita per TUTTI i chunk (override del
             preset; None = preset del chunk o centro schermo).
+        text_safe_area: alias di `safe_area` (nome da spec); se fornito,
+            ha precedenza.
 
     Returns:
         La stessa lista di chunk, con una chiave aggiuntiva "image_path".
@@ -482,6 +609,6 @@ def render_all_subtitles(
             character = character_plan[i]
         else:
             character = _character_info_from_chunk(chunk)
-        image_path = render_subtitle_image(chunk["text"], i, keyword_colors, text_color, character, safe_area)
+        image_path = render_subtitle_image(chunk["text"], i, keyword_colors, text_color, character, safe_area, text_safe_area)
         enriched.append({**chunk, "image_path": image_path})
     return enriched
