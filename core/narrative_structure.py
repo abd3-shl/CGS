@@ -26,6 +26,11 @@ I ruoli vivono SUI chunk (chiavi narrative_*): i moduli a valle
 import re
 from collections.abc import Callable
 
+try:
+    from core.subtitle_grouping import _WEAK_TRAILING_WORDS as _NARR_WEAK_WORDS
+except Exception:
+    _NARR_WEAK_WORDS = frozenset()
+
 from config import (
     NARRATIVE_CTA_CARD,
     NARRATIVE_CTA_CARD_MAX_WORDS,
@@ -185,11 +190,7 @@ def beat_tone(beat_chunks: list[dict]) -> str:
 
 def _function_word(word_norm: str) -> bool:
     """Vero per articoli/preposizioni/congiunzioni (mai impact)."""
-    try:
-        from core.subtitle_grouping import _WEAK_TRAILING_WORDS
-        weak = _WEAK_TRAILING_WORDS
-    except Exception:
-        weak = set()
+    weak = _NARR_WEAK_WORDS
     extra = {
         "che", "non", "come", "quando", "dove", "perche", "perché", "quindi",
         "mentre", "anche", "molto", "tanto", "questo", "quello", "questa",

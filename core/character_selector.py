@@ -74,6 +74,20 @@ class CharacterError(Exception):
     pass
 
 
+_groq_client_cache: dict[str, object] = {}
+
+
+def _get_groq_client(api_key: str):
+    hit = _groq_client_cache.get(api_key)
+    if hit is not None:
+        return hit
+    from groq import Groq as _Groq
+    client = _Groq(api_key=api_key)
+    if len(_groq_client_cache) < 16:
+        _groq_client_cache[api_key] = client
+    return client
+
+
 # ------------------------------------------------------------ Path resolution
 
 def _candidate_asset_paths(pose_number: int) -> list[Path]:
@@ -93,14 +107,25 @@ def _candidate_asset_paths(pose_number: int) -> list[Path]:
     return candidates
 
 
+_resolved_path_cache: dict[int, Path | None] = {}
+
+
 def resolve_character_path(pose_number: int) -> Path | None:
-    """Ritorna il percorso esistente per la posa, o None se assente."""
+    """Ritorna il percorso esistente per la posa, o None se assente (cachato)."""
+    try:
+        pose_i = int(pose_number)
+    except (TypeError, ValueError):
+        return None
+    if pose_i in _resolved_path_cache:
+        return _resolved_path_cache[pose_i]
     for p in _candidate_asset_paths(pose_number):
         try:
             if p.is_file():
+                _resolved_path_cache[pose_i] = p
                 return p
         except OSError:
             continue
+    _resolved_path_cache[pose_i] = None
     return None
 
 
@@ -742,6 +767,14 @@ def plan_character_layout(
     """
     if not chunks:
         return []
+    import os as _os
+    if _os.environ.get("PIPELINE_FAST", "0").strip().lower() not in ("0", "false", "no", "off", ""):
+        if on_attempt is not None:
+            try:
+                on_attempt(0, 0, False, "PIPELINE_FAST=1: piano character deterministico")
+            except Exception:
+                pass
+        return _fallback_plan(chunks)
 
     if not GROQ_API_KEYS:
         if on_attempt is not None:
@@ -813,11 +846,11 @@ def plan_character_layout(
 
     total = len(GROQ_API_KEYS)
     content: str | None = None
+    # max_tokens dinamico: ~60 token/chunk + margine (evita 4096 fissi su video corti).
+    _dyn_max = max(512, min(4096, 256 + n * 64))
     for index, api_key in enumerate(GROQ_API_KEYS, start=1):
         try:
-            from groq import Groq
-
-            client = Groq(api_key=api_key)
+            client = _get_groq_client(api_key)
             completion = client.chat.completions.create(
                 model=GROQ_LLM_MODEL,
                 messages=[
@@ -825,7 +858,7 @@ def plan_character_layout(
                     {"role": "user", "content": user},
                 ],
                 temperature=0.3,
-                max_tokens=4096,
+                max_tokens=_dyn_max,
                 response_format={"type": "json_object"},
             )
             content = completion.choices[0].message.content

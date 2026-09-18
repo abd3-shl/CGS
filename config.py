@@ -259,6 +259,15 @@ NARRATIVE_CTA_CARD_MAX_WORDS = _get_int("NARRATIVE_CTA_CARD_MAX_WORDS", 14)  # c
 NARRATIVE_HOOK_ENTRY_MULT = _get_float("NARRATIVE_HOOK_ENTRY_MULT", 0.7)  # hook più scattante (0.7x durata entrata)
 NARRATIVE_HOOK_POP_FROM = _get_float("NARRATIVE_HOOK_POP_FROM", 0.55)  # pop hook più marcato (0.55 -> 1.0)
 
+# ---- Performance / velocita' (stessi limiti, stesso output) ----
+# PIPELINE_FAST=1: salta gli LLM pesanti (emphasis/character/tagging/nicchia -> euristiche
+# deterministiche istantanee). Tema + keyword LLM restano attivi. Ideale per bulk veloci.
+PIPELINE_FAST = os.environ.get("PIPELINE_FAST", "0").strip().lower() not in ("0", "false", "no", "off", "")
+# RENDER_PARALLEL=1: chunk animati e micro-video ffmpeg in ThreadPool (3-4 worker).
+RENDER_PARALLEL = os.environ.get("RENDER_PARALLEL", "1").strip().lower() not in ("0", "false", "no", "off", "")
+# FFMPEG_PRESET: veryfast default (qualita' invariata); ultrafast per bozze.
+FFMPEG_PRESET = (os.environ.get("FFMPEG_PRESET", "veryfast") or "veryfast").strip() or "veryfast"
+
 # ---- Percorsi progetto ----
 OUTPUT_DIR = os.environ.get("OUTPUT_DIR", os.path.join(BASE_DIR, "outputs"))
 TEMP_DIR = os.environ.get("TEMP_DIR", os.path.join(BASE_DIR, "temp"))

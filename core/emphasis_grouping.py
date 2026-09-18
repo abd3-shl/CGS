@@ -31,6 +31,20 @@ class EmphasisGroupingError(Exception):
     pass
 
 
+# Cache client Groq per chiave (evita handshake/TLS per ogni fase pipeline).
+_groq_client_cache: dict[str, object] = {}
+
+
+def _get_groq_client(api_key: str):
+    hit = _groq_client_cache.get(api_key)
+    if hit is not None:
+        return hit
+    client = Groq(api_key=api_key)
+    if len(_groq_client_cache) < 16:
+        _groq_client_cache[api_key] = client
+    return client
+
+
 def _ends_strong(word: str) -> bool:
     stripped = word.strip()
     return any(stripped.endswith(p) for p in _STRONG_PUNCT)
@@ -126,6 +140,9 @@ def group_words_by_emphasis(
     """
     if not words:
         return []
+    import os as _os
+    if _os.environ.get("PIPELINE_FAST", "0").strip().lower() not in ("0", "false", "no", "off", ""):
+        return _deterministic_fallback(words)
 
     if not GROQ_API_KEYS:
         return _deterministic_fallback(words)
@@ -159,7 +176,7 @@ def group_words_by_emphasis(
 
     for index, api_key in enumerate(GROQ_API_KEYS, start=1):
         try:
-            client = Groq(api_key=api_key)
+            client = _get_groq_client(api_key)
             completion = client.chat.completions.create(
                 model=GROQ_LLM_MODEL,
                 messages=[

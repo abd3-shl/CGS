@@ -109,14 +109,38 @@ def _candidate_local_names(font_name: str) -> list[str]:
     ]
 
 
+_local_dir_cache: dict[str, tuple[float, list]] = {}
+
+
+def _list_font_files(fonts_dir: Path) -> list:
+    """Lista file font con cache 30s (evita iterdir per ogni ruolo/chunk)."""
+    import time
+    try:
+        key = str(fonts_dir)
+        now = time.monotonic()
+        hit = _local_dir_cache.get(key)
+        if hit is not None and (now - hit[0]) < 30.0:
+            return hit[1]
+        if not fonts_dir.is_dir():
+            return []
+        files = [p for p in fonts_dir.iterdir() if p.is_file()]
+        _local_dir_cache[key] = (now, files)
+        return files
+    except OSError:
+        return []
+
+
 def _find_local_font(font_name: str, fonts_dir: Path) -> str | None:
     """Cerca un file .ttf/.otf corrispondente (case-insensitive, prefisso tollerato)."""
-    try:
-        if not fonts_dir.is_dir():
+    files = _list_font_files(fonts_dir)
+    if not files:
+        try:
+            if not fonts_dir.is_dir():
+                return None
+        except OSError:
             return None
-        files = [p for p in fonts_dir.iterdir() if p.is_file()]
-    except OSError:
-        return None
+        if not files:
+            return None
     norm = _normalize_name(font_name)
     # 1) match esatto tra i candidati (case-insensitive).
     lowered = {p.name.lower(): p for p in files}
@@ -134,8 +158,14 @@ def _find_local_font(font_name: str, fonts_dir: Path) -> str | None:
     return None
 
 
+_system_font_cache: dict[str, str | None] = {}
+
+
 def _find_system_font(prefer: list[str] | None = None) -> str | None:
-    """Primo font di sistema esistente (preferenze opzionali per nome file)."""
+    """Primo font di sistema esistente (preferenze opzionali per nome file, cachato)."""
+    cache_key = "|".join(prefer) if prefer else "__default__"
+    if cache_key in _system_font_cache:
+        return _system_font_cache[cache_key]
     search_bases = [
         Path(r"C:\Windows\Fonts"),
         Path("/usr/share/fonts/truetype/dejavu"),
@@ -143,22 +173,30 @@ def _find_system_font(prefer: list[str] | None = None) -> str | None:
         Path("/System/Library/Fonts/Supplemental"),
         Path("/System/Library/Fonts"),
     ]
+    result: str | None = None
     if prefer:
         for base in search_bases:
             for fname in prefer:
                 try:
                     cand = base / fname
                     if cand.is_file():
-                        return str(cand)
+                        result = str(cand)
+                        break
                 except OSError:
                     continue
-    for cand in _SYSTEM_FALLBACKS:
-        try:
-            if os.path.isfile(cand):
-                return cand
-        except OSError:
-            continue
-    return None
+            if result is not None:
+                break
+    if result is None:
+        for cand in _SYSTEM_FALLBACKS:
+            try:
+                if os.path.isfile(cand):
+                    result = cand
+                    break
+            except OSError:
+                continue
+    if len(_system_font_cache) < 32:
+        _system_font_cache[cache_key] = result
+    return result
 
 
 def _download_urls(font_name: str) -> list[str]:

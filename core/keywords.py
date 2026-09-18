@@ -25,6 +25,19 @@ class KeywordError(Exception):
     pass
 
 
+_groq_client_cache: dict[str, object] = {}
+
+
+def _get_groq_client(api_key: str):
+    hit = _groq_client_cache.get(api_key)
+    if hit is not None:
+        return hit
+    client = Groq(api_key=api_key)
+    if len(_groq_client_cache) < 16:
+        _groq_client_cache[api_key] = client
+    return client
+
+
 # Palette premium in hex ("#RRGGBB", mai neon/arcobaleno): usata come default
 # e come integrazione per core/theme.py (importata come _FALLBACK_PALETTE_HEX).
 # Toni smorzati e armonici su sfondi scuri (ori/sky/lavanda/rosa/menta).
@@ -159,7 +172,7 @@ def extract_keywords(
 
     for index, api_key in enumerate(GROQ_API_KEYS, start=1):
         try:
-            client = Groq(api_key=api_key)
+            client = _get_groq_client(api_key)
             completion = client.chat.completions.create(
                 model=GROQ_LLM_MODEL,
                 messages=[

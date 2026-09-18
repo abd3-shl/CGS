@@ -36,6 +36,35 @@ class TextTaggerError(Exception):
     """Errore nel tagging tipografico (input non valido)."""
 
 
+_groq_client_cache: dict[str, object] = {}
+
+
+def _get_groq_client(api_key: str):
+    hit = _groq_client_cache.get(api_key)
+    if hit is not None:
+        return hit
+    from groq import Groq as _Groq
+    client = _Groq(api_key=api_key)
+    if len(_groq_client_cache) < 16:
+        _groq_client_cache[api_key] = client
+    return client
+
+
+def _heuristic_tagging(chunks: list[dict]) -> list[dict]:
+    """Fallback euristico unificato (evita triplicazione codice, istantaneo)."""
+    out: list[dict] = []
+    for i, ch in enumerate(chunks):
+        timed = (ch or {}).get("words") or [{"word": t} for t in str((ch or {}).get("text", "")).split()]
+        out.append({
+            "chunk_index": i,
+            "words": [
+                {"text": str(w.get("word", "")), "type": _heuristic_style(str(w.get("word", "")), str((ch or {}).get("text", "")))}
+                for w in timed if str(w.get("word", "")).strip()
+            ] or [{"text": str((ch or {}).get("text", "")), "type": "base"}],
+        })
+    return out
+
+
 VALID_TYPES = ("base", "impact", "accent")
 
 
@@ -147,6 +176,9 @@ def detect_niche(
     """
     if not script_text or not script_text.strip():
         return FALLBACK_NICHE
+    import os as _os2
+    if _os2.environ.get("PIPELINE_FAST", "0").strip().lower() not in ("0", "false", "no", "off", ""):
+        return _heuristic_niche(script_text)
     if not GROQ_API_KEYS:
         if on_attempt is not None:
             try:
@@ -178,8 +210,7 @@ def detect_niche(
     content: str | None = None
     for index, api_key in enumerate(GROQ_API_KEYS, start=1):
         try:
-            from groq import Groq
-            client = Groq(api_key=api_key)
+            client = _get_groq_client(api_key)
             completion = client.chat.completions.create(
                 model=GROQ_LLM_MODEL,
                 messages=[
@@ -187,7 +218,7 @@ def detect_niche(
                     {"role": "user", "content": user},
                 ],
                 temperature=0.2,
-                max_tokens=512,
+                max_tokens=256,
                 response_format={"type": "json_object"},
             )
             content = completion.choices[0].message.content
@@ -438,18 +469,11 @@ def tag_chunk_words(
     """
     if not chunks:
         return []
+    import os as _os
+    if _os.environ.get("PIPELINE_FAST", "0").strip().lower() not in ("0", "false", "no", "off", ""):
+        return _heuristic_tagging(chunks)
     if not GROQ_API_KEYS:
-        return [
-            {
-                "chunk_index": i,
-                "words": [
-                    {"text": str(w.get("word", "")), "type": _heuristic_style(str(w.get("word", "")), str((ch or {}).get("text", "")))}
-                    for w in ((ch or {}).get("words") or [{"word": t} for t in str((ch or {}).get("text", "")).split()])
-                    if str(w.get("word", "")).strip()
-                ] or [{"text": str((ch or {}).get("text", "")), "type": "base"}],
-            }
-            for i, ch in enumerate(chunks)
-        ]
+        return _heuristic_tagging(chunks)
 
     n = len(chunks)
     has_narrative = any(
@@ -501,10 +525,10 @@ def tag_chunk_words(
 
     total = len(GROQ_API_KEYS)
     content: str | None = None
+    _dyn_max = max(512, min(4096, 256 + n * 64))
     for index, api_key in enumerate(GROQ_API_KEYS, start=1):
         try:
-            from groq import Groq
-            client = Groq(api_key=api_key)
+            client = _get_groq_client(api_key)
             completion = client.chat.completions.create(
                 model=GROQ_LLM_MODEL,
                 messages=[
@@ -512,7 +536,7 @@ def tag_chunk_words(
                     {"role": "user", "content": user},
                 ],
                 temperature=0.3,
-                max_tokens=4096,
+                max_tokens=_dyn_max,
                 response_format={"type": "json_object"},
             )
             content = completion.choices[0].message.content
@@ -539,17 +563,7 @@ def tag_chunk_words(
                 on_attempt(total, total, False, "LLM tagging fallito: uso euristica")
             except Exception:
                 pass
-        return tag_chunk_words([], on_attempt=None) if False else [
-            {
-                "chunk_index": i,
-                "words": [
-                    {"text": str(w.get("word", "")), "type": _heuristic_style(str(w.get("word", "")), str((ch or {}).get("text", "")))}
-                    for w in ((ch or {}).get("words") or [{"word": t} for t in str((ch or {}).get("text", "")).split()])
-                    if str(w.get("word", "")).strip()
-                ] or [{"text": str((ch or {}).get("text", "")), "type": "base"}],
-            }
-            for i, ch in enumerate(chunks)
-        ]
+        return _heuristic_tagging(chunks)
 
     parsed = _parse_tagged_response(content, n)
     if parsed is None:
@@ -558,18 +572,7 @@ def tag_chunk_words(
                 on_attempt(total, total, False, "JSON tagging non valido: uso euristica")
             except Exception:
                 pass
-        # Ricorsione evitata: costruisci direttamente il fallback euristico.
-        fallback: list[dict] = []
-        for i, ch in enumerate(chunks):
-            timed = (ch or {}).get("words") or [{"word": t} for t in str((ch or {}).get("text", "")).split()]
-            fallback.append({
-                "chunk_index": i,
-                "words": [
-                    {"text": str(w.get("word", "")), "type": _heuristic_style(str(w.get("word", "")), str((ch or {}).get("text", "")))}
-                    for w in timed if str(w.get("word", "")).strip()
-                ] or [{"text": str((ch or {}).get("text", "")), "type": "base"}],
-            })
-        return fallback
+        return _heuristic_tagging(chunks)
     return parsed
 
 

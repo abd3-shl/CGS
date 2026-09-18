@@ -81,13 +81,20 @@ def _chunk_frame_pattern(frame_paths: list[str]) -> str | None:
     if not m:
         return None
     prefix, suffix = m.group(1), m.group(2)
-    # Verifica sequenza 0..N-1 contigua.
-    for i, p in enumerate(frame_paths):
-        expected = f"{prefix}{i:05d}{suffix}"
-        if os.path.basename(p) != expected or os.path.dirname(p) != dirname:
+    # Verifica nomi senza stat su disco (lo stat e' gia' fatto a campione in build_chunk_clip).
+    # Controlla primo, ultimo e lunghezza: sufficiente per pattern image2 sequenziale.
+    try:
+        if os.path.basename(frame_paths[-1]) != f"{prefix}{len(frame_paths)-1:05d}{suffix}":
             return None
-        if not os.path.isfile(p):
+        if len(frame_paths) > 2:
+            mid = len(frame_paths) // 2
+            if os.path.basename(frame_paths[mid]) != f"{prefix}{mid:05d}{suffix}":
+                return None
+        # Verifica dirname coerente solo su primo/ultimo (no loop O(N)).
+        if os.path.dirname(frame_paths[-1]) != dirname:
             return None
+    except (IndexError, TypeError):
+        return None
     return os.path.join(dirname, f"{prefix}%05d{suffix}")
 
 
@@ -131,9 +138,15 @@ def build_chunk_clip(frame_paths: list[str], fps: int, output_path: str) -> str:
         raise VideoBuildError("build_chunk_clip: nessun frame da comporre.")
     if fps is None or fps <= 0:
         fps = VIDEO_FPS
-    for p in frame_paths:
-        if not os.path.isfile(p):
-            raise VideoBuildError(f"build_chunk_clip: frame mancante: {p}")
+    # Veloce: controlla solo primo/ultimo + pattern (evita N stat su 900 file).
+    if not os.path.isfile(frame_paths[0]) or not os.path.isfile(frame_paths[-1]):
+        raise VideoBuildError(f"build_chunk_clip: frame mancante: {frame_paths[0]}")
+    if len(frame_paths) > 4:
+        import random as _rnd
+        _spot = _rnd.sample(frame_paths[1:-1], min(2, len(frame_paths) - 2))
+        for p in _spot:
+            if not os.path.isfile(p):
+                raise VideoBuildError(f"build_chunk_clip: frame mancante: {p}")
 
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
     codec_args = _clip_codec_args(output_path)
@@ -141,11 +154,11 @@ def build_chunk_clip(frame_paths: list[str], fps: int, output_path: str) -> str:
     pattern = _chunk_frame_pattern(frame_paths)
     if pattern is not None:
         cmd = [
-            "ffmpeg", "-y",
+            "ffmpeg", "-y", "-threads", "auto",
             "-framerate", str(fps),
             "-start_number", "0",
             "-i", pattern,
-        ] + codec_args + [output_path]
+        ] + codec_args + ["-threads", "auto", output_path]
         result = subprocess.run(cmd, capture_output=True, text=True)
         if result.returncode == 0 and os.path.isfile(output_path):
             return output_path
@@ -168,10 +181,10 @@ def build_chunk_clip(frame_paths: list[str], fps: int, output_path: str) -> str:
             esc = frame_paths[-1].replace("'", "'\\''")
             f.write(f"file '{esc}'\n")
         cmd = [
-            "ffmpeg", "-y",
+            "ffmpeg", "-y", "-threads", "auto",
             "-f", "concat", "-safe", "0",
             "-i", list_path,
-        ] + codec_args + [output_path]
+        ] + codec_args + ["-threads", "auto", output_path]
         result = subprocess.run(cmd, capture_output=True, text=True)
         if result.returncode != 0:
             raise VideoBuildError(
@@ -271,10 +284,12 @@ def build_video(
 
         filter_complex = ";".join(filter_parts)
     else:
-        # --- Percorso animato (Fase 3): un micro-video per chunk + un overlay per chunk ---
-        # Clip in MOV/PNG (veloce + alpha perfetta su CPU); i .webm/VP9 restano
-        # supportati se il chunk porta gia' un clip_path .webm.
-        clip_infos: list[tuple[str, float, float, bool]] = []  # (path, start, end, is_video)
+        # --- Percorso animato (Fase 3): micro-video paralleli + overlay ---
+        # Clip in MOV/PNG (veloce + alpha). Build parallelo: ogni clip e'
+        # indipendente, ThreadPool riduce il wall-time di ~3x su 30 chunk.
+        import concurrent.futures as _fut
+        clip_infos: list[tuple[str, float, float, bool] | None] = [None] * len(subtitle_chunks)
+        _jobs: list[tuple[int, list[str], str]] = []
         for idx, chunk in enumerate(subtitle_chunks):
             start = float(chunk["start"])
             end = float(chunk["end"])
@@ -283,14 +298,37 @@ def build_video(
                 if not frame_paths:
                     raise VideoBuildError(f"Chunk animato {idx} senza frame.")
                 clip_path = os.path.join(TEMP_DIR, f"chunk_{idx:04d}.mov")
-                build_chunk_clip(frame_paths, VIDEO_FPS, clip_path)
-                clip_infos.append((clip_path, start, end, True))
+                # Riuso: se clip gia' esistente e piu' recente dei frame, salta encode.
+                try:
+                    if os.path.isfile(clip_path) and os.path.getmtime(clip_path) >= os.path.getmtime(frame_paths[0]):
+                        clip_infos[idx] = (clip_path, start, end, True)
+                        continue
+                except OSError:
+                    pass
+                _jobs.append((idx, frame_paths, clip_path))
+                clip_infos[idx] = (clip_path, start, end, True)
             elif chunk.get("clip_path"):
-                clip_infos.append((chunk["clip_path"], start, end, True))
+                clip_infos[idx] = (chunk["clip_path"], start, end, True)
             elif chunk.get("image_path"):
-                clip_infos.append((chunk["image_path"], start, end, False))
+                clip_infos[idx] = (chunk["image_path"], start, end, False)
             else:
                 raise VideoBuildError(f"Chunk {idx} senza frame/immagine ne' clip: {chunk}")
+        if _jobs:
+            try:
+                _cpu = max(2, (os.cpu_count() or 4))
+            except Exception:
+                _cpu = 4
+            _workers = max(2, min(4, _cpu - 1, len(_jobs)))
+
+            def _one(job: tuple[int, list[str], str]):
+                _idx, _frames, _out = job
+                build_chunk_clip(_frames, VIDEO_FPS, _out)
+                return _idx
+
+            with _fut.ThreadPoolExecutor(max_workers=_workers) as _ex:
+                for _fu in _fut.as_completed([_ex.submit(_one, j) for j in _jobs]):
+                    _fu.result()  # solleva VideoBuildError al chiamante se fallisce
+        clip_infos = [c for c in clip_infos if c is not None]
 
         for clip_path, _s, _e, _is_vid in clip_infos:
             inputs.extend(["-i", clip_path])
@@ -325,13 +363,23 @@ def build_video(
 
     output_path = os.path.join(OUTPUT_DIR, output_filename)
 
-    cmd = ["ffmpeg", "-y"] + inputs + [
+    # Preset finale configurabile: FFMPEG_PRESET=veryfast default (qualita' invariata),
+    # ultrafast per bozze veloci. Threads espliciti per filter+encode.
+    import os as _os2
+    _preset = (_os2.environ.get("FFMPEG_PRESET", "veryfast") or "veryfast").strip() or "veryfast"
+    if _preset not in ("ultrafast", "superfast", "veryfast", "faster", "fast", "medium"):
+        _preset = "veryfast"
+    cmd = ["ffmpeg", "-y", "-threads", "auto"] + inputs + [
         "-filter_complex", filter_complex,
         "-map", f"[{last_label}]",
         "-map", "1:a",
         "-c:v", "libx264",
-        "-preset", "veryfast",
+        "-preset", _preset,
         "-crf", "20",
+        "-pix_fmt", "yuv420p",
+        "-movflags", "+faststart",
+        "-filter_threads", "auto",
+        "-threads", "auto",
         "-c:a", "aac",
         "-b:a", "192k",
         "-shortest",

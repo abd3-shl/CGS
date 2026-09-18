@@ -45,6 +45,7 @@ e' accettato per compatibilita' API ma non viene disegnato nei frame.
 
 import math
 import os
+import threading
 
 from PIL import Image, ImageDraw
 
@@ -105,6 +106,131 @@ _CHARACTER_SLIDE_SIDE_PX = 260
 # Slide rapide del sistema a zone (motion graphics 9:16): 0.2s in/out.
 _CHARACTER_ZONE_ENTRY_DURATION = 0.20
 _CHARACTER_ZONE_EXIT_DURATION = 0.20
+# --- OTTIMIZZAZIONI VELOCITA' (P0) ---
+# Singleton FontManager condiviso: evita mkdir+scan disco per ogni chunk.
+_shared_font_manager = None
+_shared_font_manager_lock = threading.Lock()
+
+
+def _get_shared_font_manager():
+    global _shared_font_manager
+    if _shared_font_manager is not None:
+        return _shared_font_manager
+    with _shared_font_manager_lock:
+        if _shared_font_manager is None:
+            try:
+                from core.font_manager import FontManager
+                _shared_font_manager = FontManager()
+            except Exception:
+                _shared_font_manager = None
+    return _shared_font_manager
+
+
+def _fast_resample_for_scale(scale: float):
+    """Resampling veloce per animazioni per-parola.
+
+    LANCZOS e' 4-8x piu' lento e indistinguibile su caption 60-90px
+    in movimento: BILINEAR vicino a 1.0, BICUBIC altrimenti.
+    LANCZOS resta solo per resize una-tantum (personaggio/font).
+    """
+    try:
+        if abs(scale - 1.0) < 0.12:
+            return Image.Resampling.BILINEAR
+        return Image.Resampling.BICUBIC
+    except AttributeError:  # Pillow < 9.1
+        try:
+            if abs(scale - 1.0) < 0.12:
+                return Image.BILINEAR
+            return Image.BICUBIC
+        except AttributeError:
+            return Image.NEAREST
+
+
+# Probe microscopica condivisa per textlength (evita Image 1080x1920 per layout).
+_probe_img = None
+_probe_draw = None
+_probe_lock = threading.Lock()
+
+
+def _get_probe_draw():
+    global _probe_img, _probe_draw
+    if _probe_draw is not None:
+        return _probe_draw
+    with _probe_lock:
+        if _probe_draw is None:
+            _probe_img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+            _probe_draw = ImageDraw.Draw(_probe_img)
+    return _probe_draw
+
+
+# Cache pill pre-renderizzate per bbox -> overlay RGBA.
+_pill_cache: dict[tuple[int, int, int, int], Image.Image] = {}
+_pill_cache_lock = threading.Lock()
+
+
+def _get_cached_pill_overlay(bbox: tuple[int, int, int, int], fill, pad: int, radius: int):
+    key = (bbox[0], bbox[1], bbox[2], bbox[3], pad, radius,
+           fill[0] if len(fill) > 0 else 0, fill[1] if len(fill) > 1 else 0,
+           fill[2] if len(fill) > 2 else 0, fill[3] if len(fill) > 3 else 255)
+    hit = _pill_cache.get(key)
+    if hit is not None:
+        return hit
+    with _pill_cache_lock:
+        hit = _pill_cache.get(key)
+        if hit is not None:
+            return hit
+        overlay = Image.new("RGBA", (VIDEO_WIDTH, VIDEO_HEIGHT), (0, 0, 0, 0))
+        d = ImageDraw.Draw(overlay)
+        try:
+            d.rounded_rectangle([bbox[0], bbox[1], bbox[2], bbox[3]],
+                                radius=radius, fill=fill)
+        except (AttributeError, ValueError, TypeError):
+            d.rectangle([bbox[0], bbox[1], bbox[2], bbox[3]], fill=fill)
+        if len(_pill_cache) < 32:
+            _pill_cache[key] = overlay
+        return overlay
+
+
+# Cache varianti opacity personaggio: {(id(char), opacity//16): img} evita copy+point per frame.
+_char_opacity_cache: dict[tuple[int, int], Image.Image] = {}
+_char_opacity_cache_lock = threading.Lock()
+
+
+def _get_char_at_opacity(char_img: Image.Image, opacity: int):
+    if opacity >= 255:
+        return char_img
+    if opacity <= 0:
+        return None
+    # Quantizza a step 8 per riuso (delta visivo nullo, hit-rate alto).
+    q = int(round(opacity / 8.0)) * 8
+    q = max(8, min(255, q))
+    if q >= 255:
+        return char_img
+    key = (id(char_img), q)
+    hit = _char_opacity_cache.get(key)
+    if hit is not None:
+        return hit
+    with _char_opacity_cache_lock:
+        hit = _char_opacity_cache.get(key)
+        if hit is not None:
+            return hit
+        try:
+            to_paste = char_img.copy()
+            alpha = to_paste.getchannel("A")
+            # Lookup table pre-calcolata: molto piu' veloce di lambda per pixel.
+            lut = [0] * 256
+            for a in range(256):
+                lut[a] = (a * q) // 255
+            alpha = alpha.point(lut)
+            to_paste.putalpha(alpha)
+        except Exception:
+            return char_img
+        if len(_char_opacity_cache) < 128:
+            # Evita crescita infinita su video lunghi: pulizia leggera.
+            if len(_char_opacity_cache) >= 120:
+                _char_opacity_cache.clear()
+            _char_opacity_cache[key] = to_paste
+        return to_paste
 # Modalita' di uscita del personaggio a fine chunk (vedi render_all lookahead).
 _CHAR_EXIT_WITH_TEXT = "with_text"  # segue il fade di gruppo del testo
 _CHAR_EXIT_SLIDE_DOWN = "slide_down"  # scende fuori campo (cambio lato dopo)
@@ -241,8 +367,7 @@ def _load_typography_fonts(preset: dict, font_scale: float = 1.0) -> dict:
     fonts_cfg = preset.get("fonts", {}) if isinstance(preset, dict) else {}
     out: dict = {"sizes": sizes, "paths": {}, "names": {}}
     try:
-        from core.font_manager import FontManager
-        manager = FontManager()
+        manager = _get_shared_font_manager()
     except Exception:
         manager = None
     for role in ("base", "impact", "accent"):
@@ -523,8 +648,12 @@ def compute_styled_layout(
         ax0, ay0, ax1, ay1 = 0, 0, VIDEO_WIDTH, VIDEO_HEIGHT
         center_x = VIDEO_WIDTH / 2.0
         center_y = VIDEO_HEIGHT / 2.0
-    probe = _Image.new("RGBA", (VIDEO_WIDTH, VIDEO_HEIGHT), (0, 0, 0, 0))
-    draw = _ImageDraw.Draw(probe)
+    try:
+        draw = _get_probe_draw()
+    except Exception:
+        from PIL import Image as _Image, ImageDraw as _ImageDraw
+        probe = _Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+        draw = _ImageDraw.Draw(probe)
 
     def _font_for(role: str):
         f = fonts.get(role)
@@ -766,10 +895,7 @@ def _render_styled_scaled_word(
                              stroke_width, shadow_offset, shadow_fill, opacity)
     new_w = max(1, int(round(tile_w * scale)))
     new_h = max(1, int(round(tile_h * scale)))
-    try:
-        resample = Image.Resampling.LANCZOS
-    except AttributeError:
-        resample = Image.LANCZOS
+    resample = _fast_resample_for_scale(scale)
     scaled = tile.resize((new_w, new_h), resample)
     cx = x + word_w / 2.0
     cy = y + word_h / 2.0
@@ -778,15 +904,18 @@ def _render_styled_scaled_word(
     px = int(round(cx - tcx))
     py = int(round(cy - tcy))
     try:
-        frame_img.paste(scaled, (px, py), scaled)
-    except ValueError:
-        fx0, fy0 = max(0, px), max(0, py)
-        tx0, ty0 = fx0 - px, fy0 - py
-        tx1 = min(new_w, VIDEO_WIDTH - px)
-        ty1 = min(new_h, VIDEO_HEIGHT - py)
-        if tx1 > tx0 and ty1 > ty0:
-            cropped = scaled.crop((tx0, ty0, tx1, ty1))
-            frame_img.paste(cropped, (fx0, fy0), cropped)
+        frame_img.alpha_composite(scaled, (px, py))
+    except (ValueError, AttributeError):
+        try:
+            frame_img.paste(scaled, (px, py), scaled)
+        except ValueError:
+            fx0, fy0 = max(0, px), max(0, py)
+            tx0, ty0 = fx0 - px, fy0 - py
+            tx1 = min(new_w, VIDEO_WIDTH - px)
+            ty1 = min(new_h, VIDEO_HEIGHT - py)
+            if tx1 > tx0 and ty1 > ty0:
+                cropped = scaled.crop((tx0, ty0, tx1, ty1))
+                frame_img.paste(cropped, (fx0, fy0), cropped)
 
 
 def enrich_chunk_words(chunk: dict, keyword_colors: dict | None = None) -> list[dict]:
@@ -864,10 +993,7 @@ def _render_scaled_word(
     draw_word(tile_draw, word, (pad, pad), font, fill, stroke_color, stroke_width, opacity=opacity)
     new_w = max(1, int(round(tile_w * scale)))
     new_h = max(1, int(round(tile_h * scale)))
-    try:
-        resample = Image.Resampling.LANCZOS
-    except AttributeError:  # Pillow < 9.1
-        resample = Image.LANCZOS
+    resample = _fast_resample_for_scale(scale)
     scaled = tile.resize((new_w, new_h), resample)
     # Centro originale della parola nel frame.
     cx = x + word_w / 2.0
@@ -879,16 +1005,19 @@ def _render_scaled_word(
     py = int(round(cy - tcy))
     # Paste con maschera alpha (gestisce anche posizioni parzialmente fuori canvas).
     try:
-        frame_img.paste(scaled, (px, py), scaled)
-    except ValueError:
-        # Fallback: ritaglia la porzione visibile se paste fallisce ai bordi.
-        fx0, fy0 = max(0, px), max(0, py)
-        tx0, ty0 = fx0 - px, fy0 - py
-        tx1 = min(new_w, VIDEO_WIDTH - px)
-        ty1 = min(new_h, VIDEO_HEIGHT - py)
-        if tx1 > tx0 and ty1 > ty0:
-            cropped = scaled.crop((tx0, ty0, tx1, ty1))
-            frame_img.paste(cropped, (fx0, fy0), cropped)
+        frame_img.alpha_composite(scaled, (px, py))
+    except (ValueError, AttributeError):
+        try:
+            frame_img.paste(scaled, (px, py), scaled)
+        except ValueError:
+            # Fallback: ritaglia la porzione visibile se paste fallisce ai bordi.
+            fx0, fy0 = max(0, px), max(0, py)
+            tx0, ty0 = fx0 - px, fy0 - py
+            tx1 = min(new_w, VIDEO_WIDTH - px)
+            ty1 = min(new_h, VIDEO_HEIGHT - py)
+            if tx1 > tx0 and ty1 > ty0:
+                cropped = scaled.crop((tx0, ty0, tx1, ty1))
+                frame_img.paste(cropped, (fx0, fy0), cropped)
 
 
 def _character_info_from_chunk(chunk: dict) -> dict | None:
@@ -1120,19 +1249,26 @@ def _paste_character_frame(
     y: int,
     opacity: int,
 ) -> None:
-    """Incolla il personaggio sul frame con opacita' e clipping ai bordi."""
+    """Incolla il personaggio sul frame con opacita' e clipping ai bordi (veloce)."""
     if opacity <= 0:
         return
     if opacity > 255:
         opacity = 255
-    to_paste = char_img
-    if opacity < 255:
-        to_paste = char_img.copy()
-        alpha = to_paste.getchannel("A")
-        alpha = alpha.point(lambda a: (a * opacity) // 255)
-        to_paste.putalpha(alpha)
+    # Fast-path: opaco -> nessun copy/point, paste diretto.
+    if opacity >= 255:
+        to_paste = char_img
+    else:
+        to_paste = _get_char_at_opacity(char_img, opacity)
+        if to_paste is None:
+            return
     px, py = int(x), int(y)
     try:
+        # alpha_composite e' piu' veloce di paste+mask su RGBA grandi.
+        try:
+            frame_img.alpha_composite(to_paste, (px, py))
+            return
+        except (ValueError, AttributeError):
+            pass
         frame_img.paste(to_paste, (px, py), to_paste)
         return
     except ValueError:
@@ -1448,6 +1584,43 @@ def generate_animated_chunk_frames(
     frame_step = 1.0 / float(fps)
     frames: list[dict] = []
 
+    # --- Pre-computazioni per-chunk (fuori dal loop frame) ---
+    # Pill: overlay pre-renderizzato una volta, poi alpha_composite (no ricalcolo bbox).
+    _pill_overlay = None
+    if needs_pill and layout:
+        try:
+            from core.renderer import TEXT_PILL_FILL, TEXT_PILL_PAD, TEXT_PILL_RADIUS
+            _x0 = min(it["x"] for it in layout) - TEXT_PILL_PAD
+            _y0 = min(it["y"] for it in layout) - TEXT_PILL_PAD
+            _x1 = max(it["x"] + it["width"] for it in layout) + TEXT_PILL_PAD
+            _y1 = max(it["y"] + it["height"] for it in layout) + TEXT_PILL_PAD
+            _x0, _y0 = max(0, _x0), max(0, _y0)
+            _x1, _y1 = min(VIDEO_WIDTH, _x1), min(VIDEO_HEIGHT, _y1)
+            if _x1 > _x0 and _y1 > _y0:
+                _pill_overlay = _get_cached_pill_overlay(
+                    (_x0, _y0, _x1, _y1), TEXT_PILL_FILL, TEXT_PILL_PAD, TEXT_PILL_RADIUS)
+        except Exception:
+            _pill_overlay = None
+    # Binding locali per loop caldo (evita lookup globali/attr per frame).
+    _ease_out_back = ease_out_back
+    _ease_out_cubic = ease_out_cubic
+    _ease_in_cubic = ease_in_cubic
+    _clamp01 = clamp01
+    _new_rgba = Image.new
+    _canvas_size = (VIDEO_WIDTH, VIDEO_HEIGHT)
+    _transparent = (0, 0, 0, 0)
+    # Font per parola pre-risolti (evita dict.get + try per frame).
+    if use_typography:
+        try:
+            _word_fonts = [typo_fonts.get(layout[i].get("style", words[i].get("style", "base")),
+                                          typo_fonts.get("base")) for i in range(len(words))]
+        except Exception:
+            _word_fonts = [typo_fonts.get("base") if isinstance(typo_fonts, dict) else font] * len(words)
+    else:
+        _word_fonts = [font] * len(words)
+    _shadow_off = typo_shadow_offset if 'typo_shadow_offset' in dir() else None
+    _shadow_fill = typo_shadow_fill if 'typo_shadow_fill' in dir() else None
+
     for fi in range(num_frames):
         t = chunk_start + fi * frame_step
         if t >= chunk_end:
@@ -1456,12 +1629,12 @@ def generate_animated_chunk_frames(
 
         # Fattore uscita di gruppo, condiviso da tutte le parole.
         if exit_dur > 0 and t >= chunk_end - exit_dur:
-            exit_prog = clamp01((t - (chunk_end - exit_dur)) / exit_dur)
-            exit_factor = 1.0 - ease_in_cubic(exit_prog)
+            exit_prog = _clamp01((t - (chunk_end - exit_dur)) / exit_dur)
+            exit_factor = 1.0 - _ease_in_cubic(exit_prog)
         else:
             exit_factor = 1.0
 
-        frame_img = Image.new("RGBA", (VIDEO_WIDTH, VIDEO_HEIGHT), (0, 0, 0, 0))
+        frame_img = _new_rgba("RGBA", _canvas_size, _transparent)
 
         # Z-index 2: personaggio sotto il testo (entrata + eventuale uscita).
         # Anti-glitch: la dissolvenza scatta SOLO in apparizione (entry_fade)
@@ -1494,46 +1667,60 @@ def generate_animated_chunk_frames(
                 char_opacity,
             )
 
-        # Z-index 2.5: pill protettiva dietro il testo (solo closeup preset).
-        if needs_pill:
+        # Z-index 2.5: pill pre-renderizzata (composite unico, no ricalcolo).
+        if _pill_overlay is not None:
+            try:
+                frame_img.alpha_composite(_pill_overlay)
+            except (ValueError, AttributeError):
+                draw_text_background(frame_img, layout)
+        elif needs_pill:
             draw_text_background(frame_img, layout)
 
         for wi, w in enumerate(words):
             if t < word_starts[wi]:
                 continue  # non ancora iniziata
-            local = clamp01((t - word_starts[wi]) / entry_dur)
+            local = _clamp01((t - word_starts[wi]) / entry_dur)
             if w["is_keyword"]:
-                eased = ease_out_back(local)
+                eased = _ease_out_back(local)
                 # Opacita': clamp 0-255 (l'overshoot >1 va saturato).
-                opacity = int(round(255 * min(1.0, max(0.0, eased))))
+                if eased >= 1.0:
+                    opacity = 255
+                elif eased <= 0.0:
+                    continue
+                else:
+                    opacity = int(round(255 * eased))
                 scale = scale_from + (1.0 - scale_from) * eased
                 # Evita scale degeneri a inizio animazione.
-                scale = max(0.05, scale)
+                if scale < 0.05:
+                    scale = 0.05
             else:
-                eased = ease_out_cubic(local)
-                opacity = int(round(255 * eased))
-                scale = 1.0
-            opacity = int(round(opacity * exit_factor))
+                # Fast-path: entrata completata -> opaco, scala 1 (disegno diretto).
+                if local >= 1.0:
+                    opacity, scale = 255, 1.0
+                elif local <= 0.0:
+                    continue
+                else:
+                    eased = _ease_out_cubic(local)
+                    opacity = int(round(255 * eased))
+                    scale = 1.0
+            if exit_factor < 1.0:
+                opacity = int(round(opacity * exit_factor))
             if opacity <= 0:
                 continue
             item = layout[wi]
             if use_typography:
-                role = item.get("style", w.get("style", "base"))
-                try:
-                    wfont = typo_fonts.get(role, typo_fonts.get("base"))
-                except Exception:
-                    wfont = typo_fonts.get("base") if isinstance(typo_fonts, dict) else font
+                wfont = _word_fonts[wi]
                 _render_styled_scaled_word(
                     frame_img, w["word"], item["x"], item["y"],
                     item["width"], item["height"], wfont,
                     fills[wi], typo_stroke_color, typo_stroke_width,
-                    typo_shadow_offset, typo_shadow_fill,
+                    _shadow_off, _shadow_fill,
                     opacity=opacity, scale=scale,
                 )
             else:
                 _render_scaled_word(
                     frame_img, w["word"], item["x"], item["y"],
-                    item["width"], item["height"], font,
+                    item["width"], item["height"], _word_fonts[wi],
                     fills[wi], SUBTITLE_STROKE_COLOR, SUBTITLE_STROKE_WIDTH,
                     opacity=opacity, scale=scale,
                 )
@@ -1724,6 +1911,30 @@ def generate_cta_card_frames(
         char_exit_dur = _CHARACTER_ZONE_EXIT_DURATION
 
     os.makedirs(output_dir, exist_ok=True)
+    # Pill CTA pre-renderizzata una volta (stesso layout per tutta la card).
+    _cta_pill = None
+    try:
+        if layout:
+            from core.renderer import TEXT_PILL_FILL as _PF, TEXT_PILL_PAD as _PP, TEXT_PILL_RADIUS as _PR
+            _cx0 = max(0, min(it["x"] for it in layout) - _PP)
+            _cy0 = max(0, min(it["y"] for it in layout) - _PP)
+            _cx1 = min(VIDEO_WIDTH, max(it["x"] + it["width"] for it in layout) + _PP)
+            _cy1 = min(VIDEO_HEIGHT, max(it["y"] + it["height"] for it in layout) + _PP)
+            if _cx1 > _cx0 and _cy1 > _cy0:
+                _cta_pill = _get_cached_pill_overlay((_cx0, _cy0, _cx1, _cy1), _PF, _PP, _PR)
+    except Exception:
+        _cta_pill = None
+    # Font per parola pre-risolti + binding locali.
+    try:
+        if use_typography and typo_fonts is not None:
+            _cta_fonts = [typo_fonts.get(layout[i].get("style", section[i].get("style", "base")), typo_fonts.get("base")) for i in range(len(section))]
+        else:
+            _cta_fonts = [font] * len(section)
+    except Exception:
+        _cta_fonts = [font if 'font' in dir() else typo_fonts.get("base")] * len(section)
+    _cta_ease_back = ease_out_back
+    _cta_ease_cubic = ease_out_cubic
+    _cta_clamp = clamp01
     per_chunk_frames: list[list[dict]] = []
     for k, ch in enumerate(cta_chunks):
         try:
@@ -1780,29 +1991,41 @@ def generate_cta_card_frames(
                 _paste_character_frame(
                     frame_img, char_img,
                     char_base_xy[0] + edx + xdx, char_base_xy[1] + edy + xdy, cop)
-            if needs_pill:
+            if _cta_pill is not None:
+                try:
+                    frame_img.alpha_composite(_cta_pill)
+                except (ValueError, AttributeError):
+                    draw_text_background(frame_img, layout)
+            elif needs_pill:
                 draw_text_background(frame_img, layout)
             for wi, w in enumerate(section):
                 if t < w["start"]:
                     continue  # parola futura: nascosta (reveal karaoke)
-                local = clamp01((t - w["start"]) / entry_dur)
+                local = _cta_clamp((t - w["start"]) / entry_dur)
                 if w["is_keyword"]:
-                    eased = ease_out_back(local)
-                    opacity = int(round(255 * min(1.0, max(0.0, eased))))
-                    scale = max(0.05, scale_from + (1.0 - scale_from) * eased)
+                    if local >= 1.0:
+                        opacity, scale = 255, 1.0
+                    elif local <= 0.0:
+                        continue
+                    else:
+                        eased = _cta_ease_back(local)
+                        opacity = int(round(255 * min(1.0, max(0.0, eased))))
+                        scale = max(0.05, scale_from + (1.0 - scale_from) * eased)
                 else:
-                    opacity = int(round(255 * ease_out_cubic(local)))
-                    scale = 1.0
-                opacity = int(round(opacity * exit_factor))
+                    if local >= 1.0:
+                        opacity, scale = 255, 1.0
+                    elif local <= 0.0:
+                        continue
+                    else:
+                        opacity = int(round(255 * _cta_ease_cubic(local)))
+                        scale = 1.0
+                if exit_factor < 1.0:
+                    opacity = int(round(opacity * exit_factor))
                 if opacity <= 0:
                     continue
                 item = layout[wi]
                 if use_typography:
-                    role = item.get("style", w.get("style", "base"))
-                    try:
-                        wfont = typo_fonts.get(role, typo_fonts.get("base"))
-                    except Exception:
-                        wfont = typo_fonts.get("base")
+                    wfont = _cta_fonts[wi]
                     _render_styled_scaled_word(
                         frame_img, w["display"], item["x"], item["y"],
                         item["width"], item["height"], wfont,
@@ -1811,7 +2034,7 @@ def generate_cta_card_frames(
                 else:
                     _render_scaled_word(
                         frame_img, w["word"], item["x"], item["y"],
-                        item["width"], item["height"], font,
+                        item["width"], item["height"], _cta_fonts[wi],
                         fills[wi], SUBTITLE_STROKE_COLOR, SUBTITLE_STROKE_WIDTH,
                         opacity=opacity, scale=scale)
             fname = f"chunk_{start_index + k:04d}_frame_{fi:05d}.png"
@@ -1865,6 +2088,8 @@ def render_all_chunks_animated(
         Lista di chunk arricchiti: {**chunk, "frames": [...], "frame_paths": [...],
         "clip_start": start, "clip_end": end}.
     """
+    import os as _os
+    _parallel_ok = _os.environ.get("RENDER_PARALLEL", "1").strip().lower() not in ("0", "false", "no", "off", "")
     enriched_all: list[dict] = []
     total = len(chunks)
     # Stati personaggio per chunk (lookahead/lookbehind), calcolati una volta:
@@ -1897,11 +2122,12 @@ def render_all_chunks_animated(
             "char_entry_jump": entry_jump,
             "char_entry_fade": entry_fade,
         })
+    # Separa run CTA (sequenziali, condividono layout) da chunk normali (paralleli).
+    cta_runs: list[list[int]] = []
+    normal_idx: list[int] = []
     i = 0
     while i < total:
         chunk = chunks[i]
-        # CTA card: run consecutivi di chunk card -> un'unica card persistente
-        # (stessa sezione: niente buchi, niente modi misti nel run).
         if _is_cta_card_chunk(chunk):
             try:
                 section_id = (chunk or {}).get("cta_section_id", i)
@@ -1918,56 +2144,91 @@ def render_all_chunks_animated(
                     break
                 run.append(j)
                 j += 1
-            run_chunks = [chunks[k] for k in run]
-            run_states = [states[k] for k in run]
+            cta_runs.append(run)
+            i = j
+            continue
+        normal_idx.append(i)
+        i += 1
+    # --- CTA card (poche, layout condiviso): sequenziale veloce ---
+    cta_results: dict[int, list[dict]] = {}
+    for run in cta_runs:
+        run_chunks = [chunks[k] for k in run]
+        run_states = [states[k] for k in run]
+        try:
+            run_frames = generate_cta_card_frames(
+                run_chunks, run_states, background_color, text_color,
+                keyword_colors or {}, output_dir, run[0], fps,
+                safe_area=safe_area, text_safe_area=text_safe_area,
+                typography_niche=typography_niche,
+                typography_preset=typography_preset,
+            )
+        except TextAnimationError:
+            raise
+        except Exception as e:
+            raise TextAnimationError(f"CTA card fallita: {e}")
+        for pos, k in enumerate(run):
+            cta_results[k] = run_frames[pos] if pos < len(run_frames) else []
+            if on_chunk is not None:
+                try:
+                    on_chunk(k + 1, total)
+                except Exception:
+                    pass
+    # --- Chunk normali: paralleli con ThreadPool (I/O + resize rilasciano GIL) ---
+    normal_results: dict[int, list[dict]] = {}
+    if normal_idx:
+        use_parallel = bool(_parallel_ok) and len(normal_idx) >= 3
+        if use_parallel:
+            import concurrent.futures as _fut
             try:
-                run_frames = generate_cta_card_frames(
-                    run_chunks, run_states, background_color, text_color,
-                    keyword_colors or {}, output_dir, run[0], fps,
-                    safe_area=safe_area, text_safe_area=text_safe_area,
-                    typography_niche=typography_niche,
-                    typography_preset=typography_preset,
+                _cpu = max(2, (_os.cpu_count() or 4))
+            except Exception:
+                _cpu = 4
+            _workers = max(2, min(4, _cpu - 1, len(normal_idx)))
+
+            def _render_one(k: int):
+                st = states[k]
+                return generate_animated_chunk_frames(
+                    chunks[k], background_color, text_color,
+                    keyword_colors or {}, output_dir, k, fps,
+                    safe_area=safe_area, char_exit_mode=st["char_exit_mode"],
+                    text_safe_area=text_safe_area, char_entry_jump=st["char_entry_jump"],
+                    char_entry_fade=st["char_entry_fade"],
+                    typography_niche=typography_niche, typography_preset=typography_preset,
                 )
-            except TextAnimationError:
-                raise
-            except Exception as e:
-                raise TextAnimationError(f"CTA card fallita: {e}")
-            for pos, k in enumerate(run):
-                frames = run_frames[pos] if pos < len(run_frames) else []
-                enriched_all.append({
-                    **chunks[k],
-                    "frames": frames,
-                    "frame_paths": [f["image_path"] for f in frames],
-                    "clip_start": chunks[k].get("start"),
-                    "clip_end": chunks[k].get("end"),
-                })
+            with _fut.ThreadPoolExecutor(max_workers=_workers) as _ex:
+                _future_map = {_ex.submit(_render_one, k): k for k in normal_idx}
+                for _fu in _fut.as_completed(_future_map):
+                    k = _future_map[_fu]
+                    normal_results[k] = _fu.result()
+                    if on_chunk is not None:
+                        try:
+                            on_chunk(k + 1, total)
+                        except Exception:
+                            pass
+        else:
+            for k in normal_idx:
+                st = states[k]
+                normal_results[k] = generate_animated_chunk_frames(
+                    chunks[k], background_color, text_color,
+                    keyword_colors or {}, output_dir, k, fps,
+                    safe_area=safe_area, char_exit_mode=st["char_exit_mode"],
+                    text_safe_area=text_safe_area, char_entry_jump=st["char_entry_jump"],
+                    char_entry_fade=st["char_entry_fade"],
+                    typography_niche=typography_niche, typography_preset=typography_preset,
+                )
                 if on_chunk is not None:
                     try:
                         on_chunk(k + 1, total)
                     except Exception:
                         pass
-            i = j
-            continue
-        st = states[i]
-        frames = generate_animated_chunk_frames(
-            chunk, background_color, text_color,
-            keyword_colors or {}, output_dir, i, fps,
-            safe_area=safe_area, char_exit_mode=st["char_exit_mode"],
-            text_safe_area=text_safe_area, char_entry_jump=st["char_entry_jump"],
-            char_entry_fade=st["char_entry_fade"],
-            typography_niche=typography_niche, typography_preset=typography_preset,
-        )
+    for k in range(total):
+        frames = cta_results.get(k, normal_results.get(k, []))
         enriched_all.append({
-            **chunk,
+            **chunks[k],
             "frames": frames,
             "frame_paths": [f["image_path"] for f in frames],
-            "clip_start": chunk.get("start"),
-            "clip_end": chunk.get("end"),
+            "clip_start": chunks[k].get("start"),
+            "clip_end": chunks[k].get("end"),
         })
-        if on_chunk is not None:
-            try:
-                on_chunk(i + 1, total)
-            except Exception:
-                pass
-        i += 1
+    # Ordina callback finale per GUI coerente (i paralleli arrivano fuori ordine).
     return enriched_all

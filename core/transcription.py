@@ -65,6 +65,19 @@ def _mask_key(key: str) -> str:
     return f"{key[:4]}...{key[-2:]}"
 
 
+_groq_client_cache: dict[str, object] = {}
+
+
+def _get_groq_client(api_key: str):
+    hit = _groq_client_cache.get(api_key)
+    if hit is not None:
+        return hit
+    client = Groq(api_key=api_key)
+    if len(_groq_client_cache) < 16:
+        _groq_client_cache[api_key] = client
+    return client
+
+
 def _is_retryable_with_next_key(error: Exception) -> bool:
     """Decide se ha senso riprovare con la chiave successiva.
 
@@ -122,7 +135,7 @@ def transcribe_audio(
     transcription = None
 
     for index, api_key in enumerate(GROQ_API_KEYS, start=1):
-        client = Groq(api_key=api_key)
+        client = _get_groq_client(api_key)
 
         try:
             with open(audio_path, "rb") as audio_file:

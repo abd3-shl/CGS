@@ -38,6 +38,20 @@ class ThemeError(Exception):
     pass
 
 
+_groq_client_cache: dict[str, object] = {}
+
+
+def _get_groq_client(api_key: str):
+    hit = _groq_client_cache.get(api_key)
+    if hit is not None:
+        return hit
+    from groq import Groq as _Groq
+    client = _Groq(api_key=api_key)
+    if len(_groq_client_cache) < 16:
+        _groq_client_cache[api_key] = client
+    return client
+
+
 HEX_RE = re.compile(r"^#[0-9A-Fa-f]{6}$")
 
 # --- Design system premium: sfondi cinematici scuri, mai saturi ---
@@ -392,7 +406,7 @@ def generate_theme(
 
     for index, api_key in enumerate(GROQ_API_KEYS, start=1):
         try:
-            client = Groq(api_key=api_key)
+            client = _get_groq_client(api_key)
             completion = client.chat.completions.create(
                 model=GROQ_THEME_MODEL,
                 messages=[

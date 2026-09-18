@@ -70,19 +70,43 @@ _FALLBACK_FONTS = [
 LINE_SPACING = 12
 
 
+_font_cache: dict[tuple[str | None, int], object] = {}
+try:
+    from functools import lru_cache as _lru  # noqa: F401
+except Exception:
+    pass
+
+
 def load_font(size: int) -> ImageFont.FreeTypeFont:
-    """Carica il font indicato in config, oppure il primo fallback disponibile."""
+    """Carica il font indicato in config, oppure il primo fallback disponibile (cachato)."""
+    try:
+        size_i = max(8, int(size))
+    except (TypeError, ValueError):
+        size_i = 64
+    key = (SUBTITLE_FONT_PATH, size_i)
+    hit = _font_cache.get(key)
+    if hit is not None:
+        return hit
     candidates = []
     if SUBTITLE_FONT_PATH:
         candidates.append(SUBTITLE_FONT_PATH)
     candidates.extend(_FALLBACK_FONTS)
 
     for path in candidates:
-        if os.path.exists(path):
-            return ImageFont.truetype(path, size)
+        try:
+            if os.path.exists(path):
+                f = ImageFont.truetype(path, size_i)
+                if len(_font_cache) < 16:
+                    _font_cache[key] = f
+                return f
+        except Exception:
+            continue
 
     # Ultimo fallback: font di default di Pillow (bitmap, poco bello ma non crasha)
-    return ImageFont.load_default()
+    fb = ImageFont.load_default()
+    if len(_font_cache) < 16:
+        _font_cache[key] = fb
+    return fb
 
 
 # Alias storico (retrocompatibilita' per import privati).
@@ -170,9 +194,13 @@ def compute_word_layout(
     if not use_area:
         center_x = VIDEO_WIDTH / 2.0
         center_y = VIDEO_HEIGHT / 2.0
-    # Misuratore temporaneo (serve un Draw per textlength/textbbox).
-    probe = Image.new("RGBA", (VIDEO_WIDTH, VIDEO_HEIGHT), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(probe)
+    # Misuratore temporaneo: basta 64x64 per textlength/textbbox (no 1080x1920).
+    try:
+        from core.text_animator import _get_probe_draw as _shared_probe
+        draw = _shared_probe()
+    except Exception:
+        probe = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(probe)
     space_w = draw.textlength(" ", font=font)
 
     lines = _wrap_words(words, font, max_width, draw)
@@ -302,6 +330,11 @@ def draw_word(
 def _paste_character_clipped(canvas: Image.Image, char_img: Image.Image, x: int, y: int) -> None:
     """Incolla il personaggio sul canvas gestendo posizioni parzialmente fuori campo."""
     try:
+        try:
+            canvas.alpha_composite(char_img, (int(x), int(y)))
+            return
+        except (ValueError, AttributeError):
+            pass
         canvas.paste(char_img, (int(x), int(y)), char_img)
         return
     except ValueError:
