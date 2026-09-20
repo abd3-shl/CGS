@@ -1,11 +1,11 @@
 """
-Modulo di rendering grafico REELS-FIX v5: PNG trasparenti con testo confinato
+Modulo di rendering grafico v8: PNG trasparenti con testo confinato
 nella Text Safe Zone (stile caption TikTok/Reels, stroke 0, ambient shadow
 morbida + auto-pill solo se contrasto <80), pronti per ffmpeg overlay.
 
-- Split 115% face-anchor dinamico (volto 25%/75% ≈270/810, mai hardcoded
-  -380/+430, volto sempre integro + gutter garantito), center 132% con
-  occupancy top >=950 e fascia testo Y[140,720]; punch zoom 1.15x.
+- Split 130% presenza piena (bbox visibile ancorata alla colonna + hard clamp
+  dentro [20,1060], mai tagliata), center 125% naturale con occupancy top
+  ~520 e fascia testo Y[140,490]; punch zoom 1.15x.
 - `compute_word_layout` + `compute_auto_fit_layout`: wrapping FORZATO su
   (X_MAX-X_MIN), hard-clamp X/Y dentro il box, auto-fit 0.92x fino a 38px.
 - `draw_word`: stroke 0 di default (nessun pavimento 5px), ombra (0,3,110).
@@ -60,18 +60,18 @@ try:
 except Exception:
     _PILL_PAD_Y = 10
 
-# REGOLA D'ORO MATEMATICA (Canvas 1080x1920): testa SEMPRE a Y=200.
-# Riesportato da layout_presets per API stabile (importabile da renderer).
-# HEADROOM_TOP = 200 (vedi core/layout_presets.py).
+# Ancoraggi verticali per-preset (Canvas 1080x1920): split Y~250, center ~500,
+# punch ~110 — vedi PRESET_HEADROOM_PX in core/layout_presets.py.
+# HEADROOM_TOP = 200 e' solo il default generico (vedi core/layout_presets.py).
 
 
 def validate_character_bounds(paste_x, paste_y, scaled_w, scaled_h,
                               canvas_w: int = VIDEO_WIDTH,
                               canvas_h: int = VIDEO_HEIGHT) -> tuple[int, int, int, int]:
-    """Sanity check REELS-FIX v5 (mai solleva, mai crash).
+    """Sanity check v8 (mai solleva, mai crash).
 
-    Range valido: 0<=py<=950 (split 0-300, center 700-950). Fuori range:
-    warning + clamp al bordo valido piu' vicino (non forza a 200).
+    Range valido: 0<=py<=800 (split 100-400, center 400-600, punch 0-300).
+    Fuori range: warning + clamp al bordo valido piu' vicino (non forza).
     Dimensioni degenerate clampate 1..8x canvas; fondo oltre bordo verificato.
     """
     try:
@@ -107,14 +107,14 @@ def validate_character_bounds(paste_x, paste_y, scaled_w, scaled_h,
         sw = cw * 8
     if sh > ch * 8:
         sh = ch * 8
-    # REELS-FIX v5: 0<=py<=950 (split 200, center 820). Clamp morbido.
-    if py < 0 or py > 950:
+    # v8: 0<=py<=800 (split 250, center 500, punch 110). Clamp morbido.
+    if py < 0 or py > 800:
         try:
-            print(f"[renderer] warning: paste_y={paste_y} fuori range 0-950: clamp")
+            print(f"[renderer] warning: paste_y={paste_y} fuori range 0-800: clamp")
         except Exception:
             pass
         try:
-            py = max(0, min(int(py), 950))
+            py = max(0, min(int(py), 800))
         except Exception:
             py = int(HEADROOM_TOP)
     # Fondo: deve spingere oltre il bordo (gambe tagliate in automatico).
@@ -640,18 +640,19 @@ def calculate_character_transform(
     canvas_h: int = VIDEO_HEIGHT,
     pose: int | None = None,
 ) -> tuple[int, int, int, int]:
-    """Coordinate overlay width-based (v7 FIT-TO-HALF, taglio impossibile).
+    """Coordinate overlay width-based (v8 presenza piena, taglio impossibile).
 
-    - Larghezza: preset_width_pct (split 115%, center 132%, punch 1.15x),
-      poi EMERGENCY AUTOSCALE negli split: se la bbox visibile della posa
-      supera 600px (su 1080) la scala scende (*0.95) finche' il personaggio
-      entra nella sua meta' schermo (mai sotto 0.60 assoluto).
+    - Larghezza: preset_width_pct (split 130%, center 125%, punch 170% /
+      1.15x), poi EMERGENCY AUTOSCALE negli split: se la bbox visibile della
+      posa supera 690px (su 1080) la scala scende (*0.95) finche' il
+      personaggio entra nella sua meta' schermo (mai sotto 0.60 assoluto).
     - X: ancoraggio di colonna sulla bbox VISIBILE (25% SX / 75% DX =
       paste_x = canvas_w * frac - (bx0*k + vis_w*k/2)) + hard clamp dentro
       [20px, canvas-20px]. NESSUN offset hardcoded: la posizione deriva da
       larghezza canvas, larghezza scalata e bbox reale della posa.
-    - Y: preset_headroom_px() per-preset (center 820, split 200) con fallback
-      bottom-anchor se il fondo restasse sopra il bordo (gambe sempre fuori).
+    - Y: preset_headroom_px() per-preset (center 500, split 250, punch 110)
+      con fallback bottom-anchor se il fondo restasse sopra il bordo
+      (gambe sempre fuori).
     La bbox visibile (viso+busto) non esce MAI dal canvas; il testo usa la
     Safe Area dinamica fino a 40px prima del personaggio (zero overlap).
     """
@@ -803,7 +804,7 @@ def get_character_layer(
             original.size, layout_preset, is_punch_in, canvas_w, canvas_h,
             pose=_pp)
     except Exception:
-        new_w, new_h, px, py = int(canvas_w * 1.15), int(canvas_h), 0, int(HEADROOM_TOP)
+        new_w, new_h, px, py = int(canvas_w * 1.30), int(canvas_h), 0, int(HEADROOM_TOP)
     try:
         px, py, new_w, new_h = validate_character_bounds(
             px, py, new_w, new_h, canvas_w, canvas_h)

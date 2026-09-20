@@ -651,7 +651,7 @@ def compute_styled_layout(
         styled_words: [{"word","display","style",...}] (display uppercase solo se <=7 char).
         fonts: {"base","impact","accent"} da _load_typography_fonts.
         max_width: ignorato se area fornita (usa strettamente ax1-ax0).
-        area: text_safe_area; None = fascia alta Y[140,720] default.
+        area: text_safe_area; None = fascia alta default.
 
     Returns:
         Lista parallela a styled_words con x/y/width/height dentro il box

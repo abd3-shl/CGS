@@ -1155,12 +1155,12 @@ _POSE_RULES = (
 )
 
 _LAYOUT_RULES = (
-    "Layout disponibili REELS-FIX v6 (mezzo busto, gambe fuori campo; "
+    "Layout disponibili v8 (presenza piena come commit di riferimento, "
     "personaggio e testo MAI sovrapposti, gutter 80px):\n"
-    "- layout_center_standard: centrato in basso (132%), testo SOLO fascia alta Y[140,720] X[90,990]. Obbligatorio per posa 2 (larga); vietato se testo denso con altre pose.\n"
-    "- layout_center_punch_in: PRIMO PIANO (150%, zoom 1.15x), testo fascia alta Y[140,620] con pill.\n"
-    "- layout_split_left: personaggio a SINISTRA (fit-to-half, bbox visibile dentro [20,1060], volto SEMPRE integro), testo a DESTRA X[665,1000] Y[320,1250] dinamico fino a 40px dal personaggio. MAI con posa 2.\n"
-    "- layout_split_right: personaggio a DESTRA (fit-to-half, bbox visibile dentro [20,1060], volto SEMPRE integro), testo a SINISTRA X[80,415] Y[320,1250] dinamico fino a 40px dal personaggio. MAI con posa 2.\n"
+    "- layout_center_standard: figura naturale centrata (125%, top Y~500, testa-busto-fianchi), testo SOLO fascia alta Y[140,490] X[90,990]. Obbligatorio per posa 2 (larga); vietato se testo denso con altre pose.\n"
+    "- layout_center_punch_in: PRIMO PIANO (170%, zoom 1.15x), testo fascia alta Y[140,620] con pill.\n"
+    "- layout_split_left: personaggio a SINISTRA (130% presenza piena, bbox visibile dentro [20,1060], volto SEMPRE integro), testo a DESTRA Y[320,1250] dinamico fino a 40px dal personaggio. MAI con posa 2.\n"
+    "- layout_split_right: personaggio a DESTRA (130% presenza piena, bbox visibile dentro [20,1060], volto SEMPRE integro), testo a SINISTRA Y[320,1250] dinamico fino a 40px dal personaggio. MAI con posa 2.\n"
     "REGOLA POSA 2 (braccia aperte, larghissima): usa SEMPRE layout_center_standard.\n"
     "REGOLA DENSITA': se il chunk ha >6 parole o >40 caratteri FORZA split_left/split_right (alterna i lati ogni 2-3 chunk), MAI center.\n"
     "REGOLA OBBLIGATORIA: con la Posa 4 (indicare) usa SEMPRE split, scegliendo il lato in modo che indichi verso il testo.\n"

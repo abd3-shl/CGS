@@ -1,31 +1,31 @@
 """
 Dynamic Layout & Smart Text Zones: preset di scena a "zone" (1080x1920).
 
-REELS-FIX v6 (clipping-fix definitivo, face-anchor dinamico):
-- Split 115% (~1242px) paste DINAMICO face-anchor (volto 25%/75% ≈270/810,
-  mai hardcoded -380/+430/overhang 420 che tagliavano mezza faccia);
-  center 132% centrato con occupancy top ~852 (gap 132px dalla fascia testo).
+v8 (proporzioni commit di riferimento + garanzie matematiche):
+- Split 130% presenza piena, bbox visibile ancorata alla colonna (25%/75%)
+  con hard clamp dentro [20, 1060]: mai tagliata, mai hardcoded -380/+430.
+- Center 125% naturale (top Y~500, testa-busto-fianchi), testo compatto alto.
 - Posa 2 larga (676px) sempre center; pose 4/5 sempre split.
-- Center testo SOLO fascia alta Y[140,720]; split testo colonne strette
-  X[665,1000]/X[80,415] Y[320,1250]; punch zoom 1.15x fascia Y[140,620].
-- Text Safe Zones rigide + occupancy_box AABB con fascia +120/+24px +
-  nudge anti-overlap dinamico: verify_zero_overlap() garantisce IoU==0,
-  verify_face_visible() garantisce volto integro con margine 40px.
+- Center testo fascia alta Y[140,490]; split testo colonne dinamiche
+  (bordo a 40px dall'occupancy) Y[320,1250]; punch zoom 1.15x Y[140,620].
+- Text Safe Zones + occupancy_box AABB con fascia +120/+24px:
+  verify_zero_overlap() garantisce IoU==0, verify_face_visible() garantisce
+  volto integro con margine 40px.
 
 Niente figura intera: i personaggi sono ingranditi in scala su larghezza
-e ancorati in alto a Y=200 con le gambe fuori inquadratura
-(i piedi non sono MAI visibili, la testa resta sempre in campo).
+e ancorati per-preset (split Y~250, center Y~500) con le gambe fuori
+inquadratura (i piedi non sono MAI visibili, la testa resta sempre in campo).
 Il cropping e' solo compositivo: le coordinate (X, Y) possono uscire dal
 canvas e il paste ritaglia il visibile.
 
 Preset (canvas 1080x1920, asset di riferimento 768x1376 figura intera):
-- `layout_center_standard`: 125% larghezza, centrato in basso (mezza figura,
-  testa-busto-fianchi). Testo in alto (Y 150-900).
+- `layout_center_standard`: 125% larghezza, figura naturale (mezza figura,
+  testa-busto-fianchi). Testo compatto in alto (Y 140-490).
 - `layout_center_punch_in`: 170% larghezza (primo piano busto/testa).
   Testo nel terzo superiore in sovrimpressione con pill ad alto contrasto.
-- `layout_split_left`: 130% larghezza, spalla sinistra fuori campo
-  (overhang negativo). Testo a destra (X 640-1000, banda centrale).
-- `layout_split_right`: speculare (testo a sinistra, X 80-420).
+- `layout_split_left`: 130% larghezza, personaggio intero nella colonna SX.
+  Testo a destra (banda centrale dinamica).
+- `layout_split_right`: speculare (testo a sinistra).
   Con la posa 4 ("indicare") il personaggio indica verso il testo.
 
 Punch-in: flag per-chunk (jump-cut con ingrandimento improvviso per enfasi,
@@ -37,8 +37,8 @@ le safe area sono scelte per non sovrapporsi mai al volto/busto; il text
 engine e il character engine risolvono entrambi da `resolve_chunk_layout`
 (vedi core/character_selector.py), quindi non possono divergere.
 
-Margini/padding configurabili: SPLIT_OVERHANG_X, SAFE_AREA inset nei box,
-TEXT_PILL_*.
+Margini/padding configurabili: SPLIT_EDGE_MARGIN_PX, SPLIT_TEXT_GAP_PX,
+SPLIT_MAX_VISIBLE_W_PX, TEXT_PILL_*.
 """
 
 from config import VIDEO_HEIGHT, VIDEO_WIDTH
@@ -87,21 +87,20 @@ LEGACY_POSITION_TO_PRESET: dict[str, str] = {
 }
 
 # --- Scala personaggio: percentuale della LARGHEZZA schermo ---
-# REELS-FIX v6 (clipping-fix: volto sempre integro in split):
-# split al 115% (~1242px su 1080, visibile ~515-540px = mezza metà schermo,
-# gutter garantito), center 130-134% (~1405-1450px), punch-in 1.50x con
-# PUNCH_IN_FACTOR 1.15x. Il 120% precedente rendeva il visibile troppo largo
-# (>560px) e forzava overhang eccessivo con mezzo-taglio del volto.
+# v8 (proporzioni validate dal commit di riferimento: presenza piena):
+# split 130% (~1404px su 1080, busto intero nella sua meta'), center 125%
+# (~1350px, testa-busto-fianchi naturali), punch-in 170% (primo piano).
+# Il FIT-TO-HALF (soglia 690px) riduce solo le pose larghe; le strette
+# restano a scala piena. PUNCH_IN_FACTOR 1.15x invariato (enfasi sobria).
 PRESET_WIDTH_PCT: dict[str, float] = {
-    "layout_center_standard": 1.32,
-    "layout_center_punch_in": 1.50,
-    "layout_split_left": 1.15,
-    "layout_split_right": 1.15,
+    "layout_center_standard": 1.25,
+    "layout_center_punch_in": 1.70,
+    "layout_split_left": 1.30,
+    "layout_split_right": 1.30,
 }
 
 # Vincoli matematici Perfect-Crop (spec §3, canvas 1080x1920).
-# REELS-FIX v6: split 110-118% ammesso (target 115%), center 130-134%,
-# punch max 1.55.
+# v8: split 110-132% ammesso (base 130%), center 110-140%, punch max 1.75.
 PERFECT_CROP_SCALE_MIN: float = 1.10
 PERFECT_CROP_SCALE_MAX: float = 1.40
 # Offset positivo Y: il fondo scende SEMPRE sotto il bordo (gambe mai visibili,
@@ -114,9 +113,10 @@ SLIDE_X_DURATION: float = 0.30
 
 # --- REGOLA D'ORO ANTI-DECAPITAZIONE + REELS GRID (Canvas 1080x1920) ---
 # La testa del personaggio DEVE essere SEMPRE visibile e MAI sotto il testo.
-# HEADROOM_TOP: margine superiore dell'immagine (paste_y). Split restano alti
-# (Y=200) per lasciare colonna testo libera; il center_standard e' spinto in
-# basso (occupancy garantita Y>=950) cosi' la fascia testo Y[140,720] e' libera.
+# HEADROOM_TOP: default generico (paste_y) quando nessun preset e' noto.
+# Gli headroom reali vivono in PRESET_HEADROOM_PX (split 250, center 500,
+# punch 110): il center_standard ha occupancy top ~520 cosi' la fascia testo
+# Y[140,490] e' libera con gutter garantito.
 HEADROOM_TOP: int = 200
 # DEPRECATI (causa mezzo-taglio): paste fisso ignorava new_w e trim per-posa
 # (X=+430/-380 tagliavano mezza faccia sul bordo 1080). Il path attivo usa
@@ -138,8 +138,9 @@ CENTER_GUTTER_PX: int = 80
 # (bbox per-posa gia' strette: 24px bastano, 60px mangiava il gutter testo).
 OCCUPANCY_HEADROOM_PX: int = 120
 OCCUPANCY_SIDE_PX: int = 24
-# Occupancy minima garantita per center_standard (testo sopra, corpo sotto).
-CENTER_CHARACTER_TOP_MIN: int = 950
+# Occupancy minima garantita per center_standard (testo sopra, corpo sotto):
+# occupancy top = headroom 500 + bbox_y0 (~140 a 125%) - 120 ~= 520.
+CENTER_CHARACTER_TOP_MIN: int = 520
 
 # Moltiplicatore punch-in REELS-FIX v5: 1.15x (non piu' 1.35 mostruoso).
 PUNCH_IN_FACTOR: float = 1.15
@@ -147,18 +148,16 @@ PUNCH_IN_FACTOR: float = 1.15
 MAX_PUNCH_INS_PER_VIDEO: int = 2
 
 # --- Ancoraggio verticale: headroom px dal bordo superiore al top asset ---
-# REELS-FIX v5: split alti (200, colonna testo libera Y[320,1250]), center
-# spinto in basso (occupancy top >=950) cosi' fascia testo Y[140,720] libera.
+# v8 (proporzioni commit di riferimento): split a 250 (testa alta, busto
+# pieno nella colonna), center_standard a 500 (testa-busto-fianchi naturali,
+# testo compatto in alto), punch_in a 110 (primo piano con pill).
 # Il fondo esce sempre sotto canvas_h (gambe mai visibili).
-# Misurato su assets reali 768x1376 (bbox alpha 218,82,551,1298):
-# testa src y130-340, bbox visibile 43% larghezza centrata. Con scala 132%
-# (1425px) la testa reale sta a py+241: py=820 -> testa Y~1061 (>=950 ok),
-# occupancy (py+bbox_y0-120) ~852, gap 132px dalla fascia testo Y1=720.
+# Misurato su assets reali 768x1376 (bbox alpha 218,82,551,1298).
 PRESET_HEADROOM_PX: dict[str, int] = {
-    "layout_center_standard": 820,
-    "layout_center_punch_in": 200,
-    "layout_split_left": 200,
-    "layout_split_right": 200,
+    "layout_center_standard": 500,
+    "layout_center_punch_in": 110,
+    "layout_split_left": 250,
+    "layout_split_right": 250,
 }
 
 # --- Ancoraggio orizzontale split: DEPRECATO l'overhang fisso ---
@@ -184,27 +183,32 @@ SPLIT_MAX_SHOULDER_OVERHANG_PX: int = 40
 # - testo dinamico: box dal bordo opposto fino a TEXT_GAP px prima del bbox.
 SPLIT_EDGE_MARGIN_PX: int = 20
 SPLIT_TEXT_GAP_PX: int = 40
-SPLIT_MAX_VISIBLE_W_PX: int = 600
+# Soglia FIT-TO-HALF su 1080 (scalata con canvas_w): a scala base 130% la
+# posa stretta piu' larga (posa 3: 372px -> 680px) passa intatta; solo le
+# pose veramente larghe (posa 2: 676px -> 1236px) attivano l'autoscale.
+SPLIT_MAX_VISIBLE_W_PX: int = 690
 SPLIT_MIN_SCALE_ABS: float = 0.60
 SPLIT_FIT_STEP: float = 0.95
 SPLIT_MIN_TEXT_W_PX: int = 200
 
 # Text Safe Area per preset: (x_min, y_min, x_max, y_max) su 1080x1920.
-# REELS-FIX v7 FIT-TO-HALF (TikTok/Reels):
-# - center_standard: SOLO fascia alta X[90,990] Y[140,720], corpo sotto Y>=950.
-# - split_left (char SX fittato, visibile dentro [20,1060]) -> testo DX
-#   X[665,1000] Y[320,1250] (worst-case su tutte le pose incl. punch).
-# - split_right (char DX fittato) -> testo SX X[80,415] Y[320,1250].
+# REELS-FIX v8 (proporzioni commit di riferimento + separazione garantita):
+# - center_standard: fascia ALTA compatta X[90,990] Y[140,490], corpo sotto
+#   (occupancy top ~520 a 125%/500): il testo resta sopra testa e busto.
+# - split_left (char SX 130% fittato, visibile dentro [20,1060]) -> testo DX
+#   X[750,1000] Y[320,1250] (worst-case: occ max 725 + gutter 24).
+# - split_right (char DX 130% fittato) -> testo SX X[80,330] Y[320,1250]
+#   (worst-case: occ min 356 - gutter 24).
 # - center_punch_in -> fascia alta X[80,1000] Y[140,620] (+pill, zoom 1.15x).
 # Nel render si usa preset_safe_area_dynamic() (bordo a 40px dall'occupancy
 # reale della posa, box piu' larghi per-posa); questi statici restano il
 # fallback sicuro senza posa nota. Il wrapping e' FORZATO su (X_MAX-X_MIN);
 # auto-fit riduce fino a 38px (vedi renderer / text_animator).
 PRESET_SAFE_AREA: dict[str, tuple[int, int, int, int]] = {
-    "layout_center_standard": (90, 140, 990, 720),
+    "layout_center_standard": (90, 140, 990, 490),
     "layout_center_punch_in": (80, 140, 1000, 620),
-    "layout_split_left": (665, 320, 1000, 1250),
-    "layout_split_right": (80, 320, 415, 1250),
+    "layout_split_left": (750, 320, 1000, 1250),
+    "layout_split_right": (80, 320, 330, 1250),
 }
 
 # Scala font per preset (box stretti degli split -> testo leggermente minore).
@@ -280,10 +284,9 @@ def perfect_crop_y(new_h: int, canvas_h: int = VIDEO_HEIGHT,
 
 
 def character_anchor_y(canvas_h: int = VIDEO_HEIGHT, preset_name: str | None = None) -> int:
-    """Ancoraggio Y REELS-FIX v5 (mai solleva).
+    """Ancoraggio Y per-preset (mai solleva).
 
-    Split/punch: HEADROOM_TOP=200 (colonna testo libera). Center_standard:
-    620px (occupancy volto/busto >=950, fascia testo Y[140,720] libera).
+    Split: 250, center_standard: 500, punch_in: 110 (proporzioni v8).
     MAI canvas_h - new_h. Scalato su canvas diversi da 1080x1920.
     """
     try:
@@ -812,7 +815,7 @@ def preset_paste_x(preset_name: str, new_w: int, canvas_w: int = VIDEO_WIDTH) ->
     Formula pura (zero magic numbers):
       paste = canvas_w * frac - (bx0 * k + vis_w * k / 2),
     poi hard clamp della bbox visibile dentro [20px, canvas-20px].
-    Il ridimensionamento d'emergenza (visibile > 600px) e' compito del
+    Il ridimensionamento d'emergenza (visibile > soglia FIT-TO-HALF) e' compito del
     renderer via fitted_split_character_size(); qui la posizione e'
     comunque garantita dentro il canvas per qualsiasi larghezza fittabile.
     """
@@ -877,26 +880,25 @@ def interpolate_x_out_cubic(x_from: int, x_to: int, progress: float) -> int:
 
 
 def preset_width_pct(name: str, punch_in: bool = False) -> float:
-    """Percentuale larghezza schermo REELS-FIX v6 (mai solleva).
+    """Percentuale larghezza schermo v8 (mai solleva).
 
-    Split 115% (~1242px: visibile ~515-540px = meta' schermo, volto integro),
-    center 132% (~1425px), punch_in 150% con PUNCH_IN_FACTOR 1.15x
-    (max 1.55). Se il 115% risultasse ancora largo per una posa, il chiamante
-    puo' scendere fino a 110% (1110%: visibile ~500px, ancora pieno e vivo).
+    Split 130% (~1404px: presenza piena, busto intero), center 125%
+    (~1350px), punch_in 170% con PUNCH_IN_FACTOR 1.15x su preset normali.
+    Il FIT-TO-HALF riduce solo le pose larghe oltre soglia.
     """
     preset = normalize_preset(name)
-    pct = PRESET_WIDTH_PCT.get(preset, 1.32)
+    pct = PRESET_WIDTH_PCT.get(preset, 1.25)
     if punch_in and preset != "layout_center_punch_in":
         pct *= PUNCH_IN_FACTOR
     try:
         pct_f = float(pct)
     except (TypeError, ValueError):
-        return 1.15 if "split" in preset else 1.32
+        return 1.30 if "split" in preset else 1.25
     if preset == "layout_center_punch_in" or punch_in:
-        return min(1.55, max(PERFECT_CROP_SCALE_MIN, pct_f))
+        return min(1.75, max(PERFECT_CROP_SCALE_MIN, pct_f))
     if "split" in preset:
-        # Split: 110-118% (target 115%, volto integro + gutter garantito).
-        return min(1.18, max(1.10, pct_f))
+        # Split: 110-132% (base 130%, presenza piena + gutter garantito).
+        return min(1.32, max(1.10, pct_f))
     return min(PERFECT_CROP_SCALE_MAX, max(PERFECT_CROP_SCALE_MIN, pct_f))
 
 
@@ -1012,10 +1014,10 @@ def legacy_position(preset_name: str) -> str:
 def describe_preset(name: str) -> str:
     """Riga descrittiva del preset (per prompt LLM e logging)."""
     info = {
-        "layout_center_standard": "mezza figura centrata in basso (132%, top Y~820), testo in ALTO Y[140,720]",
-        "layout_center_punch_in": "PRIMO PIANO (150%, zoom 1.15x), testo fascia alta Y[140,620] con pill",
-        "layout_split_left": "personaggio a SINISTRA (fit-to-half, bbox visibile dentro [20,1060], volto integro), testo a DESTRA X[665,1000] dinamico fino a 40px dal personaggio (posa 4: indica il testo; posa 2 MAI qui)",
-        "layout_split_right": "personaggio a DESTRA (fit-to-half, bbox visibile dentro [20,1060], volto integro), testo a SINISTRA X[80,415] dinamico fino a 40px dal personaggio",
+        "layout_center_standard": "mezza figura naturale (125%, top Y~500, testa-busto-fianchi), testo in ALTO Y[140,490]",
+        "layout_center_punch_in": "PRIMO PIANO (170%, zoom 1.15x), testo fascia alta Y[140,620] con pill",
+        "layout_split_left": "personaggio a SINISTRA (130% presenza piena, bbox visibile dentro [20,1060], volto integro), testo a DESTRA dinamico fino a 40px dal personaggio (posa 4: indica il testo; posa 2 MAI qui)",
+        "layout_split_right": "personaggio a DESTRA (130% presenza piena, bbox visibile dentro [20,1060], volto integro), testo a SINISTRA dinamico fino a 40px dal personaggio",
     }
     return info.get(normalize_preset(name), str(name))
 
@@ -1042,15 +1044,14 @@ def verify_perfect_crop(new_w: int, new_h: int, paste_x: int, paste_y: int,
                         canvas_w: int = VIDEO_WIDTH, canvas_h: int = VIDEO_HEIGHT,
                         preset_name: str | None = None,
                         punch_in: bool = False) -> dict:
-    """Verifica invarianti REELS-FIX v7 mezzo-busto (mai solleva).
+    """Verifica invarianti v8 mezzo-busto (mai solleva).
 
-    - Scala: split 60-118% (base 110-118%, target 115%; sotto 110% solo per
-      emergency autoscale FIT-TO-HALF su pose larghe: mai un warning falso
-      quando il fit salva il personaggio dal taglio); con punch_in lo zoom
-      intenzionale 1.15x sposta il cap a 155% come il preset punch_in.
-      Center 110-140%, punch fino 155%.
-    - paste_y: split/punch 0<=py<=300; center 700<=py<=950 (testa Y~1060,
-      occupancy ~852, fascia testo Y1=720 libera con gutter).
+    - Scala: split 60-132% (base 130% presenza piena; sotto 110% solo per
+      emergency autoscale FIT-TO-HALF su pose larghe), con punch_in lo zoom
+      intenzionale 1.15x sposta il cap a 175% come il preset punch_in.
+      Center 110-140% (+punch 1.15x fino a 160%), punch_in 110-175%.
+    - paste_y: split 100<=py<=400 (headroom 250); center_standard 400<=py<=600
+      (headroom 500, testa-busto-fianchi naturali); punch 0<=py<=300.
     - Fondo fuori campo: paste_y + new_h >= canvas_h.
     """
     try:
@@ -1063,9 +1064,11 @@ def verify_perfect_crop(new_w: int, new_h: int, paste_x: int, paste_y: int,
         except Exception:
             preset = None
         if preset == "layout_center_standard":
-            head_ok = 700 <= int(paste_y) <= 950
-        else:
+            head_ok = 400 <= int(paste_y) <= 600
+        elif preset == "layout_center_punch_in":
             head_ok = 0 <= int(paste_y) <= 300
+        else:
+            head_ok = 100 <= int(paste_y) <= 400
         try:
             _punch = bool(punch_in)
         except Exception:
@@ -1075,13 +1078,13 @@ def verify_perfect_crop(new_w: int, new_h: int, paste_x: int, paste_y: int,
                 _floor = float(SPLIT_MIN_SCALE_ABS)
             except Exception:
                 _floor = 0.60
-            _cap = 1.55 if _punch else 1.18
+            _cap = 1.75 if _punch else 1.32
             scale_ok = _floor <= scale_pct <= _cap
         elif preset == "layout_center_punch_in":
-            scale_ok = 1.10 <= scale_pct <= 1.55
+            scale_ok = 1.10 <= scale_pct <= 1.75
         else:
             scale_ok = (PERFECT_CROP_SCALE_MIN <= scale_pct <= PERFECT_CROP_SCALE_MAX) or \
-                (1.45 <= scale_pct <= 1.55)
+                (1.40 <= scale_pct <= 1.60)
         ok = bool(scale_ok) and bool(bottom_ok) and bool(head_ok)
         return {"ok": bool(ok), "scale_pct": float(scale_pct), "anchored": bool(anchored),
                 "head_ok": bool(head_ok), "bottom": int(bottom)}
@@ -1142,7 +1145,7 @@ def pose_paste_x(pose: int | None, preset_name: str, new_w: int,
     - center/*: centrato classico.
     Il volto resta SEMPRE integro con margine FACE_MARGIN_PX (clamp finale);
     la bbox visibile (viso+busto) non esce MAI dal canvas. Il resize
-    d'emergenza (visibile > 600px) e' compito del renderer via
+    d'emergenza (visibile > soglia FIT-TO-HALF) e' compito del renderer via
     fitted_split_character_size(): qui la posizione e' comunque garantita
     dentro il canvas per qualsiasi larghezza fittabile.
     """
