@@ -1243,11 +1243,14 @@ def _character_side(info: dict) -> str:
         "right" if "right" in str(info.get("position", "")) else "center")
 
 
-def _load_chunk_character_layer(info: dict | None):
+def _load_chunk_character_layer(info: dict | None, text_rect=None):
     """Layer personaggio (immagine + XY) per il chunk, o (None, None).
 
-    Col preset usa `get_character_layer` (scala width-based + punch_in);
-    errori non bloccanti (asset mancante, posa invalida): il frame viene
+    Placement vincolato (scala = min(base, vincolo altezza, vincolo larghezza)
+    + centro visivo in safe zone + clamp): soggetto interamente nel frame con
+    margine, faccia mai tagliata. `text_rect` (x, y, w, h della fascia
+    sottotitoli, opzionale) evita l'overlap col testo (il testo ha priorita').
+    Errori non bloccanti (asset mancante, posa invalida): il frame viene
     generato senza personaggio (nessuna regressione).
     """
     if info is None:
@@ -1257,8 +1260,40 @@ def _load_chunk_character_layer(info: dict | None):
             char_img, px, py = get_character_layer(
                 int(info["pose"]), info.get("layout"),
                 bool(info.get("punch_in", False)),
-                VIDEO_WIDTH, VIDEO_HEIGHT)
+                VIDEO_WIDTH, VIDEO_HEIGHT, text_rect=text_rect)
             return char_img, (px, py)
+        # Legacy v1: stesso placement vincolato (position -> zona), fallback
+        # al calcolo storico se fallisce.
+        try:
+            from core.character_selector import load_character_original
+            from core.character_geometry import compute_subject_placement
+            _orig = load_character_original(int(info["pose"]))
+            try:
+                _hint = float(info.get("scale", 0.75))
+            except (TypeError, ValueError):
+                _hint = 0.75
+            _pl = compute_subject_placement(
+                int(info["pose"]), str(info.get("position", "bottom_center")),
+                False, VIDEO_WIDTH, VIDEO_HEIGHT, src_size=_orig.size,
+                scale_hint=_hint, text_rect=text_rect)
+            try:
+                from PIL import Image as _PILImage
+                try:
+                    _rs = _PILImage.Resampling.LANCZOS
+                except AttributeError:  # Pillow < 9.1
+                    _rs = _PILImage.LANCZOS
+                _resized = _orig.resize((int(_pl["new_w"]), int(_pl["new_h"])), _rs)
+                if _resized.mode != "RGBA":
+                    _resized = _resized.convert("RGBA")
+                return _resized, (int(_pl["px"]), int(_pl["py"]))
+            except Exception:
+                pass
+        except Exception as _le:
+            try:
+                print(f"[text_animator] warning: placement legacy fallito "
+                      f"({_le}), uso bbox storica")
+            except Exception:
+                pass
         from core.character_selector import character_target_height, load_and_process_character_image
         target_h = character_target_height(info.get("scale", 0.75), VIDEO_HEIGHT)
         char_img = load_and_process_character_image(int(info["pose"]), target_h)
@@ -1817,7 +1852,20 @@ def generate_animated_chunk_frames(
 
     # --- Personaggio del chunk (layer UNA volta, riusato in ogni frame) ---
     # Z-index sui frame: 1. sfondo (ffmpeg) / 2. personaggio / 2.5 pill / 3. testo.
-    char_img, char_base_xy = _load_chunk_character_layer(char_info)
+    # La fascia testo (area) guida il placement anti-overlap (FASE 7); il
+    # keyframe finale delle transizioni coincide con lo stato stabile clampato
+    # (offset 0 a progress 1, vedi _character_entry_offset_opacity), quindi il
+    # fuori-campo esiste solo a meta' animazione (FASE 4); il punch_in e'
+    # ricappato su vincolo larghezza + faccia visibile (FASE 5).
+    try:
+        _char_text_rect = None
+        if area is not None and len(area) == 4:
+            _char_text_rect = (float(area[0]), float(area[1]),
+                               float(area[2] - area[0]), float(area[3] - area[1]))
+    except Exception:
+        _char_text_rect = None
+    char_img, char_base_xy = _load_chunk_character_layer(char_info,
+                                                         text_rect=_char_text_rect)
     if char_img is not None and char_base_xy is not None and char_info is not None:
         char_transition = char_info.get("transition_in", "fade") or "fade"
         char_side = _character_side(char_info)
@@ -2215,7 +2263,16 @@ def generate_cta_card_frames(
 
     # --- Personaggio bloccato (layer unico per tutta la card) ---
     # CTA card = finale stabile: sempre slide corta/morbida, mai full-travel.
-    char_img, char_base_xy = _load_chunk_character_layer(first_info)
+    # La fascia testo guida il placement anti-overlap come nel path normale.
+    try:
+        _cta_text_rect = None
+        if area is not None and len(area) == 4:
+            _cta_text_rect = (float(area[0]), float(area[1]),
+                              float(area[2] - area[0]), float(area[3] - area[1]))
+    except Exception:
+        _cta_text_rect = None
+    char_img, char_base_xy = _load_chunk_character_layer(first_info,
+                                                         text_rect=_cta_text_rect)
     if char_img is not None and char_base_xy is not None and first_info is not None:
         char_transition = first_info.get("transition_in", "fade") or "fade"
         char_side = _character_side(first_info)
@@ -2492,6 +2549,9 @@ def render_full_timeline_frames(
             pass
 
         # --- Layer character per segmento (una sola volta, riusati) ---
+        # Nota FASE 7: i segmenti attraversano piu' chunk con fasce testo
+        # diverse, quindi niente text_rect qui (placement stabile clampato +
+        # safe area dinamiche strutturali: l'overlap e' impossibile).
         seg_layers: list[dict] = []
         try:
             for s_idx, seg in enumerate(segments):

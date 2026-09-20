@@ -18,6 +18,7 @@ from PIL import Image, ImageDraw, ImageFont
 
 from config import (
     CHARACTER_ENABLED,
+    CHARACTER_DEBUG,
     VIDEO_WIDTH,
     VIDEO_HEIGHT,
     SUBTITLE_FONT_PATH,
@@ -640,7 +641,12 @@ def calculate_character_transform(
     canvas_h: int = VIDEO_HEIGHT,
     pose: int | None = None,
 ) -> tuple[int, int, int, int]:
-    """Coordinate overlay width-based (v8 presenza piena, taglio impossibile).
+    """Coordinate overlay con placement vincolato (taglio impossibile).
+
+    Tenta prima il placement vincolato (core/character_geometry: scala =
+    min(base, vincolo altezza, CHARACTER_MAX_WIDTH_RATIO) + centro visivo in
+    safe zone + clamp + faccia mai tagliata); se fallisce usa il calcolo
+    width-based storico v8 qui sotto (presenza piena, FIT-TO-HALF sugli split).
 
     - Larghezza: preset_width_pct (split 130%, center 125%, punch 170% /
       1.15x), poi EMERGENCY AUTOSCALE negli split: se la bbox visibile della
@@ -684,6 +690,31 @@ def calculate_character_transform(
             return (int(_thit[0]), int(_thit[1]), int(_thit[2]), int(_thit[3]))
     except Exception:
         _tkey = None
+    # Path vincolato (FASE 2-5): scala = min(base, vincolo altezza, vincolo
+    # larghezza) + centro visivo in safe zone + clamp. Se fallisce, sotto il
+    # vecchio calcolo width-based (fail-safe, look invariato).
+    if _pose_key is not None:
+        try:
+            from core.character_geometry import compute_subject_placement
+            _pl = compute_subject_placement(
+                _pose_key, layout_preset, bool(is_punch_in),
+                cw, ch, src_size=(int(src_w), int(src_h)))
+            _res_new = (int(_pl["new_w"]), int(_pl["new_h"]),
+                        int(_pl["px"]), int(_pl["py"]))
+            try:
+                if _tkey is not None:
+                    if len(_transform_cache) >= _TRANSFORM_CACHE_MAX:
+                        _transform_cache.clear()
+                    _transform_cache[_tkey] = _res_new
+            except Exception:
+                pass
+            return _res_new
+        except Exception as _e:
+            try:
+                print(f"[renderer] warning: placement vincolato fallito ({_e}), "
+                      f"uso width-based storico")
+            except Exception:
+                pass
     new_w = max(1, int(round(cw * preset_width_pct(preset, bool(is_punch_in)))))
     new_h = max(1, int(round(src_h * new_w / float(src_w))))
 
@@ -780,53 +811,88 @@ def get_character_layer(
     is_punch_in: bool = False,
     canvas_w: int = VIDEO_WIDTH,
     canvas_h: int = VIDEO_HEIGHT,
+    text_rect: tuple[float, float, float, float] | None = None,
 ) -> tuple[Image.Image, int, int]:
-    """Layer personaggio (v6 face-anchor: full-image, niente trim).
+    """Layer personaggio (full-image, niente trim; placement vincolato).
 
-    RIMOSSO il trim del bbox alpha: spostava il paste di +368px a destra e,
-    combinato col paste fisso, tagliava meta' volto sul bordo destro (e la
-    posa 2 larga copriva il testo). Il layer intero (con padding trasparente)
-    si incolla esattamente a (px,py) da calculate_character_transform
-    (face-anchor 25%/75%, volto integro): costo +~10ms/frame.
+    Scala = min(base, vincolo altezza, CHARACTER_MAX_WIDTH_RATIO) con centro
+    visivo in safe zone + clamp (vedi core/character_geometry): il soggetto
+    sta interamente nel frame con margine, faccia mai tagliata. `text_rect`
+    (x, y, w, h della fascia sottotitoli, opzionale) sposta/riduce il soggetto
+    se copre oltre il 25% del testo (il testo ha priorita'). Retrocompatibile:
+    senza text_rect il comportamento e' il placement stabile clampato.
     """
     from core.character_selector import load_character_original
     try:
         original = load_character_original(pose)
     except Exception:
         raise
+    _new_path_ok = False
     try:
         _pp: int | None = None
         try:
             _pp = int(pose)
         except Exception:
             _pp = None
-        new_w, new_h, px, py = calculate_character_transform(
-            original.size, layout_preset, is_punch_in, canvas_w, canvas_h,
-            pose=_pp)
-    except Exception:
-        new_w, new_h, px, py = int(canvas_w * 1.30), int(canvas_h), 0, int(HEADROOM_TOP)
+        if _pp is not None:
+            from core.character_geometry import compute_subject_placement
+            _pl = compute_subject_placement(
+                _pp, layout_preset, bool(is_punch_in), canvas_w, canvas_h,
+                src_size=original.size, text_rect=text_rect)
+            new_w, new_h, px, py = (int(_pl["new_w"]), int(_pl["new_h"]),
+                                    int(_pl["px"]), int(_pl["py"]))
+            _new_path_ok = True
+            try:
+                if float(_pl.get("visible_ratio", 1.0)) < 0.97:
+                    print(f"[renderer] warning: visible_ratio basso "
+                          f"posa {pose}/{layout_preset}: "
+                          f"{float(_pl.get('visible_ratio', 0.0)):.3f}")
+            except Exception:
+                pass
+        else:
+            raise ValueError("posa non valida")
+    except Exception as _e:
+        try:
+            print(f"[renderer] warning: placement vincolato fallito ({_e}), "
+                  f"uso transform storico")
+        except Exception:
+            pass
+        try:
+            _pp2: int | None = None
+            try:
+                _pp2 = int(pose)
+            except Exception:
+                _pp2 = None
+            new_w, new_h, px, py = calculate_character_transform(
+                original.size, layout_preset, is_punch_in, canvas_w, canvas_h,
+                pose=_pp2)
+        except Exception:
+            new_w, new_h, px, py = int(canvas_w * 1.30), int(canvas_h), 0, int(HEADROOM_TOP)
     try:
         px, py, new_w, new_h = validate_character_bounds(
             px, py, new_w, new_h, canvas_w, canvas_h)
     except Exception:
         pass
-    try:
-        from core.layout_presets import verify_perfect_crop
+    if not _new_path_ok:
+        # Invariante storica solo per il path storico: col placement vincolato
+        # la garanzia e' soggetto-dentro + faccia-dentro (verificata sopra).
         try:
-            _vpunch = bool(is_punch_in)
-        except Exception:
-            _vpunch = False
-        check = verify_perfect_crop(new_w, new_h, px, py, canvas_w, canvas_h,
-                                    layout_preset, _vpunch)
-        if not check.get("ok"):
+            from core.layout_presets import verify_perfect_crop
             try:
-                print(f"[renderer] warning: fuori invariante "
-                      f"posa {pose}/{layout_preset} scala {check.get('scale_pct', 0):.2f} "
-                      f"head_ok={check.get('head_ok')} anchored={check.get('anchored')}")
+                _vpunch = bool(is_punch_in)
             except Exception:
-                pass
-    except Exception:
-        pass
+                _vpunch = False
+            check = verify_perfect_crop(new_w, new_h, px, py, canvas_w, canvas_h,
+                                        layout_preset, _vpunch)
+            if not check.get("ok"):
+                try:
+                    print(f"[renderer] warning: fuori invariante "
+                          f"posa {pose}/{layout_preset} scala {check.get('scale_pct', 0):.2f} "
+                          f"head_ok={check.get('head_ok')} anchored={check.get('anchored')}")
+                except Exception:
+                    pass
+        except Exception:
+            pass
     key = (int(pose), new_w, new_h)
     cached = _character_layer_cache.get(key)
     if cached is None:
@@ -862,16 +928,20 @@ def clear_character_layer_cache() -> None:
         pass
 
 
-def _draw_character_static(img: Image.Image, character: dict | None) -> None:
+def _draw_character_static(
+    img: Image.Image,
+    character: dict | None,
+    text_rect: tuple[float, float, float, float] | None = None,
+) -> None:
     """Disegna il personaggio sul frame (Z-index: sopra lo sfondo, sotto i sottotitoli).
 
     `character` e' un dict di metadati come arricchito in main.py via
     core/character_selector.enrich_chunks_with_characters (oppure il chunk
-    stesso). La risoluzione passa da `resolve_chunk_layout`: col preset valido
-    si usa `get_character_layer` (scala 130-140% + ancoraggio ALTO Y=200,
-    punch_in amplificato), altrimenti il posizionamento legacy v1 (validato
-    anti-decapitazione: mai testa fuori schermo).
-    Errori non bloccanti (asset mancante, posa invalida): nessun disegno.
+    stesso). La risoluzione passa da `resolve_chunk_layout`: il placement
+    vincolato (scala = min(base, vincolo altezza, vincolo larghezza) + centro
+    visivo in safe zone + clamp) vale sia col preset che col posizionamento
+    legacy v1; `text_rect` (x, y, w, h della fascia sottotitoli) evita
+    l'overlap col testo. Errori non bloccanti: nessun disegno.
     """
     if not CHARACTER_ENABLED:
         return
@@ -886,22 +956,49 @@ def _draw_character_static(img: Image.Image, character: dict | None) -> None:
         if info["use_preset"]:
             char_img, x, y = get_character_layer(
                 info["pose"], info["layout"], info.get("punch_in", False),
-                VIDEO_WIDTH, VIDEO_HEIGHT)
+                VIDEO_WIDTH, VIDEO_HEIGHT, text_rect=text_rect)
         else:
-            from core.character_selector import (
-                character_target_height,
-                load_and_process_character_image,
-            )
-            target_h = character_target_height(info["scale"], VIDEO_HEIGHT)
-            char_img = load_and_process_character_image(info["pose"], target_h)
-            x, y = calculate_character_bbox(char_img.size, info["position"], VIDEO_WIDTH, VIDEO_HEIGHT)
-            # Sanity anti-decapitazione anche sul path legacy.
+            # Legacy v1: stesso placement vincolato (mappa position -> zona),
+            # con fallback al calcolo storico se fallisce.
             try:
-                x, y, _sw, _sh = validate_character_bounds(
-                    x, y, char_img.size[0], char_img.size[1],
-                    VIDEO_WIDTH, VIDEO_HEIGHT)
-            except Exception:
-                pass
+                from core.character_selector import load_character_original
+                from core.character_geometry import compute_subject_placement
+                _orig = load_character_original(int(info["pose"]))
+                _pl = compute_subject_placement(
+                    int(info["pose"]), str(info.get("position", "bottom_center")),
+                    False, VIDEO_WIDTH, VIDEO_HEIGHT,
+                    src_size=_orig.size,
+                    scale_hint=float(info.get("scale", 0.75)),
+                    text_rect=text_rect)
+                try:
+                    resample = Image.Resampling.LANCZOS
+                except AttributeError:  # Pillow < 9.1
+                    resample = Image.LANCZOS
+                char_img = _orig.resize((int(_pl["new_w"]), int(_pl["new_h"])),
+                                        resample)
+                if char_img.mode != "RGBA":
+                    char_img = char_img.convert("RGBA")
+                x, y = int(_pl["px"]), int(_pl["py"])
+            except Exception as _le:
+                try:
+                    print(f"[renderer] warning: placement legacy fallito ({_le}), "
+                          f"uso bbox storica")
+                except Exception:
+                    pass
+                from core.character_selector import (
+                    character_target_height,
+                    load_and_process_character_image,
+                )
+                target_h = character_target_height(info["scale"], VIDEO_HEIGHT)
+                char_img = load_and_process_character_image(info["pose"], target_h)
+                x, y = calculate_character_bbox(char_img.size, info["position"], VIDEO_WIDTH, VIDEO_HEIGHT)
+                # Sanity anti-decapitazione anche sul path legacy.
+                try:
+                    x, y, _sw, _sh = validate_character_bounds(
+                        x, y, char_img.size[0], char_img.size[1],
+                        VIDEO_WIDTH, VIDEO_HEIGHT)
+                except Exception:
+                    pass
     except Exception:
         return
     _paste_character_clipped(img, char_img, x, y)
@@ -1011,10 +1108,19 @@ def render_subtitle_image(
         Percorso assoluto del file PNG generato.
     """
     img = Image.new("RGBA", (VIDEO_WIDTH, VIDEO_HEIGHT), (0, 0, 0, 0))
-    # Z-index 2: personaggio (lo sfondo tinta unita e' applicato da ffmpeg).
-    if character is not None:
-        _draw_character_static(img, character)
+    # Safe area prima del personaggio: la fascia testo (x, y, w, h) guida il
+    # placement anti-overlap (FASE 7, il testo ha priorita').
     area, needs_pill, font_scale = _resolve_safe_area(character, safe_area, text_safe_area)
+    if character is not None:
+        _text_rect = None
+        try:
+            if area is not None and len(area) == 4:
+                _text_rect = (float(area[0]), float(area[1]),
+                              float(area[2] - area[0]), float(area[3] - area[1]))
+        except Exception:
+            _text_rect = None
+        # Z-index 2: personaggio (lo sfondo tinta unita e' applicato da ffmpeg).
+        _draw_character_static(img, character, text_rect=_text_rect)
     if area is None:
         area = (90, 140, 990, 720)
 
@@ -1148,7 +1254,85 @@ def render_subtitle_image(
         pass
     output_path = os.path.join(TEMP_DIR, f"subtitle_{index:04d}.png")
     img.save(output_path)
+    # Diagnostica FASE 8 (solo con CHARACTER_DEBUG=1, mai nel path felice).
+    try:
+        _maybe_debug_character_chunk(index, character, area, layout, img)
+    except Exception:
+        pass
     return output_path
+
+
+def _maybe_debug_character_chunk(
+    index: int,
+    character: dict | None,
+    area: tuple[int, int, int, int] | None,
+    layout: list[dict] | None,
+    img: Image.Image | None = None,
+) -> None:
+    """PNG di debug per chunk (bordo frame, safe zone, bbox, faccia, testo).
+
+    Attivo solo con CHARACTER_DEBUG=1: salva in TEMP_DIR/debug_char/ e logga
+    visible_ratio e correzioni. Non solleva mai.
+    """
+    try:
+        if not int(CHARACTER_DEBUG):
+            return
+    except Exception:
+        return
+    try:
+        from core.character_selector import resolve_chunk_layout as _resolve
+        info = _resolve(character) if isinstance(character, dict) else None
+    except Exception:
+        return
+    if info is None:
+        return
+    try:
+        from core.character_geometry import (
+            compute_subject_placement,
+            debug_dir,
+            safe_zone_for_layout,
+            save_debug_png,
+        )
+        try:
+            _pose = int(info.get("pose"))
+        except (TypeError, ValueError):
+            return
+        _lay = str(info.get("layout"))
+        try:
+            _punch = bool(info.get("punch_in", False))
+        except Exception:
+            _punch = False
+        _text_rect = None
+        try:
+            if area is not None and len(area) == 4:
+                _text_rect = (float(area[0]), float(area[1]),
+                              float(area[2] - area[0]), float(area[3] - area[1]))
+        except Exception:
+            _text_rect = None
+        pl = compute_subject_placement(
+            _pose, _lay, _punch, VIDEO_WIDTH, VIDEO_HEIGHT, text_rect=_text_rect)
+        out = os.path.join(debug_dir(), f"chunk_{int(index):04d}.png")
+        save_debug_png(
+            out, VIDEO_WIDTH, VIDEO_HEIGHT,
+            subject_rect=pl.get("subject_rect"),
+            face_rect=pl.get("face_rect"),
+            text_rect=_text_rect,
+            safe_zone=safe_zone_for_layout(str(pl.get("layout_used", _lay))),
+            pose=_pose, layout=str(pl.get("layout_used", _lay)),
+            base_image=img)
+        try:
+            print(f"[debug_char] chunk {int(index)}: posa {_pose} "
+                  f"{pl.get('layout_used')} punch={int(_punch)} "
+                  f"vis={float(pl.get('visible_ratio', 0.0)):.3f} "
+                  f"corretto={bool(pl.get('corrected'))} "
+                  f"note={pl.get('notes')}")
+        except Exception:
+            pass
+    except Exception as e:
+        try:
+            print(f"[debug_char] warning: debug chunk {index} fallito ({e})")
+        except Exception:
+            pass
 
 
 def render_all_subtitles(

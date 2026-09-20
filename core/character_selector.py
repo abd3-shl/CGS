@@ -57,7 +57,9 @@ from core.layout_presets import (
     normalize_transition_in,
     preset_default_transition,
 )
-
+# Geometria soggetto (FASE 1/6): nessun ciclo di import (quel modulo importa
+# solo config + layout_presets).
+from core.character_geometry import get_subject_geometry, validate_pose_layout_pair
 # Soglia sfondo nero opaco da rendere trasparente.
 _BLACK_THRESHOLD = 15
 
@@ -846,6 +848,19 @@ def preload_character_assets(poses: tuple[int, ...] | list[int] | None = None) -
                 print(f"[character] warning: posa {p} non precaricata ({e})")
             except Exception:
                 pass
+    # Warmup geometria (FASE 1): misura il soggetto una sola volta per asset
+    # (bbox visibile, centro visivo, faccia) e tienila in cache RAM.
+    try:
+        for p in poses:
+            try:
+                get_subject_geometry(int(p))
+            except Exception as e:
+                try:
+                    print(f"[character] warning: geometria posa {p} saltata ({e})")
+                except Exception:
+                    pass
+    except Exception:
+        pass
     return ok
 
 
@@ -854,6 +869,10 @@ def enforce_pose_layout_coherence(plan: list[dict]) -> list[dict]:
 
     - Posa 2 (larga 676px) SEMPRE center (in split coprirebbe il testo).
     - Posa 4/5 SEMPRE split (indicano/pensano verso il testo).
+    - Pass di validazione geometrica (FASE 6): la coppia posa/layout viene
+      ricontrollata sulla larghezza reale del soggetto (pose larghe/braccio
+      teso solo al centro); se non ammessa usa il layout ammesso piu' vicino
+      per direzione e logga "layout corretto" (vedi character_geometry).
     Chiamata per ULTIMA in finalize: nessun lock a valle puo' reintrodurre
     combo vietate (era il buco che metteva la posa 2 a destra tagliata).
     """
@@ -880,7 +899,7 @@ def enforce_pose_layout_coherence(plan: list[dict]) -> list[dict]:
                     except Exception:
                         pass
                 elif pose in (4, 5) and lay not in ("layout_split_left",
-                                                    "layout_split_right"):
+                                                     "layout_split_right"):
                     _nl = "layout_split_left" if _flip % 2 == 0 else "layout_split_right"
                     _flip += 1
                     entry["layout"] = _nl
@@ -889,6 +908,36 @@ def enforce_pose_layout_coherence(plan: list[dict]) -> list[dict]:
                         entry["position"] = legacy_position(_nl)
                         entry["transition_in"] = preset_default_transition(_nl)
                         entry["transition"] = legacy_transition(entry["transition_in"])
+                    except Exception:
+                        pass
+            except Exception:
+                continue
+    except Exception:
+        pass
+    # Pass geometrico FASE 6 sul layout risultante (anche legacy): valida la
+    # coppia sulla larghezza reale del soggetto e corregge al vicino per
+    # direzione con log "layout corretto". Mantiene le regole esistenti
+    # (MAX_CONSECUTIVE, dwell, full-travel gestiti a monte: qui solo coerenza).
+    try:
+        for entry in plan or []:
+            try:
+                if not isinstance(entry, dict):
+                    continue
+                pose = int(entry.get("pose", 1))
+                lay = str(entry.get("layout", entry.get("layout_preset",
+                                                        "layout_center_standard")))
+            except Exception:
+                continue
+            try:
+                fixed, changed = validate_pose_layout_pair(pose, lay)
+                if changed and isinstance(fixed, str) and fixed != lay:
+                    entry["layout"] = fixed
+                    entry["layout_preset"] = fixed
+                    try:
+                        entry["position"] = legacy_position(fixed)
+                        entry["transition_in"] = preset_default_transition(fixed)
+                        entry["transition"] = legacy_transition(
+                            entry["transition_in"])
                     except Exception:
                         pass
             except Exception:

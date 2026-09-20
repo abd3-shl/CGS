@@ -245,6 +245,19 @@ CHARACTER_MIN_DWELL_SECONDS = _get_float("CHARACTER_MIN_DWELL_SECONDS", 3.0)
 # 1 = slide lunga da fuori-campo solo alla prima apparizione; i cambi successivi
 # usano slide corta (260-320px) a piena opacità: niente salti da un bordo all'altro.
 CHARACTER_FULL_TRAVEL_FIRST_ONLY = os.environ.get("CHARACTER_FULL_TRAVEL_FIRST_ONLY", "1").strip().lower() not in ("0", "false", "no", "off", "")
+# Larghezza massima del SOGGETTO visibile (non dell'immagine intera col padding
+# trasparente) in frazione di VIDEO_WIDTH. Vince sempre sulla scala da altezza:
+# le pose larghe (es. braccia tese) vengono ridotte finché ci stanno.
+CHARACTER_MAX_WIDTH_RATIO = _get_float("CHARACTER_MAX_WIDTH_RATIO", 0.62)
+# Margine di sicurezza (px) dai bordi del frame per soggetto e faccia.
+CHARACTER_SAFE_MARGIN_PX = _get_int("CHARACTER_SAFE_MARGIN_PX", 40)
+# Frazione minima del soggetto che deve restare visibile a riposo (1.0 = intero).
+CHARACTER_MIN_VISIBLE_RATIO = _get_float("CHARACTER_MIN_VISIBLE_RATIO", 0.97)
+# Frazione minima della faccia che deve restare visibile (1.0 = mai tagliata).
+CHARACTER_FACE_MIN_VISIBLE = _get_float("CHARACTER_FACE_MIN_VISIBLE", 1.0)
+# 1 = salva in TEMP_DIR/debug_char/ un PNG per chunk con bordo frame, safe zone,
+# subject_bbox, face_box e fascia testo + log di visible_ratio e correzioni.
+CHARACTER_DEBUG = _get_int("CHARACTER_DEBUG", 0)
 # Alias storici (retrocompatibilita').
 CHARACTER_POSITIONS = CHARACTER_VALID_POSITIONS
 CHARACTER_TRANSITIONS = CHARACTER_VALID_TRANSITIONS
