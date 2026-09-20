@@ -270,6 +270,40 @@ class VideoGeneratorApp:
         symbol = "✅" if ok else "⚠️"
         self._log(f"      {symbol} chiave {index}/{total}: {short}")
 
+    def _preload_fonts_safe(self, typography_niche=None) -> None:
+        """Warmup RAM font (fail-safe: mai solleva, warning su fallback)."""
+        try:
+            from core.font_manager import FontManager
+            from core.typography_presets import get_preset
+            niche = typography_niche or "dark_motivational"
+            try:
+                preset = get_preset(niche)
+            except Exception:
+                preset = None
+            fm = FontManager()
+            if preset is not None:
+                paths = fm.preload_preset_fonts(preset)
+            else:
+                paths = fm.preload_preset_fonts(niche)
+            self._log(f"      Font pre-caricati in RAM: "
+                      f"{sum(1 for p in (paths or {}).values() if p)} / 3 ruoli.")
+        except Exception as e:
+            self._log(f"      ⚠️ Preload font saltato ({e}), uso fallback runtime.")
+
+    def _preload_chars_safe(self) -> None:
+        """Warmup RAM character layer (fail-safe: mai solleva)."""
+        try:
+            from core.character_selector import preload_character_assets
+            from core.renderer import preload_character_layers
+            n1 = preload_character_assets()
+            try:
+                n2 = preload_character_layers()
+            except Exception:
+                n2 = 0
+            self._log(f"      Personaggi pre-caricati in RAM: {n1} asset + {n2} layer.")
+        except Exception as e:
+            self._log(f"      ⚠️ Preload personaggi saltato ({e}).")
+
     def _run_pipeline(self, scripts: str | list[str]):
         """Orchestratore bulk: uno script = un video, processati separatamente.
 
@@ -520,6 +554,24 @@ class VideoGeneratorApp:
                 chunks = enrich_chunks_with_characters(chunks, character_plan)
             except Exception:
                 pass
+
+        # --- Warmup RAM v2 (zero I/O in loop frame): font PIL + layer char ---
+        # Fail-safe: mai bloccante, warning su fallback.
+        try:
+            import concurrent.futures as _prefut
+            with _prefut.ThreadPoolExecutor(max_workers=2) as _pre:
+                _f_font = _pre.submit(self._preload_fonts_safe, typography_niche)
+                _f_char = _pre.submit(self._preload_chars_safe)
+                try:
+                    _f_font.result()
+                except Exception:
+                    pass
+                try:
+                    _f_char.result()
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
         self._log(f"{tag}[7/8] Rendering sottotitoli animati per-parola (Pillow+easing)...")
         if TEXT_ANIMATION_ENABLED:

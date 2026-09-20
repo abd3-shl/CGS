@@ -1,19 +1,35 @@
 """
-Semantic Typography Engine v1 — Preset tipografici per nicchia.
+Semantic Typography Engine v2 — Preset tipografici per nicchia (REELS-FIX v5).
 
 Ogni nicchia definisce 3 livelli visivi:
-  - base:   parlato standard / congiunzioni / testo generico
-  - impact: keyword ad alto valore, dati numerici, concetti chiave
-  - accent: domande retoriche, citazioni, parole tra virgolette, espressioni d'effetto
+  - base:   parlato standard SemiBold 52-56px (auto-fit minimo 38px)
+  - impact: keyword 1.25x (uppercase solo se <=7 char), colore highlight
+  - accent: citazioni/domande 1.05x handwritten, colore dedicato
 
 Per ogni livello: lista font in ordine di preferenza, colore, scala dimensione.
-Look pulito: NESSUN contorno (stroke_width=0) e NESSUNA ombra di default.
-Leggibilità garantita da contrasto tema + pill sul punch-in (vedi config.py).
+REELS-FIX v5: stroke 0 assoluto, ambient shadow morbida (0,3,110) +
+auto-pill (0,0,0,120) solo se contrasto <80.
 
 Uso:
     from core.typography_presets import get_preset, VALID_NICHES, FALLBACK_NICHE
     preset = get_preset("tech_ai")
 """
+
+# REELS-FIX v5: STROKE 0 ASSOLUTO di default (nessun contorno nero).
+# Leggibilita' da contrasto + ambient shadow morbida (0,3,110) + auto-pill.
+FORCED_STROKE_WIDTH: int = 0
+FORCED_SHADOW_OFFSET: tuple[int, int] = (0, 3)
+FORCED_SHADOW_FILL: tuple[int, int, int, int] = (0, 0, 0, 110)
+# Dimensione base target 52-56px SemiBold, auto-fit minimo 38px (mai sotto).
+MIN_BASE_FONT_SIZE: int = 38
+TARGET_BASE_FONT_SIZE: int = 54
+# Parole impact piu' lunghe di N char restano minuscole (no espansione brutta).
+IMPACT_UPPERCASE_MAX_LEN: int = 7
+# Pill dinamica quando contrasto < soglia: sfondo elegante, non stroke.
+AUTO_PILL_FILL: tuple[int, int, int, int] = (0, 0, 0, 120)
+AUTO_PILL_RADIUS: int = 24
+AUTO_PILL_PAD_X: int = 20
+AUTO_PILL_PAD_Y: int = 10
 
 # Nicchia di fallback quando il rilevamento LLM è incerto o fallisce.
 FALLBACK_NICHE: str = "dark_motivational"
@@ -41,7 +57,9 @@ TYPOGRAPHY_PRESETS: dict[str, dict] = {
     "business_finance": {
         "fonts": {
             "base": ["Inter", "Roboto"],
-            "impact": ["Anton", "Impact"],
+            # v2: Impact rimosso (font di sistema, non Google Fonts) -> Oswald/Bebas
+            # equivalenti visivi 1:1 stabili (vedi VISUAL_FALLBACK_MATRIX).
+            "impact": ["Anton", "Oswald", "Bebas Neue"],
             "accent": ["Playfair Display", "Caveat"],
         },
         "colors": {
@@ -51,12 +69,12 @@ TYPOGRAPHY_PRESETS: dict[str, dict] = {
             "stroke": "#000000",
         },
         "sizes": {
-            "base": 60,
-            "impact_scale": 1.4,   # 84px
-            "accent_scale": 1.1,   # 66px
+            "base": 54,
+            "impact_scale": 1.25,
+            "accent_scale": 1.05,
         },
-        "stroke_width": 0,  # nessun contorno: look pulito
-        "shadow": {"offset": (0, 0), "fill": (0, 0, 0, 0)},
+        "stroke_width": 0,  # REELS-FIX v5: stroke 0, leggibilita' da contrasto+ombra
+        "shadow": {"offset": (0, 3), "fill": (0, 0, 0, 110)},
         "impact_uppercase": True,
     },
     "tech_ai": {
@@ -72,12 +90,12 @@ TYPOGRAPHY_PRESETS: dict[str, dict] = {
             "stroke": "#000000",
         },
         "sizes": {
-            "base": 60,
-            "impact_scale": 1.4,
-            "accent_scale": 1.1,
+            "base": 54,
+            "impact_scale": 1.25,
+            "accent_scale": 1.05,
         },
         "stroke_width": 0,
-        "shadow": {"offset": (0, 0), "fill": (0, 0, 0, 0)},
+        "shadow": {"offset": (0, 3), "fill": (0, 0, 0, 110)},
         "impact_uppercase": True,
     },
     "fitness_sport": {
@@ -93,12 +111,12 @@ TYPOGRAPHY_PRESETS: dict[str, dict] = {
             "stroke": "#000000",
         },
         "sizes": {
-            "base": 60,
-            "impact_scale": 1.45,  # più aggressivo
-            "accent_scale": 1.1,
+            "base": 54,
+            "impact_scale": 1.25,
+            "accent_scale": 1.05,
         },
         "stroke_width": 0,
-        "shadow": {"offset": (0, 0), "fill": (0, 0, 0, 0)},
+        "shadow": {"offset": (0, 3), "fill": (0, 0, 0, 110)},
         "impact_uppercase": True,
     },
     "lifestyle_vlog": {
@@ -114,12 +132,12 @@ TYPOGRAPHY_PRESETS: dict[str, dict] = {
             "stroke": "#000000",
         },
         "sizes": {
-            "base": 60,
-            "impact_scale": 1.3,
-            "accent_scale": 1.1,
+            "base": 54,
+            "impact_scale": 1.25,
+            "accent_scale": 1.05,
         },
         "stroke_width": 0,
-        "shadow": {"offset": (0, 0), "fill": (0, 0, 0, 0)},
+        "shadow": {"offset": (0, 3), "fill": (0, 0, 0, 110)},
         "impact_uppercase": True,
     },
     "educational": {
@@ -135,12 +153,12 @@ TYPOGRAPHY_PRESETS: dict[str, dict] = {
             "stroke": "#000000",
         },
         "sizes": {
-            "base": 60,
-            "impact_scale": 1.35,
-            "accent_scale": 1.1,
+            "base": 54,
+            "impact_scale": 1.25,
+            "accent_scale": 1.05,
         },
         "stroke_width": 0,
-        "shadow": {"offset": (0, 0), "fill": (0, 0, 0, 0)},
+        "shadow": {"offset": (0, 3), "fill": (0, 0, 0, 110)},
         "impact_uppercase": True,
     },
     "dark_motivational": {
@@ -161,12 +179,12 @@ TYPOGRAPHY_PRESETS: dict[str, dict] = {
             "stroke": "#000000",
         },
         "sizes": {
-            "base": 62,
-            "impact_scale": 1.45,  # 90px, massimo impatto cinematico
-            "accent_scale": 1.1,
+            "base": 56,
+            "impact_scale": 1.25,
+            "accent_scale": 1.05,
         },
         "stroke_width": 0,
-        "shadow": {"offset": (0, 0), "fill": (0, 0, 0, 0)},
+        "shadow": {"offset": (0, 3), "fill": (0, 0, 0, 110)},
         "impact_uppercase": True,
     },
 }
@@ -209,6 +227,35 @@ def get_preset(niche: str | None) -> dict:
     """
     key = normalize_niche(niche) if niche else FALLBACK_NICHE
     src = TYPOGRAPHY_PRESETS.get(key, TYPOGRAPHY_PRESETS[FALLBACK_NICHE])
+    # REELS-FIX v5: stroke 0 di default, nessun pavimento rigido.
+    # Legacy con stroke>0 viene rispettato solo se esplicitamente >0,
+    # ma il default e' sempre 0 (elegante, no contorno nero).
+    try:
+        _sw = int(src.get("stroke_width", FORCED_STROKE_WIDTH))
+    except (TypeError, ValueError):
+        _sw = int(FORCED_STROKE_WIDTH)
+    if _sw < 0:
+        _sw = 0
+    try:
+        _off = tuple(src.get("shadow", {}).get("offset", FORCED_SHADOW_OFFSET))
+        _fill = tuple(src.get("shadow", {}).get("fill", FORCED_SHADOW_FILL))
+    except Exception:
+        _off, _fill = FORCED_SHADOW_OFFSET, FORCED_SHADOW_FILL
+    # Ambient shadow morbida consentita; (0,0) = nessuna ombra (rispettato).
+    # Base target 52-56px, minimo auto-fit 38px (mai sotto).
+    try:
+        _sizes = dict(src.get("sizes", {}))
+        try:
+            _b = int(_sizes.get("base", TARGET_BASE_FONT_SIZE))
+        except Exception:
+            _b = int(TARGET_BASE_FONT_SIZE)
+        if _b < int(MIN_BASE_FONT_SIZE):
+            _b = int(MIN_BASE_FONT_SIZE)
+        if _b > 64:
+            _b = 64
+        _sizes["base"] = int(_b)
+    except Exception:
+        _sizes = dict(src.get("sizes", {}))
     return {
         "niche": key,
         "fonts": {
@@ -217,11 +264,11 @@ def get_preset(niche: str | None) -> dict:
             "accent": list(src["fonts"].get("accent", [])),
         },
         "colors": dict(src.get("colors", {})),
-        "sizes": dict(src.get("sizes", {})),
-        "stroke_width": int(src.get("stroke_width", 0)),
+        "sizes": _sizes,
+        "stroke_width": int(_sw),
         "shadow": {
-            "offset": tuple(src.get("shadow", {}).get("offset", (0, 0))),
-            "fill": tuple(src.get("shadow", {}).get("fill", (0, 0, 0, 0))),
+            "offset": tuple(_off),
+            "fill": tuple(_fill),
         },
         "impact_uppercase": bool(src.get("impact_uppercase", True)),
     }

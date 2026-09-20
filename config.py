@@ -199,20 +199,25 @@ VIDEO_FPS = _get_int("VIDEO_FPS", 30)
 # Nota: lo sfondo video viene dal tema dinamico (core/theme.py),
 # non più da un colore fisso in configurazione.
 
-# ---- Sottotitoli ----
+# ---- Sottotitoli (REELS-FIX v5: stroke 0, ambient shadow) ----
 SUBTITLE_FONT_PATH = _get_str_or_none("SUBTITLE_FONT_PATH")  # None = usa un font di default del sistema, vedi core/renderer.py
-SUBTITLE_FONT_SIZE = _get_int("SUBTITLE_FONT_SIZE", 64)
+SUBTITLE_FONT_SIZE = _get_int("SUBTITLE_FONT_SIZE", 54)
 SUBTITLE_COLOR = _get_tuple("SUBTITLE_COLOR", (255, 255, 255, 255))  # bianco RGBA
-SUBTITLE_STROKE_COLOR = _get_tuple("SUBTITLE_STROKE_COLOR", (0, 0, 0, 255))  # contorno nero per leggibilità
-SUBTITLE_STROKE_WIDTH = _get_int("SUBTITLE_STROKE_WIDTH", 0)  # 0 = nessun contorno sul testo
+SUBTITLE_STROKE_COLOR = _get_tuple("SUBTITLE_STROKE_COLOR", (0, 0, 0, 0))  # stroke 0 di default
+SUBTITLE_STROKE_WIDTH = _get_int("SUBTITLE_STROKE_WIDTH", 0)  # 0 = nessun contorno (REELS-FIX v5)
 SUBTITLE_MAX_CHARS = _get_int("SUBTITLE_MAX_CHARS", 38)   # lunghezza massima approx per chunk di sottotitolo
 SUBTITLE_MAX_WORDS = _get_int("SUBTITLE_MAX_WORDS", 7)    # numero massimo di parole per chunk
+# Auto-fit: dimensione minima assoluta per blocchi densi (mai sotto).
+SUBTITLE_MIN_FONT_SIZE = _get_int("SUBTITLE_MIN_FONT_SIZE", 38)
+# Auto-pill elegante quando contrasto < soglia (anziche' stroke).
+SUBTITLE_PILL_FILL = _get_tuple("SUBTITLE_PILL_FILL", (0, 0, 0, 120))
+SUBTITLE_PILL_RADIUS = _get_int("SUBTITLE_PILL_RADIUS", 24)
 
-# ---- Animazioni testo per-parola (Fase 3) ----
+# ---- Animazioni testo per-parola (Fase 3, REELS-FIX v5: pop 0.85->1.0, no overshoot) ----
 TEXT_ANIMATION_ENABLED = os.environ.get("TEXT_ANIMATION_ENABLED", "1").strip().lower() not in ("0", "false", "no", "off", "")
 TEXT_ANIMATION_ENTRY_DURATION = _get_float("TEXT_ANIMATION_ENTRY_DURATION", 0.18)  # secondi, durata entrata singola parola
 TEXT_ANIMATION_EXIT_DURATION = _get_float("TEXT_ANIMATION_EXIT_DURATION", 0.15)  # secondi, durata fade-out di gruppo
-KEYWORD_ENTRY_SCALE_FROM = _get_float("KEYWORD_ENTRY_SCALE_FROM", 0.7)  # scala iniziale entrata keyword (0.7 -> 1.0)
+KEYWORD_ENTRY_SCALE_FROM = _get_float("KEYWORD_ENTRY_SCALE_FROM", 0.85)  # 0.85 -> 1.0, mai oltre 1.0
 
 # ---- Personaggi 2D "Character-Driven Overlay" ----
 # 1 = personaggi sovrapposti tra sfondo e sottotitoli, 0 = video senza personaggi.
@@ -226,24 +231,38 @@ CHARACTER_VALID_TRANSITIONS: list[str] = ["slide_up", "slide_side", "fade", "non
 CHARACTER_POSE_COUNT = _get_int("CHARACTER_POSE_COUNT", 5)
 CHARACTER_SCALE_MIN = _get_float("CHARACTER_SCALE_MIN", 0.65)
 CHARACTER_SCALE_MAX = _get_float("CHARACTER_SCALE_MAX", 0.90)
+# Ritmo transizioni (secondi): valori calmi per evitare flicker/appari-scompari
+# troppo veloci. Entry = ingresso slide, exit = uscita slide_down su cambio lato.
+CHARACTER_ENTRY_DURATION = _get_float("CHARACTER_ENTRY_DURATION", 0.55)
+CHARACTER_EXIT_DURATION = _get_float("CHARACTER_EXIT_DURATION", 0.45)
+# Max chunk consecutivi con stessa posa+layout (anti-sticker senza frenesia).
+# 3 = ~4-6s di permanenza con chunk da 2-3 parole; CTA tollera +1.
+CHARACTER_MAX_CONSECUTIVE = _get_int("CHARACTER_MAX_CONSECUTIVE", 3)
+# Minimum Dwell Time (secondi): nessuna apparizione/scomparsa a ritmo di singola
+# parola o chunk breve. Ogni permanenza (stessa identità) dura almeno 3.0s salvo
+# ai confini narrativi forti (hook->corpo, corpo->CTA) dove il cambio è libero.
+CHARACTER_MIN_DWELL_SECONDS = _get_float("CHARACTER_MIN_DWELL_SECONDS", 3.0)
+# 1 = slide lunga da fuori-campo solo alla prima apparizione; i cambi successivi
+# usano slide corta (260-320px) a piena opacità: niente salti da un bordo all'altro.
+CHARACTER_FULL_TRAVEL_FIRST_ONLY = os.environ.get("CHARACTER_FULL_TRAVEL_FIRST_ONLY", "1").strip().lower() not in ("0", "false", "no", "off", "")
 # Alias storici (retrocompatibilita').
 CHARACTER_POSITIONS = CHARACTER_VALID_POSITIONS
 CHARACTER_TRANSITIONS = CHARACTER_VALID_TRANSITIONS
 
-# ---- Semantic Typography Engine v1 ----
+# ---- Semantic Typography Engine v2 (REELS-FIX v5) ----
 # 1 = font/colori/dimensioni per nicchia + tagging LLM (base/impact/accent),
 # 0 = path legacy (singolo font + keyword palette).
-# Look pulito stile TikTok: NESSUN contorno nero (stroke=0) e NESSUNA ombra
-# di default. La leggibilità è garantita dal contrasto tema (sfondo/testo
-# validato in core/theme.py) + pill semi-trasparente sul preset punch-in.
+# STROKE 0 ASSOLUTO di default; leggibilita' da contrasto + ambient shadow
+# morbida (0,3,110) + auto-pill (0,0,0,120). Base 52-56px, minimo auto-fit 38px.
 TYPOGRAPHY_ENGINE_ENABLED = os.environ.get("TYPOGRAPHY_ENGINE_ENABLED", "1").strip().lower() not in ("0", "false", "no", "off", "")
-TYPOGRAPHY_BASE_FONT_SIZE = _get_int("TYPOGRAPHY_BASE_FONT_SIZE", 60)  # px, prima di font_scale del preset
-TYPOGRAPHY_IMPACT_SCALE = _get_float("TYPOGRAPHY_IMPACT_SCALE", 1.4)  # 1.3x-1.5x da spec
-TYPOGRAPHY_ACCENT_SCALE = _get_float("TYPOGRAPHY_ACCENT_SCALE", 1.1)
-TYPOGRAPHY_STROKE_WIDTH = _get_int("TYPOGRAPHY_STROKE_WIDTH", 0)  # 0 = nessun contorno (look pulito)
-TYPOGRAPHY_SHADOW_ENABLED = os.environ.get("TYPOGRAPHY_SHADOW_ENABLED", "0").strip().lower() not in ("0", "false", "no", "off", "")
-TYPOGRAPHY_SHADOW_OFFSET = _get_tuple("TYPOGRAPHY_SHADOW_OFFSET", (3, 3))
-TYPOGRAPHY_SHADOW_FILL = _get_tuple("TYPOGRAPHY_SHADOW_FILL", (0, 0, 0, 180))
+TYPOGRAPHY_BASE_FONT_SIZE = _get_int("TYPOGRAPHY_BASE_FONT_SIZE", 54)  # px, prima di font_scale del preset
+TYPOGRAPHY_MIN_FONT_SIZE = _get_int("TYPOGRAPHY_MIN_FONT_SIZE", 38)  # minimo auto-fit per blocchi densi
+TYPOGRAPHY_IMPACT_SCALE = _get_float("TYPOGRAPHY_IMPACT_SCALE", 1.25)
+TYPOGRAPHY_ACCENT_SCALE = _get_float("TYPOGRAPHY_ACCENT_SCALE", 1.05)
+TYPOGRAPHY_STROKE_WIDTH = _get_int("TYPOGRAPHY_STROKE_WIDTH", 0)  # 0 = nessun contorno
+TYPOGRAPHY_SHADOW_ENABLED = os.environ.get("TYPOGRAPHY_SHADOW_ENABLED", "1").strip().lower() not in ("0", "false", "no", "off", "")
+TYPOGRAPHY_SHADOW_OFFSET = _get_tuple("TYPOGRAPHY_SHADOW_OFFSET", (0, 3))
+TYPOGRAPHY_SHADOW_FILL = _get_tuple("TYPOGRAPHY_SHADOW_FILL", (0, 0, 0, 110))
 # Cartella font scaricati (vedi core/font_manager.py).
 FONTS_DIR = Path(BASE_DIR) / "assets" / "fonts"
 
