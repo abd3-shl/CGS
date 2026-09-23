@@ -57,9 +57,7 @@ from core.layout_presets import (
     normalize_transition_in,
     preset_default_transition,
 )
-# Geometria soggetto (FASE 1/6): nessun ciclo di import (quel modulo importa
-# solo config + layout_presets).
-from core.character_geometry import get_subject_geometry, validate_pose_layout_pair
+
 # Soglia sfondo nero opaco da rendere trasparente.
 _BLACK_THRESHOLD = 15
 
@@ -338,49 +336,15 @@ def _clamp_scale(value) -> float:
     return min(CHARACTER_SCALE_MAX, max(CHARACTER_SCALE_MIN, s))
 
 
-def _is_dense_text(text: str = "", n_words: int | None = None) -> bool:
-    """Vero se il testo e' denso (REELS-FIX v5): >6 parole o >40 caratteri.
+def _preset_for_pose(pose: int, alternate: int = 0) -> str:
+    """Preset deterministico per posa (fallback e normalizzazione).
 
-    Testi densi VIETANO center_standard (colonna split libera per il testo).
-    Mai solleva.
+    Posa 4 -> split alternati (indica il testo); posa 5 -> split laterali;
+    posa 3 -> mezza figura centrale; altre -> rotazione standard/split.
     """
-    try:
-        if n_words is None:
-            n_words = len(str(text or "").split())
-        else:
-            n_words = int(n_words)
-    except Exception:
-        n_words = 0
-    try:
-        n_chars = len(str(text or "").strip())
-    except Exception:
-        n_chars = 0
-    try:
-        return int(n_words) > 6 or int(n_chars) > 40
-    except Exception:
-        return False
-
-
-def _preset_for_pose(pose: int, alternate: int = 0, chunk_text: str = "") -> str:
-    """Preset deterministico (fallback e normalizzazione, fix posa larga).
-
-    Posa 4 -> split alternati; posa 5 -> split; posa 2 (braccia aperte,
-    676px misurati, quasi 2x le altre) -> SEMPRE center (in split coprirebbe
-    la colonna testo); testi densi -> split alternati; posa 3 breve ->
-    center; altre -> rotazione.
-    """
-    try:
-        dense = _is_dense_text(chunk_text)
-    except Exception:
-        dense = False
     if pose == 4:
         return "layout_split_right" if alternate % 2 == 0 else "layout_split_left"
     if pose == 5:
-        return "layout_split_left" if alternate % 2 == 0 else "layout_split_right"
-    if pose == 2:
-        return "layout_center_standard"
-    if dense:
-        # Testo lungo: colonna libera, alterna L/R per ritmo visivo.
         return "layout_split_left" if alternate % 2 == 0 else "layout_split_right"
     if pose == 3:
         return "layout_center_standard"
@@ -427,231 +391,18 @@ def _chunk_role(chunk: dict | None) -> str | None:
         return None
 
 
-# --- Anti-staticità v2: alternative semanticamente vicine per rotazione ---
-# Quando una run identica supera 2 chunk, si ruota su alternative dello
-# stesso registro (mai salti assurdi: assertivo<->aperto, domande<->aperto).
-_POSE_ALTERNATIVES: dict[int, list[int]] = {
-    1: [2, 4],
-    2: [4, 1],
-    3: [2, 1],
-    4: [2, 1],
-    5: [2, 4],
-}
-
-# Max chunk consecutivi con stessa identità (posa+layout) prima del ricambio.
-# Calmi (anti-flicker): 3 body/hook (~4-6s con chunk da 2-3 parole), CTA +1.
-# Override via config CHARACTER_MAX_CONSECUTIVE (default 3).
-try:
-    from config import CHARACTER_MAX_CONSECUTIVE as _CFG_MAX_CONSEC
-    ANTI_STATIC_MAX_BODY = max(2, int(_CFG_MAX_CONSEC))
-except Exception:
-    ANTI_STATIC_MAX_BODY = 3
-ANTI_STATIC_MAX_CTA = ANTI_STATIC_MAX_BODY + 1
-
-
-def _alternate_split(preset: str, flip: int = 0) -> str:
-    """Alterna split_left <-> split_right (ritmo visivo senza salti)."""
-    if preset == "layout_split_left":
-        return "layout_split_right"
-    if preset == "layout_split_right":
-        return "layout_split_left"
-    # Da centro: alterna lati per dare movimento.
-    return "layout_split_left" if flip % 2 == 0 else "layout_split_right"
-
-
-def _dynamic_successor(pose: int, layout: str, index: int) -> tuple[int, str]:
-    """Successore dinamico CALMO (B.2): preferisce cambio posa SENZA spostamento.
-
-    Stessa scena = jump-cut netto (posa diversa, stesso layout): nessun
-    slide_down/slide_up, il personaggio resta fisso e cambia espressione.
-    Il cambio di layout (slide laterale) avviene solo 1 volta su 3 rotazioni
-    o ai confini di beat. Rispetta: posa 4/5 sempre in split.
-    """
-    alts = _POSE_ALTERNATIVES.get(int(pose), [1, 2, 4])
-    new_pose = alts[index % len(alts)]
-    if new_pose == 2:
-        # Posa larga: sempre center (mai split).
-        return int(new_pose), "layout_center_standard"
-    if new_pose in (4, 5):
-        # Posa che indica/pensa: richiede split (scivola verso il lato).
-        new_layout = _alternate_split(layout, index)
-        if new_layout not in ("layout_split_left", "layout_split_right"):
-            new_layout = "layout_split_left" if index % 2 == 0 else "layout_split_right"
-    elif index % 3 == 0:
-        # 1 rotazione su 3: cambio di lato fluido (slide_side).
-        if layout in ("layout_split_left", "layout_split_right"):
-            new_layout = _alternate_split(layout, index)
-        else:
-            new_layout = "layout_split_left" if index % 2 == 0 else "layout_split_right"
-    else:
-        # 2 rotazioni su 3: STESSO layout, solo posa (jump-cut, no movimento).
-        new_layout = layout
-    return int(new_pose), str(new_layout)
-
-
-def _identity_of(entry: dict) -> tuple:
-    try:
-        return (int(entry.get("pose", 0)), str(entry.get("layout", "")))
-    except Exception:
-        return (0, "")
-
-
-def enforce_anti_static_plan(plan: list[dict], chunks: list[dict] | None = None) -> list[dict]:
-    """Regola dell'Anti-Staticità v2 (calma): mai stessa (posa+layout) oltre il limite.
-
-    - body/hook: max ANTI_STATIC_MAX_BODY (default 3, ~4-6s); CTA: +1.
-    - Al superamento: rotazione su posa alternativa vicina + lato split
-      alternato + transizione direzionale coerente (slide corta, mai full-travel
-      sui cambi: niente salti da bordo a bordo).
-    - I punch_in esistenti sono preservati (non aggiunti qui: cap dedicato).
-    - Non solleva mai; ritorna lo stesso piano (modificato in place).
-    """
-    try:
-        if not plan or len(plan) < 3:
-            return plan
-    except Exception:
-        return plan
-    try:
-        for i in range(1, len(plan)):
-            try:
-                prev, cur = plan[i - 1], plan[i]
-                if not isinstance(prev, dict) or not isinstance(cur, dict):
-                    continue
-                # Lunghezza run identica fino a i (guarda indietro).
-                run = 1
-                for k in range(i - 1, -1, -1):
-                    try:
-                        if _identity_of(plan[k]) == _identity_of(plan[k + 1]):
-                            run += 1
-                        else:
-                            break
-                    except Exception:
-                        break
-                    if run > 4:
-                        break
-                # Limite per atto (CTA tollerante).
-                try:
-                    role = str(((chunks[i] or {}) if chunks else {}).get("narrative_role", "body"))
-                except Exception:
-                    role = "body"
-                limit = ANTI_STATIC_MAX_CTA if role == "cta" else ANTI_STATIC_MAX_BODY
-                # run = n. consecutivi identici incluso il corrente.
-                # Consentiti fino a `limit` (es. 3 identici ok), cambio dal successiva.
-                if _identity_of(prev) != _identity_of(cur):
-                    continue
-                if run <= limit:
-                    continue
-                # Forza ricambio dinamico sul corrente.
-                new_pose, new_layout = _dynamic_successor(
-                    int(cur.get("pose", 1)), str(cur.get("layout", "layout_center_standard")), i)
-                cur["pose"] = new_pose
-                cur["layout"] = new_layout
-                cur["layout_preset"] = new_layout
-                try:
-                    cur["transition_in"] = preset_default_transition(new_layout)
-                    cur["position"] = legacy_position(new_layout)
-                    cur["transition"] = legacy_transition(cur["transition_in"])
-                except Exception:
-                    pass
-            except Exception:
-                continue
-    except Exception:
-        pass
-    return plan
-
-
-def _is_narrative_boundary(chunks: list[dict] | None, index: int) -> bool:
-    """Vero se tra chunk[index-1] e chunk[index] c'è un confine forte.
-
-    Confini forti (unici punti dove uscita/ri-entrata è consentita):
-    hook->corpo, corpo->CTA, oppure comparsa/scomparsa personaggio.
-    Altrove il personaggio resta in scena (jump-cut o slide corta).
-    """
-    try:
-        if not chunks or index <= 0 or index >= len(chunks):
-            return False
-        prev_role = str(((chunks[index - 1] or {}).get("narrative_role", "")))
-        cur_role = str(((chunks[index] or {}).get("narrative_role", "")))
-        if not prev_role or not cur_role:
-            return False  # senza ruoli: nessun confine rilevabile
-        return prev_role != cur_role
-    except Exception:
-        return False
-
-
-def enforce_min_dwell_time(plan: list[dict], chunks: list[dict] | None = None,
-                           min_seconds: float = 3.0) -> list[dict]:
-    """Minimum Dwell Time (B.2): ogni permanenza dura almeno `min_seconds`.
-
-    Elimina l'effetto stroboscopico: nessuna apparizione a ritmo di singola
-    parola/chunk breve. Le run identiche più corte del minimo vengono fuse
-    con la run precedente (estensione: il personaggio resta, non lampeggia),
-    SALVO ai confini narrativi forti dove il cambio è sempre libero.
-    Non solleva mai; ritorna lo stesso piano (modificato in place).
-    """
-    try:
-        if not plan or not chunks or len(plan) != len(chunks) or len(plan) < 2:
-            return plan
-    except Exception:
-        return plan
-    try:
-        try:
-            from config import CHARACTER_MIN_DWELL_SECONDS as _CFG_DWELL
-            limit_s = float(min_seconds if min_seconds else _CFG_DWELL)
-        except Exception:
-            limit_s = float(min_seconds or 3.0)
-        if limit_s <= 0:
-            return plan
-    except Exception:
-        return plan
-    try:
-        # Identifica run identiche [start, end] con durata in secondi.
-        n = len(plan)
-        run_start = 0
-        for i in range(1, n + 1):
-            boundary = (i == n) or (_identity_of(plan[i]) != _identity_of(plan[run_start]))
-            if not boundary:
-                continue
-            # Run [run_start, i): calcola durata da chunk start/end.
-            try:
-                rs = float((chunks[run_start] or {}).get("start", 0.0))
-                ce = float((chunks[i - 1] or {}).get("end", rs))
-                dur = max(0.0, ce - rs)
-            except Exception:
-                dur = 99.0
-            if dur < limit_s and run_start > 0 and (i - run_start) >= 1:
-                # Run troppo breve e non è la prima: fonde col precedente,
-                # salvo confine narrativo forte al suo inizio (cambio libero).
-                if not _is_narrative_boundary(chunks, run_start):
-                    try:
-                        ref = plan[run_start - 1]
-                        for j in range(run_start, i):
-                            plan[j]["pose"] = ref.get("pose", 2)
-                            plan[j]["layout"] = ref.get("layout", "layout_center_standard")
-                            plan[j]["layout_preset"] = plan[j]["layout"]
-                            plan[j]["position"] = legacy_position(plan[j]["layout"])
-                            plan[j]["punch_in"] = False
-                            try:
-                                plan[j]["transition_in"] = preset_default_transition(plan[j]["layout"])
-                                plan[j]["transition"] = legacy_transition(plan[j]["transition_in"])
-                            except Exception:
-                                pass
-                    except Exception:
-                        pass
-            run_start = i
-    except Exception:
-        pass
-    return plan
-
-
 def _apply_narrative_locks(plan: list[dict], chunks: list[dict]) -> list[dict]:
-    """Blocchi deterministici REELS-FIX v5 (pacing + testi lunghi in split).
+    """Blocchi deterministici per atto (stabilita' garantita anche se l'LLM varia).
 
-    - HOOK breve: posa 1 center; HOOK denso (>6 parole/>40 char): split
-      alternati L/R (mai center con blocco alto).
-    - CORPO: rotazione ogni 3 chunk; densi sempre split alternati per beat.
-    - CTA breve: posa 3/2 center; CTA densa: split fisso (stesso lato).
-    Non solleva mai; senza ruoli restituisce il piano invariato.
+    - HOOK: primo chunk posa 1 + center_standard + slide_up; punch sul climax
+      (ultimo chunk hook). Transizioni pulite in ingresso.
+    - CORPO: dentro ogni beat (stesso narrative_beat) UNA sola identita'
+      (posa+layout del primo chunk del beat); i cambi avvengono solo ai
+      confini di beat con slide piena (niente dissolvenze a meta' pensiero).
+    - CTA: TUTTI i chunk su un'unica identita' (forte: posa 3; debole: posa 2),
+      center_standard, punch=False, scala 0.75, ingresso fade sul primo.
+      Il personaggio resta pixel-identico fino alla dissolvenza finale.
+    Non solleva mai; senza ruoli sui chunk restituisce il piano invariato.
     """
     try:
         if not plan or not chunks or len(plan) != len(chunks):
@@ -663,35 +414,27 @@ def _apply_narrative_locks(plan: list[dict], chunks: list[dict]) -> list[dict]:
     try:
         hook_idx = [i for i, c in enumerate(chunks) if _chunk_role(c) == "hook"]
         cta_idx = [i for i, c in enumerate(chunks) if _chunk_role(c) == "cta"]
-        # --- HOOK REELS-FIX v5: breve=center, denso=split alternato ---
+        # --- HOOK ---
         if hook_idx:
-            _hflip = 0
-            for k, j in enumerate(hook_idx):
+            first = hook_idx[0]
+            try:
+                plan[first]["pose"] = 1
+                plan[first]["layout"] = "layout_center_standard"
+                plan[first]["layout_preset"] = "layout_center_standard"
+                plan[first]["transition_in"] = "slide_up"
+                plan[first]["position"] = legacy_position("layout_center_standard")
+                plan[first]["transition"] = legacy_transition("slide_up")
+            except Exception:
+                pass
+            if len(hook_idx) > 1:
                 try:
-                    try:
-                        _htxt = str((chunks[j] or {}).get("text", ""))
-                        _hdense = _is_dense_text(_htxt)
-                    except Exception:
-                        _hdense, _htxt = False, ""
-                    plan[j]["pose"] = 1
-                    if _hdense:
-                        _hlay = "layout_split_left" if _hflip % 2 == 0 else "layout_split_right"
-                        _hflip += 1
-                    else:
-                        _hlay = "layout_center_standard"
-                    plan[j]["layout"] = _hlay
-                    plan[j]["layout_preset"] = _hlay
-                    plan[j]["scale"] = 0.75
-                    plan[j]["position"] = legacy_position(_hlay)
-                    if k == 0:
-                        plan[j]["transition_in"] = "slide_up" if _hlay == "layout_center_standard" else preset_default_transition(_hlay)
-                    else:
-                        # Chunk hook successivi: nessun ri-ingresso (resta in scena).
-                        plan[j]["transition_in"] = "none"
-                    plan[j]["transition"] = legacy_transition(plan[j]["transition_in"])
-                    plan[j]["punch_in"] = (j == hook_idx[-1] and len(hook_idx) > 1 and not _hdense)
+                    plan[hook_idx[0]]["punch_in"] = False
                 except Exception:
                     pass
+            try:
+                plan[hook_idx[-1]]["punch_in"] = True  # climax hook: stacco
+            except Exception:
+                pass
         # --- CORPO: lock per beat ---
         beats: dict[int, list[int]] = {}
         for i, c in enumerate(chunks):
@@ -705,50 +448,20 @@ def _apply_narrative_locks(plan: list[dict], chunks: list[dict]) -> list[dict]:
         for beat in beats.values():
             if len(beat) < 2:
                 continue
-            # v2 dinamico: coerenza di registro per beat ma variazione ogni 2
-            # chunk (mai sticker oltre ~3-4s). Coppie: [0,1] identici, [2,3]
-            # variati su alternativa vicina + lato split alternato.
             try:
                 ref = plan[beat[0]]
-                ref_pose = ref.get("pose", 2)
-                ref_layout = ref.get("layout", "layout_center_standard")
+                ref_pose, ref_layout = ref.get("pose", 2), ref.get("layout", "layout_center_standard")
                 ref_punch = bool(ref.get("punch_in", False))
-                ref_scale = ref.get("scale", 0.75)
             except Exception:
                 continue
-            for pos_in_beat, j in enumerate(beat[1:], start=1):
+            for j in beat[1:]:
                 try:
-                    # Rotazione calma ogni 3 chunk (pos 3,6...): permanenza più
-                    # lunga, niente cambi frenetici dentro lo stesso pensiero.
-                    if pos_in_beat % ANTI_STATIC_MAX_BODY == 0:
-                        dyn_pose, dyn_layout = _dynamic_successor(
-                            int(ref_pose), str(ref_layout), j)
-                        plan[j]["pose"] = dyn_pose
-                        plan[j]["layout"] = dyn_layout
-                        plan[j]["layout_preset"] = dyn_layout
-                        plan[j]["position"] = legacy_position(dyn_layout)
-                        try:
-                            plan[j]["transition_in"] = preset_default_transition(dyn_layout)
-                            plan[j]["transition"] = legacy_transition(plan[j]["transition_in"])
-                        except Exception:
-                            pass
-                        plan[j]["punch_in"] = False  # variazione, non stacco
-                        plan[j]["scale"] = ref_scale
-                    else:
-                        plan[j]["pose"] = ref_pose
-                        # Posa 2 larga mai in split anche per coerenza beat.
-                        if int(ref_pose) == 2 and str(ref_layout) in (
-                                "layout_split_left", "layout_split_right"):
-                            plan[j]["layout"] = "layout_center_standard"
-                            plan[j]["layout_preset"] = "layout_center_standard"
-                            plan[j]["position"] = legacy_position(
-                                "layout_center_standard")
-                        else:
-                            plan[j]["layout"] = ref_layout
-                            plan[j]["layout_preset"] = ref_layout
-                            plan[j]["position"] = legacy_position(ref_layout)
-                        plan[j]["punch_in"] = ref_punch
-                        plan[j]["scale"] = ref_scale
+                    plan[j]["pose"] = ref_pose
+                    plan[j]["layout"] = ref_layout
+                    plan[j]["layout_preset"] = ref_layout
+                    plan[j]["position"] = legacy_position(ref_layout)
+                    plan[j]["punch_in"] = ref_punch
+                    plan[j]["scale"] = ref.get("scale", 0.75)
                 except Exception:
                     continue
         # --- CTA: lock totale ---
@@ -760,26 +473,15 @@ def _apply_narrative_locks(plan: list[dict], chunks: list[dict]) -> list[dict]:
             except Exception:
                 strong = True
             pose = 3 if strong else 2
-            # CTA densa: split fisso, MA posa 2 (larga) sempre center.
-            try:
-                _cta_txt = " ".join(str((chunks[j] or {}).get("text", "")) for j in cta_idx)
-                _cta_dense = _is_dense_text(_cta_txt, sum(len(str((chunks[j] or {}).get("text", "")).split()) for j in cta_idx))
-            except Exception:
-                _cta_dense = False
-            if pose == 2:
-                _cta_lay = "layout_center_standard"
-            else:
-                _cta_lay = "layout_split_right" if _cta_dense else "layout_center_standard"
             for k, j in enumerate(cta_idx):
                 try:
                     plan[j]["pose"] = pose
-                    plan[j]["layout"] = _cta_lay
-                    plan[j]["layout_preset"] = _cta_lay
+                    plan[j]["layout"] = "layout_center_standard"
+                    plan[j]["layout_preset"] = "layout_center_standard"
                     plan[j]["punch_in"] = False
                     plan[j]["scale"] = 0.75
-                    plan[j]["position"] = legacy_position(_cta_lay)
-                    # CTA: entra e RESTA fisso fino alla fine.
-                    plan[j]["transition_in"] = "fade" if k == 0 else "none"
+                    plan[j]["position"] = legacy_position("layout_center_standard")
+                    plan[j]["transition_in"] = "fade" if k == 0 else plan[j].get("transition_in", "fade")
                     plan[j]["transition"] = legacy_transition(plan[j]["transition_in"])
                 except Exception:
                     continue
@@ -826,162 +528,14 @@ def _cap_punch_ins_narrative(plan: list[dict], chunks: list[dict]) -> list[dict]
     return plan
 
 
-def preload_character_assets(poses: tuple[int, ...] | list[int] | None = None) -> int:
-    """Warmup RAM: precarica gli asset originali puliti per le pose richieste.
-
-    Da chiamare UNA volta a inizio pipeline (prima del rendering) per
-    azzerare I/O disco in loop frame. Ritorna n. pose precaricate.
-    Mai solleva (asset mancanti saltati con warning).
-    """
-    if poses is None:
-        try:
-            poses = list(range(1, int(CHARACTER_POSE_COUNT) + 1))
-        except Exception:
-            poses = [1, 2, 3, 4, 5]
-    ok = 0
-    for p in poses:
-        try:
-            load_character_original(int(p))
-            ok += 1
-        except Exception as e:
-            try:
-                print(f"[character] warning: posa {p} non precaricata ({e})")
-            except Exception:
-                pass
-    # Warmup geometria (FASE 1): misura il soggetto una sola volta per asset
-    # (bbox visibile, centro visivo, faccia) e tienila in cache RAM.
-    try:
-        for p in poses:
-            try:
-                get_subject_geometry(int(p))
-            except Exception as e:
-                try:
-                    print(f"[character] warning: geometria posa {p} saltata ({e})")
-                except Exception:
-                    pass
-    except Exception:
-        pass
-    return ok
-
-
-def enforce_pose_layout_coherence(plan: list[dict]) -> list[dict]:
-    """Garanzia finale posa/layout (mai solleva, in place).
-
-    - Posa 2 (larga 676px) SEMPRE center (in split coprirebbe il testo).
-    - Posa 4/5 SEMPRE split (indicano/pensano verso il testo).
-    - Pass di validazione geometrica (FASE 6): la coppia posa/layout viene
-      ricontrollata sulla larghezza reale del soggetto (pose larghe/braccio
-      teso solo al centro); se non ammessa usa il layout ammesso piu' vicino
-      per direzione e logga "layout corretto" (vedi character_geometry).
-    Chiamata per ULTIMA in finalize: nessun lock a valle puo' reintrodurre
-    combo vietate (era il buco che metteva la posa 2 a destra tagliata).
-    """
-    try:
-        _flip = 0
-        for i, entry in enumerate(plan or []):
-            try:
-                if not isinstance(entry, dict):
-                    continue
-                pose = int(entry.get("pose", 1))
-                lay = str(entry.get("layout", "layout_center_standard"))
-            except Exception:
-                continue
-            try:
-                if pose == 2 and lay in ("layout_split_left", "layout_split_right",
-                                         "layout_center_punch_in"):
-                    entry["layout"] = "layout_center_standard"
-                    entry["layout_preset"] = "layout_center_standard"
-                    try:
-                        entry["position"] = legacy_position("layout_center_standard")
-                        entry["transition_in"] = preset_default_transition(
-                            "layout_center_standard")
-                        entry["transition"] = legacy_transition(entry["transition_in"])
-                    except Exception:
-                        pass
-                elif pose in (4, 5) and lay not in ("layout_split_left",
-                                                     "layout_split_right"):
-                    _nl = "layout_split_left" if _flip % 2 == 0 else "layout_split_right"
-                    _flip += 1
-                    entry["layout"] = _nl
-                    entry["layout_preset"] = _nl
-                    try:
-                        entry["position"] = legacy_position(_nl)
-                        entry["transition_in"] = preset_default_transition(_nl)
-                        entry["transition"] = legacy_transition(entry["transition_in"])
-                    except Exception:
-                        pass
-            except Exception:
-                continue
-    except Exception:
-        pass
-    # Pass geometrico FASE 6 sul layout risultante (anche legacy): valida la
-    # coppia sulla larghezza reale del soggetto e corregge al vicino per
-    # direzione con log "layout corretto". Mantiene le regole esistenti
-    # (MAX_CONSECUTIVE, dwell, full-travel gestiti a monte: qui solo coerenza).
-    try:
-        for entry in plan or []:
-            try:
-                if not isinstance(entry, dict):
-                    continue
-                pose = int(entry.get("pose", 1))
-                lay = str(entry.get("layout", entry.get("layout_preset",
-                                                        "layout_center_standard")))
-            except Exception:
-                continue
-            try:
-                fixed, changed = validate_pose_layout_pair(pose, lay)
-                if changed and isinstance(fixed, str) and fixed != lay:
-                    entry["layout"] = fixed
-                    entry["layout_preset"] = fixed
-                    try:
-                        entry["position"] = legacy_position(fixed)
-                        entry["transition_in"] = preset_default_transition(fixed)
-                        entry["transition"] = legacy_transition(
-                            entry["transition_in"])
-                    except Exception:
-                        pass
-            except Exception:
-                continue
-    except Exception:
-        pass
-    return plan
-
-
 def _finalize_character_plan(plan: list[dict], chunks: list[dict]) -> list[dict]:
-    """Lock narrativi + cap per atto + anti-statico + dwell + coerenza pose."""
+    """Lock narrativi + cap per atto (o cap globale legacy senza ruoli)."""
     try:
         if any(_chunk_role(c) for c in (chunks or [])):
-            locked = _apply_narrative_locks(plan, chunks)
-            capped = _cap_punch_ins_narrative(locked, chunks)
-            calm = enforce_anti_static_plan(capped, chunks)
-            try:
-                from config import CHARACTER_MIN_DWELL_SECONDS as _DWELL
-                dwell = float(_DWELL)
-            except Exception:
-                dwell = 3.0
-            return enforce_pose_layout_coherence(
-                enforce_min_dwell_time(calm, chunks, dwell))
+            return _cap_punch_ins_narrative(_apply_narrative_locks(plan, chunks), chunks)
     except Exception:
         pass
-    try:
-        calm = enforce_anti_static_plan(_cap_punch_ins(plan), chunks)
-        try:
-            from config import CHARACTER_MIN_DWELL_SECONDS as _DWELL2
-            dwell2 = float(_DWELL2)
-        except Exception:
-            dwell2 = 3.0
-        # Dwell anche senza ruoli narrativi (solo se i chunk hanno timing).
-        try:
-            has_timing = any(isinstance(c, dict) and "start" in c and "end" in c
-                              for c in (chunks or []))
-        except Exception:
-            has_timing = False
-        if has_timing:
-            return enforce_pose_layout_coherence(
-                enforce_min_dwell_time(calm, chunks, dwell2))
-        return enforce_pose_layout_coherence(calm)
-    except Exception:
-        return enforce_pose_layout_coherence(_cap_punch_ins(plan))
+    return _cap_punch_ins(plan)
 
 
 def _normalize_entry(raw: dict, chunk_index: int, chunk_text: str = "") -> dict:
@@ -1002,38 +556,24 @@ def _normalize_entry(raw: dict, chunk_index: int, chunk_text: str = "") -> dict:
         pose = 1
     pose = min(CHARACTER_POSE_COUNT, max(1, pose))
 
-    # Layout REELS-FIX v5: testi densi forzano split (mai center), pose 4/5
-    # sempre split anche se l'LLM sbaglia.
-    try:
-        _dense_here = _is_dense_text(chunk_text)
-    except Exception:
-        _dense_here = False
+    # Layout: campo nuovo "layout", alias "layout_preset", altrimenti mappa
+    # dalla position legacy, altrimenti euristica per posa (la posa 4 indica
+    # -> split anche se l'LLM sbaglia; la posa 5 predilige i laterali).
     layout_raw = raw.get("layout", raw.get("layout_preset"))
     if isinstance(layout_raw, str) and (
         layout_raw in VALID_LAYOUT_PRESETS
         or layout_raw in ("bottom_center", "bottom_left", "bottom_right", "side_left", "side_right")
         or layout_raw in ("layout_bottom_focus", "layout_closeup_center")
     ):
-        preset = normalize_preset(layout_raw, _preset_for_pose(pose, chunk_index, chunk_text))
+        preset = normalize_preset(layout_raw, _preset_for_pose(pose, chunk_index))
     elif raw.get("position") is not None:
-        preset = normalize_preset(raw.get("position"), _preset_for_pose(pose, chunk_index, chunk_text))
+        preset = normalize_preset(raw.get("position"), _preset_for_pose(pose, chunk_index))
     else:
-        preset = _preset_for_pose(pose, chunk_index, chunk_text)
+        preset = _preset_for_pose(pose, chunk_index)
     if pose == 4 and preset not in ("layout_split_left", "layout_split_right"):
-        preset = _preset_for_pose(pose, chunk_index, chunk_text)
+        preset = _preset_for_pose(pose, chunk_index)
     if pose == 5 and preset not in ("layout_split_left", "layout_split_right"):
-        preset = _preset_for_pose(pose, chunk_index, chunk_text)
-    if pose == 2 and preset not in ("layout_center_standard", "layout_center_punch_in"):
-        # Posa 2 larga (676px): solo center, mai split (coprirebbe il testo).
-        preset = "layout_center_standard"
-    if _dense_here and preset in ("layout_center_standard", "layout_center_punch_in") and pose not in (2, 3):
-        # Fallback automatico Center->Split per testi lunghi (catena v5).
-        try:
-            from core.layout_presets import fallback_preset_for_overflow as _fb
-            preset = _fb(preset, len(str(chunk_text or "")),
-                         len(str(chunk_text or "").split()))
-        except Exception:
-            preset = _preset_for_pose(pose, chunk_index, chunk_text)
+        preset = _preset_for_pose(pose, chunk_index)
 
     transition_raw = raw.get("transition_in", raw.get("transition", None))
     if transition_raw is None:
@@ -1056,12 +596,14 @@ def _normalize_entry(raw: dict, chunk_index: int, chunk_text: str = "") -> dict:
 
 
 def _fallback_plan(chunks: list[dict]) -> list[dict]:
-    """Piano deterministico REELS-FIX v5 (ritmo Reels, testi lunghi in split).
+    """Piano deterministico senza LLM (sistema a zone + punch-in + legacy).
 
-    - Primo chunk breve: posa 1 center; se denso (>6 parole/>40 char): split.
-    - Successivi: "?" -> posa 5 split, "!" -> posa 3 + punch (no CTA),
-      altrimenti ciclo 1->2->4; densi sempre split alternati L/R.
-    - Lock narrativi a valle (vedi _apply_narrative_locks) rispettano i densi.
+    - Primo chunk: posa 1, layout_center_standard, slide_up, scala 0.75.
+    - Successivi: "?" -> posa 5 (split), "!" -> posa 3 + punch_in (enfasi),
+      altrimenti ciclo 1 -> 2 -> 4 (posa 4 -> split alternati per indicare).
+    - Con ruoli narrativi: niente punch in CTA (finale stabile) e lock
+      per atto applicati in finalize (vedi _apply_narrative_locks).
+    - I punch_in sono limitati per atto (vedi _cap_punch_ins_narrative).
     """
     cycle_poses = [1, 2, 4]
     plan: list[dict] = []
@@ -1071,18 +613,8 @@ def _fallback_plan(chunks: list[dict]) -> list[dict]:
         text = str((chunk or {}).get("text", ""))
         punch_in = False
         is_cta = _chunk_role(chunk) == "cta"
-        try:
-            dense = _is_dense_text(text)
-        except Exception:
-            dense = False
         if i == 0:
-            if dense:
-                pose = 1
-                preset = "layout_split_right" if split_flip % 2 == 0 else "layout_split_left"
-                split_flip += 1
-                transition_in = preset_default_transition(preset)
-            else:
-                pose, preset, transition_in = 1, "layout_center_standard", "slide_up"
+            pose, preset, transition_in = 1, "layout_center_standard", "slide_up"
         else:
             if "?" in text:
                 pose = 5
@@ -1100,16 +632,8 @@ def _fallback_plan(chunks: list[dict]) -> list[dict]:
             elif pose == 5:
                 preset = "layout_split_left" if split_flip % 2 == 0 else "layout_split_right"
                 split_flip += 1
-            elif pose == 2:
-                # Posa larga: sempre center (mai split).
-                preset = "layout_center_standard"
-            elif dense:
-                # Testo lungo: forza split alternato, mai center.
-                preset = "layout_split_left" if split_flip % 2 == 0 else "layout_split_right"
-                split_flip += 1
-                punch_in = False
             else:
-                preset = _preset_for_pose(pose, i, text)
+                preset = _preset_for_pose(pose, i)
             transition_in = preset_default_transition(preset)
             if i % 3 == 2 and transition_in.startswith("slide"):
                 transition_in = "fade"  # ogni tanto un cambio morbido
@@ -1204,17 +728,17 @@ _POSE_RULES = (
 )
 
 _LAYOUT_RULES = (
-    "Layout disponibili v8 (presenza piena come commit di riferimento, "
-    "personaggio e testo MAI sovrapposti, gutter 80px):\n"
-    "- layout_center_standard: figura naturale centrata (125%, top Y~500, testa-busto-fianchi), testo SOLO fascia alta Y[140,490] X[90,990]. Obbligatorio per posa 2 (larga); vietato se testo denso con altre pose.\n"
-    "- layout_center_punch_in: PRIMO PIANO (170%, zoom 1.15x), testo fascia alta Y[140,620] con pill.\n"
-    "- layout_split_left: personaggio a SINISTRA (130% presenza piena, bbox visibile dentro [20,1060], volto SEMPRE integro), testo a DESTRA Y[320,1250] dinamico fino a 40px dal personaggio. MAI con posa 2.\n"
-    "- layout_split_right: personaggio a DESTRA (130% presenza piena, bbox visibile dentro [20,1060], volto SEMPRE integro), testo a SINISTRA Y[320,1250] dinamico fino a 40px dal personaggio. MAI con posa 2.\n"
-    "REGOLA POSA 2 (braccia aperte, larghissima): usa SEMPRE layout_center_standard.\n"
-    "REGOLA DENSITA': se il chunk ha >6 parole o >40 caratteri FORZA split_left/split_right (alterna i lati ogni 2-3 chunk), MAI center.\n"
-    "REGOLA OBBLIGATORIA: con la Posa 4 (indicare) usa SEMPRE split, scegliendo il lato in modo che indichi verso il testo.\n"
-    "Con la Posa 5 (pensare) prediligi split.\n"
-    "PUNCH-IN (jump-cut 1.15x): punch_in=true SOLO per frasi chiave, MAX 1-2 volte in TUTTO il video."
+    "Layout disponibili (niente figura intera: mezzo busto/mezza figura, gambe fuori campo; "
+    "personaggio e testo NON devono mai sovrapporsi):\n"
+    "- layout_center_standard: mezza figura centrata in basso (125% larghezza), testo in ALTO (y 150-900).\n"
+    "- layout_center_punch_in: PRIMO PIANO busto/testa (170% larghezza), testo nel terzo superiore con sfondo ad alto contrasto.\n"
+    "- layout_split_left: personaggio a SINISTRA (130%, spalla fuori campo), testo a DESTRA (x 640-1000).\n"
+    "- layout_split_right: personaggio a DESTRA (130%), testo a SINISTRA (x 80-420).\n"
+    "REGOLA OBBLIGATORIA: con la Posa 4 (indicare) usa SEMPRE layout_split_left o layout_split_right, "
+    "scegliendo il lato in modo che il personaggio indichi verso il testo.\n"
+    "Con la Posa 5 (pensare) prediligi i layout laterali (split_left/split_right).\n"
+    "PUNCH-IN (jump-cut con ingrandimento improvviso, stacco di camera televisivo): metti punch_in=true "
+    "SOLO per frasi chiave, rivelazioni o call to action finali, MAX 1-2 volte in TUTTO il video."
 )
 
 
@@ -1268,24 +792,19 @@ def plan_character_layout(
         isinstance(ch, dict) and ch.get("narrative_role") in ("hook", "body", "cta")
         for ch in chunks
     )
-    # Contesto compatto: indice + testo + conteggi (guida split su lunghi).
+    # Contesto compatto: indice + testo per chunk (i chunk sono da 2-3 parole,
+    # quindi il prompt resta leggero anche con decine di chunk).
     lines = []
     for i, ch in enumerate(chunks):
         text = str((ch or {}).get("text", "")).strip().replace("\n", " ")
         if len(text) > 200:
             text = text[:200] + "..."
-        try:
-            _nw = len(str((ch or {}).get("text", "")).split())
-            _nc = len(str((ch or {}).get("text", "")).strip())
-        except Exception:
-            _nw, _nc = 0, 0
-        _len_tag = f"({_nw}w,{_nc}ch)"
         if has_narrative and isinstance(ch, dict):
             role = str(ch.get("narrative_role", "body"))
             tag = {"hook": "HOOK", "body": "CORPO", "cta": "CTA"}.get(role, "CORPO")
-            lines.append(f"{i} [{tag}]{_len_tag}: {text}")
+            lines.append(f"{i} [{tag}]: {text}")
         else:
-            lines.append(f"{i} {_len_tag}: {text}")
+            lines.append(f"{i}: {text}")
     chunk_block = "\n".join(lines)
     script_snippet = (script_text or "").strip().replace("\n", " ")
     if len(script_snippet) > 1500:
@@ -1294,12 +813,14 @@ def plan_character_layout(
     narrative_rules = ""
     if has_narrative:
         narrative_rules = (
-            "\nREGOLE NARRATIVE REELS-FIX v5 (hook/corpo/CTA + densita'):\n"
-            "- Chunk [HOOK] breve (<=6w,<=40ch): posa 1 center; HOOK denso: posa 1 split (alterna L/R); punch_in=true "
-            "SOLO sull'ultimo hook breve.\n"
-            "- Chunk [CORPO]: DINAMISMO CALMO ogni 3 chunk; testi densi SEMPRE split alternati L/R ogni 2-3 chunk "
-            "(lato opposto libero per il testo). Domande → posa 5 split, dati → posa 4 split.\n"
-            "- Chunk [CTA] breve: posa 3 center; CTA densa: posa 3 split fisso; punch_in=false SEMPRE.\n"
+            "\nREGOLE NARRATIVE (hook/corpo/CTA, tag [HOOK]/[CORPO]/[CTA]):\n"
+            "- Chunk [HOOK]: posa 1 assertiva, layout_center_standard; punch_in=true "
+            "SOLO sull'ultimo chunk hook (picco di attenzione).\n"
+            "- Chunk [CORPO]: UNA sola identità per beat (stessa posa+layout per "
+            "tutti i chunk dello stesso pensiero); cambia solo ai confini di beat. "
+            "Domande → posa 5 split, dati/numeri → posa 4 split, resto → posa 2.\n"
+            "- Chunk [CTA]: posa 3, layout_center_standard, punch_in=false SEMPRE "
+            "(il finale deve restare perfettamente stabile, niente stacchi).\n"
         )
     system = (
         "Sei un regista che assegna un personaggio 2D ai sottotitoli di un video breve. "
@@ -1309,10 +830,10 @@ def plan_character_layout(
         "Analizza il tono di ogni chunk e assegna personaggio/layout/punch-in.\n\n"
         "REGOLE POSE:\n" + _POSE_RULES + "\n\n"
         "REGOLE LAYOUT E REGIA:\n" + _LAYOUT_RULES + "\n"
-        "- REGOLA ANTI-STATICITÀ CALMA: mantieni stessa posa+layout per 2-3 chunk "
-        "di fila (~4-6s), poi ruota con transizione morbida. MAI cambiare a ogni "
-        "chunk: la frenesia rovina il video. Ritmo 10/10 = calmo ma vivo.\n"
-        "- Alterna i lati degli split solo ai confini di frase/beat, non a ogni chunk.\n"
+        "- Cambia posa/layout SOLO quando il concetto o il tono cambia davvero: "
+        "se il discorso e' continuo, mantieni stessa posa e stesso layout dei chunk "
+        "precedenti (non cambiare ad ogni chunk di 2 parole).\n"
+        "- Alterna i lati degli split (sinistra/destra) per dare ritmo visivo.\n"
         + narrative_rules + "\n"
         f"LAYOUT VALIDI: {', '.join(VALID_LAYOUT_PRESETS)}\n\n"
         f"SCRIPT (contesto):\n{script_snippet}\n\n"
@@ -1473,212 +994,3 @@ def enrich_chunks_with_characters(
         except (TypeError, ValueError, AttributeError):
             enriched.append({**chunk})
     return enriched
-
-
-# ---------------------------------------------------------------------------
-# Timeline Manager v3 — Continuity Engine (spec §1+§2)
-# ---------------------------------------------------------------------------
-# La causa dei "flash neri" e' il render per-chunk isolato: ogni chunk ricrea
-# la clip del character (fade/entry da zero) e il video_builder sovrappone
-# N micro-clip con `between(t,start,end)`, lasciando gap tra end[N] e
-# start[N+1] dove nessun overlay e' attivo (solo sfondo -> blink nero).
-# Il Timeline Manager raggruppa chunk consecutivi con stessa identita'
-# (posa+layout+punch) in SEGMENTI CONTINUI: il character vive su una traccia
-# unica da segment.start a segment.end senza fade-out/in, reset alpha o
-# riposizionamento ai confini interni (es. 0.0-2.0 + 2.0-4.5 -> 0.0-4.5).
-
-TIMELINE_MIN_DWELL_SECONDS: float = 3.0
-TIMELINE_SLIDE_X_DURATION: float = 0.30
-# Gap oltre il quale uno stacco visivo totale e' reale (slide_up consentito).
-TIMELINE_GAP_THRESHOLD: float = 0.40
-
-
-def timeline_identity_of(chunk: dict | None) -> tuple | None:
-    """Identita' visiva (posa, layout, punch) o None se senza character."""
-    try:
-        if not isinstance(chunk, dict) or chunk.get("pose") is None:
-            return None
-        info = resolve_chunk_layout(chunk)
-        if info is None:
-            return None
-        zone = info.get("layout") if info.get("use_preset") else info.get("position")
-        return (int(info.get("pose")), str(zone), bool(info.get("punch_in", False)))
-    except Exception:
-        return None
-
-
-def build_continuous_timeline(chunks: list[dict]) -> list[dict]:
-    """Raggruppa chunk arricchiti in segmenti continui per identita' (mai solleva).
-
-    Ogni segmento: {"pose","layout","punch_in","use_preset","start","end",
-    "chunk_indices": [...], "entry": "slide_up|slide_x|jump",
-    "exit": "hold|slide_down|fade_out", "side_from"/"side_to": ...}.
-    Chunk senza character -> segmento `{"pose": None, "gap": True}` (testo
-    fullscreen: il character resta nascosto, nessun blink).
-    Confini interni allo stesso segmento NON devono mai generare fade o
-    riposizionamento (canale alpha persistente, spec §1).
-    """
-    try:
-        if not chunks:
-            return []
-    except Exception:
-        return []
-    segments: list[dict] = []
-    try:
-        for i, ch in enumerate(chunks):
-            try:
-                start = float((ch or {}).get("start", 0.0))
-                end = float((ch or {}).get("end", start))
-            except (TypeError, ValueError):
-                continue
-            if end <= start:
-                continue
-            ident = timeline_identity_of(ch)
-            try:
-                info = resolve_chunk_layout(ch) if ident is not None else None
-            except Exception:
-                info = None
-            if ident is None:
-                # Gap fullscreen: chiude il segmento precedente.
-                segments.append({
-                    "pose": None, "layout": None, "punch_in": False,
-                    "use_preset": False, "start": start, "end": end,
-                    "chunk_indices": [i], "gap": True,
-                    "entry": "none", "exit": "none",
-                })
-                continue
-            if segments and not segments[-1].get("gap") and \
-                    (segments[-1].get("identity") == ident) and \
-                    start <= segments[-1]["end"] + TIMELINE_GAP_THRESHOLD + 1e-6:
-                # Stessa identita' -> estendi senza interruzione (State Machine).
-                prev = segments[-1]
-                prev["end"] = max(float(prev["end"]), end)
-                prev["chunk_indices"].append(i)
-                continue
-            segments.append({
-                "pose": ident[0], "layout": ident[1], "punch_in": ident[2],
-                "identity": ident,
-                "use_preset": bool(info.get("use_preset")) if info else False,
-                "start": start, "end": end,
-                "chunk_indices": [i], "gap": False,
-                "entry": "slide_up" if i == 0 else "jump",
-                "exit": "hold",
-            })
-        # Policy entry/exit (spec §2): slide_up SOLO inizio o dopo gap/stacco;
-        # slide_down SOLO verso fullscreen/CTA; intermedi = jump-cut + slide X.
-        for s_idx, seg in enumerate(segments):
-            if seg.get("gap"):
-                continue
-            prev_real = next(
-                (s for s in reversed(segments[:s_idx]) if not s.get("gap")), None)
-            next_real = next(
-                (s for s in segments[s_idx + 1:] if not s.get("gap")), None)
-            if prev_real is None:
-                seg["entry"] = "slide_up"  # Hook iniziale
-            elif seg["start"] - float(prev_real["end"]) > TIMELINE_GAP_THRESHOLD:
-                seg["entry"] = "slide_up"  # stacco visivo totale reale
-            elif prev_real.get("layout") != seg.get("layout"):
-                seg["entry"] = "slide_x"  # scivolamento laterale 0.3s out_cubic
-            else:
-                seg["entry"] = "jump"  # stessa coordinata, taglio netto TV
-            if next_real is None:
-                seg["exit"] = "fade_out" if seg.get("punch_in") else "hold"
-            else:
-                seg["exit"] = "hold"  # mai slide_down intermedio
-                # slide_down solo se il prossimo e' gap fullscreen (CTA testo).
-                nxt_is_gap = (s_idx + 1 < len(segments)
-                              and segments[s_idx + 1].get("gap"))
-                if nxt_is_gap:
-                    seg["exit"] = "slide_down"
-    except Exception:
-        pass
-    return segments
-
-
-def enforce_timeline_dwell(segments: list[dict],
-                           min_seconds: float = TIMELINE_MIN_DWELL_SECONDS,
-                           chunks: list[dict] | None = None) -> list[dict]:
-    """Minimum Dwell Time 3.0s su segmenti (spec §2, mai solleva).
-
-    I segmenti piu' corti del minimo vengono fusi col precedente (il character
-    resta a schermo, nessun appari/scompari <3s), SALVO confine narrativo forte
-    (hook->body, body->CTA) dove il cambio resta libero. Ritorna stessa lista.
-    """
-    try:
-        if not segments or len(segments) < 2:
-            return segments
-        try:
-            limit = float(min_seconds)
-        except (TypeError, ValueError):
-            limit = TIMELINE_MIN_DWELL_SECONDS
-        if limit <= 0:
-            return segments
-    except Exception:
-        return segments
-    try:
-        i = 1
-        while i < len(segments):
-            try:
-                cur = segments[i]
-                if cur.get("gap"):
-                    i += 1
-                    continue
-                dur = float(cur["end"]) - float(cur["start"])
-                if dur >= limit:
-                    i += 1
-                    continue
-                # Confine narrativo forte? -> cambio libero, non fondere.
-                boundary = False
-                try:
-                    if chunks is not None and cur.get("chunk_indices"):
-                        first_idx = int(cur["chunk_indices"][0])
-                        boundary = _is_narrative_boundary(chunks, first_idx)
-                except Exception:
-                    boundary = False
-                if boundary:
-                    i += 1
-                    continue
-                # Fondi col segmento reale precedente (estendi identità prev).
-                prev_idx = i - 1
-                while prev_idx >= 0 and segments[prev_idx].get("gap"):
-                    prev_idx -= 1
-                if prev_idx < 0:
-                    i += 1
-                    continue
-                prev = segments[prev_idx]
-                # Il character del prev persiste su tutta la durata del cur:
-                # sposta i chunk_indices e allunga end (merge visivo).
-                prev["end"] = max(float(prev["end"]), float(cur["end"]))
-                prev["chunk_indices"] = list(prev.get("chunk_indices", [])) + \
-                    list(cur.get("chunk_indices", []))
-                prev["exit"] = cur.get("exit", prev.get("exit"))
-                del segments[i]
-                # Non avanzare: ricontrolla il segmento fuso/accorpato.
-            except Exception:
-                i += 1
-    except Exception:
-        pass
-    return segments
-
-
-def get_timeline_for_chunks(chunks: list[dict],
-                            min_dwell: float | None = None) -> list[dict]:
-    """Entry-point unico: timeline continua + dwell enforcement (fail-safe).
-
-    Usato da text_animator/video_builder per la traccia character persistente.
-    Se `min_dwell` e' None usa config.CHARACTER_MIN_DWELL_SECONDS o 3.0s.
-    """
-    try:
-        segments = build_continuous_timeline(chunks or [])
-    except Exception:
-        return []
-    try:
-        if min_dwell is None:
-            try:
-                from config import CHARACTER_MIN_DWELL_SECONDS as _DW
-                min_dwell = float(_DW)
-            except Exception:
-                min_dwell = TIMELINE_MIN_DWELL_SECONDS
-        return enforce_timeline_dwell(segments, float(min_dwell), chunks)
-    except Exception:
-        return segments

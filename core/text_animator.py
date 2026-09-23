@@ -7,8 +7,10 @@ e resta visibile accumulandosi accanto alle precedenti; tutte le parole
 scompaiono insieme a `chunk.end` (uscita di gruppo).
 
 - Parole normali/base: entrata minimal (solo fade con `ease_out_cubic`).
-- Keyword/impact: entrata marcata (opacita' + scala 0.85 -> 1.0 con
-  `ease_out_back` clampato a max 1.0, mai overshoot gigante).
+- Keyword/impact: entrata marcata (opacita' + scala 0.7 -> 1.0 con `ease_out_back`,
+  effetto "pop" premium; `ease_out_bounce` resta disponibile come variante
+  piu' giocosa ma di default si usa `ease_out_back`, meno distraente su
+  caption da 2-3 parole).
 - Uscita: uguale per tutte, fade di gruppo con `ease_in_cubic`.
 
 Il layout e' pre-calcolato UNA VOLTA per chunk (via
@@ -17,10 +19,13 @@ Il layout e' pre-calcolato UNA VOLTA per chunk (via
 del preset (wrapping dinamico sulla sua larghezza): personaggio e testo non si
 sovrappongono mai (entrambi risolvono da `resolve_chunk_layout`, singola fonte).
 
-Semantic Typography REELS-FIX v5 (quando il chunk porta "styled_words"):
-3 font per nicchia, impact 1.25x (uppercase solo <=7 char), accent 1.05x.
-Stroke 0, ambient shadow (0,3,110), auto-fit min 38px, hard-clamp nel box,
-auto-pill solo se contrasto <80. Colori coerenti col tema.
+Semantic Typography (quando il chunk porta "styled_words" + "typography_niche",
+vedi core/text_tagger.py): 3 font per nicchia (base/impact/accent via
+core/font_manager.py), impact 1.3x-1.5x uppercase colore highlight, accent
+handwritten 1.1x con colore dedicato per ruolo. NESSUN contorno nero e
+NESSUNA ombra di default (look pulito TikTok): leggibilità da contrasto
+tema + pill sul punch-in. Colori sempre coerenti col tema (base dal tema,
+highlight/accent validati per contrasto sullo sfondo).
 
 Personaggio (mezzo busto/mezza figura, mai figura intera): slide rapida da
 fuori campo in 0.2s; cambio lato split -> slide_down 0.2s + rientro dal lato
@@ -66,14 +71,6 @@ from config import (
     TYPOGRAPHY_SHADOW_OFFSET,
     TYPOGRAPHY_SHADOW_FILL,
 )
-try:
-    from config import (  # tunable ritmo character (default calmi, anti-flicker)
-        CHARACTER_ENTRY_DURATION as _CFG_CHAR_ENTRY,
-        CHARACTER_EXIT_DURATION as _CFG_CHAR_EXIT,
-        CHARACTER_FULL_TRAVEL_FIRST_ONLY as _CFG_FULL_TRAVEL_FIRST_ONLY,
-    )
-except Exception:
-    _CFG_CHAR_ENTRY, _CFG_CHAR_EXIT, _CFG_FULL_TRAVEL_FIRST_ONLY = 0.55, 0.45, True
 from core.easing import (
     clamp01,
     ease_out_cubic,
@@ -87,7 +84,6 @@ from core.renderer import (
     draw_word,
     draw_text_background,
     get_character_layer,
-    should_auto_pill,
 )
 
 # Re-export per spec ("RENDER E POSIZIONAMENTO (... / core/text_animator.py)").
@@ -100,7 +96,6 @@ from core.layout_presets import (
     preset_font_scale,
     preset_needs_text_background,
     preset_safe_area,
-    preset_safe_area_dynamic,
     preset_side,
 )
 
@@ -108,31 +103,9 @@ from core.layout_presets import (
 _CHARACTER_ENTRY_DURATION = 0.35
 _CHARACTER_SLIDE_UP_PX = 320
 _CHARACTER_SLIDE_SIDE_PX = 260
-# Transizioni sistema a zone (motion graphics 9:16): CALME per evitare
-# appari/scompari frenetici. Default da config (0.55s in / 0.45s out);
-# fallback storici se config non disponibile.
-try:
-    _CHARACTER_ZONE_ENTRY_DURATION = max(0.15, float(_CFG_CHAR_ENTRY))
-except Exception:
-    _CHARACTER_ZONE_ENTRY_DURATION = 0.55
-try:
-    _CHARACTER_ZONE_EXIT_DURATION = max(0.15, float(_CFG_CHAR_EXIT))
-except Exception:
-    _CHARACTER_ZONE_EXIT_DURATION = 0.45
-try:
-    _FULL_TRAVEL_FIRST_ONLY = bool(_CFG_FULL_TRAVEL_FIRST_ONLY)
-except Exception:
-    _FULL_TRAVEL_FIRST_ONLY = True
-# Micro-movimento idle "respiratorio" v2 (anti-sticker): bob verticale +
-# sway orizzontale sinusoidali durante la permanenza. Ampiezze minime per
-# look premium senza distrarre dai sottotitoli; frequenze <1Hz (calme).
-_IDLE_BOB_AMP_Y = 5  # px, oscillazione verticale (±5px)
-_IDLE_BOB_FREQ = 0.6  # Hz, respiro calmo
-_IDLE_SWAY_AMP_X = 3  # px, oscillazione orizzontale (±3px)
-_IDLE_SWAY_FREQ = 0.43  # Hz, sfasata dal bob per moto organico
-# Zoom continuo 0.5%: applicato come micro-scala via offset di paste
-# (nessun resize per-frame: costo zero, effetto vita garantito dal bob+sway).
-_IDLE_ENABLED = True
+# Slide rapide del sistema a zone (motion graphics 9:16): 0.2s in/out.
+_CHARACTER_ZONE_ENTRY_DURATION = 0.20
+_CHARACTER_ZONE_EXIT_DURATION = 0.20
 # --- OTTIMIZZAZIONI VELOCITA' (P0) ---
 # Singleton FontManager condiviso: evita mkdir+scan disco per ogni chunk.
 _shared_font_manager = None
@@ -218,12 +191,8 @@ def _get_cached_pill_overlay(bbox: tuple[int, int, int, int], fill, pad: int, ra
         return overlay
 
 
-# Cache varianti opacity personaggio: evita copy+point per frame (stile
-# "upgrade 2": lookup table + quantizzazione step 8). La chiave include le
-# dimensioni del layer oltre a id(): se un oggetto Image viene deallocato e
-# Python riusa lo stesso id per un layer diverso, la size evita di ritornare
-# pixel stantii (anti flash-frame). Pulizia leggera anti-crescita infinita.
-_char_opacity_cache: dict[tuple[int, int, int, int], Image.Image] = {}
+# Cache varianti opacity personaggio: {(id(char), opacity//16): img} evita copy+point per frame.
+_char_opacity_cache: dict[tuple[int, int], Image.Image] = {}
 _char_opacity_cache_lock = threading.Lock()
 
 
@@ -237,12 +206,7 @@ def _get_char_at_opacity(char_img: Image.Image, opacity: int):
     q = max(8, min(255, q))
     if q >= 255:
         return char_img
-    try:
-        _sz = char_img.size
-        _sw, _sh = int(_sz[0]), int(_sz[1])
-    except Exception:
-        _sw, _sh = 0, 0
-    key = (id(char_img), _sw, _sh, q)
+    key = (id(char_img), q)
     hit = _char_opacity_cache.get(key)
     if hit is not None:
         return hit
@@ -349,7 +313,7 @@ def _resolve_typography_preset(chunk: dict, explicit_niche=None, explicit_preset
             "colors": {"base": "#FFFFFF", "highlight": "#FFD700", "accent": "#FFE8A3", "stroke": "#000000"},
             "sizes": {"base": TYPOGRAPHY_BASE_FONT_SIZE, "impact_scale": TYPOGRAPHY_IMPACT_SCALE, "accent_scale": TYPOGRAPHY_ACCENT_SCALE},
             "stroke_width": 0,
-            "shadow": {"offset": (0, 3), "fill": (0, 0, 0, 110)},
+            "shadow": {"offset": (0, 0), "fill": (0, 0, 0, 0)},
             "impact_uppercase": True,
         }
     if isinstance(explicit_preset, dict) and "fonts" in explicit_preset:
@@ -366,18 +330,14 @@ def _resolve_typography_preset(chunk: dict, explicit_niche=None, explicit_preset
 
 
 def _load_typography_fonts(preset: dict, font_scale: float = 1.0) -> dict:
-    """Carica i 3 font PIL REELS-FIX v5 (base 52-56px, auto-fit min 38px).
+    """Carica i 3 font PIL del preset alle dimensioni ponderate.
 
-    - base:   size preset (54) * font_scale, clamp 38..64
-    - impact: base * 1.25 (clamp 1.15..1.30, mai gigante)
-    - accent: base * 1.05 (clamp 1.0..1.10)
-    Ritorna {"base","impact","accent","sizes","paths","names"}. Mai eccezioni.
+    - base:   size standard (es. 60px) * font_scale del layout preset
+    - impact: base * impact_scale (1.3x-1.5x, es. 80-90px)
+    - accent: base * accent_scale (1.1x)
+    Ritorna {"base": font, "impact": font, "accent": font, "sizes": {...}, "paths": {...}}.
+    Mai eccezioni: fallback a renderer.load_font.
     """
-    try:
-        from config import TYPOGRAPHY_MIN_FONT_SIZE as _MIN_FS
-        _min_fs = max(20, int(_MIN_FS))
-    except Exception:
-        _min_fs = 38
     try:
         scale = float(font_scale)
     except (TypeError, ValueError):
@@ -392,17 +352,17 @@ def _load_typography_fonts(preset: dict, font_scale: float = 1.0) -> dict:
     try:
         impact_scale = float(sizes_cfg.get("impact_scale", TYPOGRAPHY_IMPACT_SCALE))
     except (TypeError, ValueError):
-        impact_scale = 1.25
+        impact_scale = 1.4
     try:
         accent_scale = float(sizes_cfg.get("accent_scale", TYPOGRAPHY_ACCENT_SCALE))
     except (TypeError, ValueError):
-        accent_scale = 1.05
-    impact_scale = min(1.30, max(1.15, impact_scale))
-    accent_scale = min(1.10, max(1.0, accent_scale))
+        accent_scale = 1.1
+    impact_scale = min(1.6, max(1.2, impact_scale))
+    accent_scale = min(1.3, max(1.0, accent_scale))
     sizes = {
-        "base": min(64, max(_min_fs, base_size)),
-        "impact": min(80, max(_min_fs, int(round(base_size * impact_scale)))),
-        "accent": min(68, max(_min_fs, int(round(base_size * accent_scale)))),
+        "base": max(24, base_size),
+        "impact": max(24, int(round(base_size * impact_scale))),
+        "accent": max(24, int(round(base_size * accent_scale))),
     }
     fonts_cfg = preset.get("fonts", {}) if isinstance(preset, dict) else {}
     out: dict = {"sizes": sizes, "paths": {}, "names": {}}
@@ -537,7 +497,8 @@ def _styled_fills(
     - accent: colore dedicato del preset (mai uguale al base per costruzione
       dei preset v2). Se manca o è uguale al base, deriva una tinta coerente;
       se illeggibile sullo sfondo, ripiega sul base (distinzione resta via font).
-    - stroke: SEMPRE (0,0,0,0) REELS-FIX v5 (stroke 0, auto-pill a parte).
+    - stroke: sempre trasparente (nessun contorno nero). La chiave resta per
+      compatibilità API ma con width=0 non viene mai disegnata.
     """
     from config import THEME_MIN_LUMINANCE_DIFF
     colors = preset.get("colors", {}) if isinstance(preset, dict) else {}
@@ -634,7 +595,7 @@ def _styled_fills(
         "base": base_rgba,
         "impact": impact_rgba,
         "accent": accent_rgba,
-        # REELS-FIX v5: stroke 0 trasparente (auto-pill separata, mai bordo).
+        # Trasparente: nessun contorno nero su nessuna parola.
         "stroke": (0, 0, 0, 0),
     }
 
@@ -645,18 +606,18 @@ def compute_styled_layout(
     max_width: int,
     area: tuple[int, int, int, int] | None = None,
 ) -> list[dict]:
-    """Layout multi-style REELS-FIX v5: wrapping stretto + hard-clamp + split long-word.
+    """Layout multi-style: misura OGNI parola col suo font e wrappa per larghezza cumulativa.
 
     Args:
-        styled_words: [{"word","display","style",...}] (display uppercase solo se <=7 char).
-        fonts: {"base","impact","accent"} da _load_typography_fonts.
-        max_width: ignorato se area fornita (usa strettamente ax1-ax0).
-        area: text_safe_area; None = fascia alta default.
+        styled_words: [{"word","display","style",...}] (display già uppercase per impact).
+        fonts: {"base": font, "impact": font, "accent": font} da _load_typography_fonts.
+        max_width: larghezza massima blocco (es. VIDEO_WIDTH*0.85, poi min con area).
+        area: text_safe_area (x_min,y_min,x_max,y_max); None = centro schermo.
 
     Returns:
-        Lista parallela a styled_words con x/y/width/height dentro il box
-        (hard-clamp X in [ax0,ax1-w], Y in [ay0,ay1-h]). Singola parola piu'
-        larga del box viene spezzata per caratteri (mai overflow).
+        Lista parallela a styled_words: {"word","display","style","x","y","width","height","font_role"}.
+        Il blocco è centrato DENTRO l'area e resta dentro quando ci sta
+        (stessa semantica di renderer.compute_word_layout).
     """
     from PIL import Image as _Image, ImageDraw as _ImageDraw
     from core.renderer import LINE_SPACING
@@ -673,7 +634,7 @@ def compute_styled_layout(
         try:
             ax0, ay0, ax1, ay1 = (int(area[0]), int(area[1]), int(area[2]), int(area[3]))
             if ax1 > ax0 and ay1 > ay0:
-                max_width = int(ax1 - ax0)
+                max_width = min(int(max_width), ax1 - ax0)
                 center_x = (ax0 + ax1) / 2.0
                 center_y = (ay0 + ay1) / 2.0
                 use_area = True
@@ -684,11 +645,9 @@ def compute_styled_layout(
     else:
         use_area = False
     if not use_area:
-        ax0, ay0, ax1, ay1 = 90, 140, 990, 720
+        ax0, ay0, ax1, ay1 = 0, 0, VIDEO_WIDTH, VIDEO_HEIGHT
         center_x = VIDEO_WIDTH / 2.0
-        center_y = (ay0 + ay1) / 2.0
-        max_width = int(ax1 - ax0)
-        use_area = True
+        center_y = VIDEO_HEIGHT / 2.0
     try:
         draw = _get_probe_draw()
     except Exception:
@@ -735,37 +694,8 @@ def compute_styled_layout(
     except Exception:
         space_w = 20.0
 
-    # REELS-FIX v5: pre-split parole singole piu' larghe del box (styled path).
-    try:
-        _mw = max(40, int(max_width))
-    except Exception:
-        _mw = int(max_width)
-    expanded: list[dict] = []
-    for it in items:
-        try:
-            _w0, _, _, _ = _measure(it["display"], it["style"])
-        except Exception:
-            expanded.append(it)
-            continue
-        if _w0 <= _mw or len(it["display"]) <= 1:
-            expanded.append(it)
-            continue
-        # Spezza per caratteri in chunk che stanno nel box (eredita stile).
-        _buf = ""
-        for _ch in it["display"]:
-            try:
-                _tw = draw.textlength(_buf + _ch, font=_font_for(it["style"]))
-            except Exception:
-                _tw = _mw + 1
-            if _tw <= _mw or not _buf:
-                _buf += _ch
-            else:
-                expanded.append({"word": _buf, "display": _buf, "style": it["style"]})
-                _buf = _ch
-        if _buf:
-            expanded.append({"word": _buf, "display": _buf, "style": it["style"]})
-    items = expanded
-    # Wrapping per larghezza cumulativa (misure stabili da metriche font).
+    # Wrapping per larghezza cumulativa (misure stabili da metriche font,
+    # non da bbox glifo-dipendente: niente salti tra maiuscole/minuscole).
     lines: list[list[int]] = []
     current: list[int] = []
     current_width = 0.0
@@ -810,20 +740,16 @@ def compute_styled_layout(
     total_height = sum(line_heights) + LINE_SPACING * (len(lines) - 1) if lines else 0
     start_y = int(round(center_y - total_height / 2.0))
     if use_area and lines:
-        if total_height >= (ay1 - ay0):
-            start_y = int(ay0)
-        else:
-            start_y = max(int(ay0), min(int(start_y), int(ay1 - total_height)))
+        start_y = max(ay0, min(start_y, ay1 - total_height))
 
     layout: list[dict] = [None] * len(items)  # type: ignore
     y = start_y
     for line, lw, la, ld, lh in zip(lines, line_widths, line_ascents, line_descents, line_heights):
         x = center_x - lw / 2.0
         if use_area:
-            if lw >= (ax1 - ax0):
-                x = float(ax0)
-            else:
-                x = max(float(ax0), min(float(x), float(ax1 - lw)))
+            x = max(float(ax0), x)
+            if x + lw > VIDEO_WIDTH - 8:
+                x = max(float(ax0), VIDEO_WIDTH - 8 - lw)
         baseline = y + la  # baseline comune di riga (anchor "la": y = baseline - ascent)
         for j, idx in enumerate(line):
             it = items[idx]
@@ -850,78 +776,7 @@ def compute_styled_layout(
             if j < len(line) - 1:
                 x += space_w
         y += lh + LINE_SPACING
-    # Hard-clamp finale: ogni parola dentro il box (mai fuori, mai overlap).
-    if use_area:
-        try:
-            for _it in layout:
-                if not isinstance(_it, dict):
-                    continue
-                try:
-                    _it["x"] = max(int(ax0), min(int(_it["x"]), int(ax1 - _it["width"])))
-                    _it["y"] = max(int(ay0), min(int(_it["y"]), int(ay1 - _it["height"])))
-                except Exception:
-                    continue
-        except Exception:
-            pass
     return layout
-
-
-def compute_auto_fit_styled_layout(styled_words: list[dict], preset: dict,
-                                   font_scale: float,
-                                   area: tuple[int, int, int, int] | None,
-                                   min_font_size: int = 38) -> tuple[list[dict], dict, dict]:
-    """Auto-fit styled REELS-FIX v5: riduce font_scale fino a rientro nel box.
-
-    Ritorna (layout, fonts, fills-base). Usato dai path animati per blocchi
-    densi: scala 1.0 -> *0.92 (max 6 iter) fino a min 38px equivalenti.
-    """
-    try:
-        scale = max(0.4, float(font_scale or 1.0))
-    except Exception:
-        scale = 1.0
-    try:
-        min_sz = max(20, int(min_font_size or 38))
-    except Exception:
-        min_sz = 38
-    try:
-        box_w = int(area[2]) - int(area[0]) if area else 900
-        box_h = int(area[3]) - int(area[1]) if area else 580
-    except Exception:
-        box_w, box_h = 900, 580
-    last: tuple = ([], {}, {})
-    for _ in range(6):
-        try:
-            fonts = _load_typography_fonts(preset, scale)
-        except Exception:
-            break
-        try:
-            lay = compute_styled_layout(list(styled_words or []), fonts,
-                                        max(40, box_w), area=area)
-        except Exception:
-            break
-        last = (lay, fonts, preset)
-        try:
-            if not lay:
-                return (lay, fonts, preset)
-            xs = [int(it["x"]) for it in lay if isinstance(it, dict)]
-            ys = [int(it["y"]) for it in lay if isinstance(it, dict)]
-            xe = [int(it["x"]) + int(it["width"]) for it in lay if isinstance(it, dict)]
-            ye = [int(it["y"]) + int(it["height"]) for it in lay if isinstance(it, dict)]
-            bb_w = max(xe) - min(xs) if xs else 0
-            bb_h = max(ye) - min(ys) if ys else 0
-        except Exception:
-            return (lay, fonts, preset)
-        if bb_w <= box_w + 1 and bb_h <= box_h + 1:
-            return (lay, fonts, preset)
-        # Stima size base corrente per stop a 38px.
-        try:
-            cur_base = int((fonts.get("sizes", {}) or {}).get("base", 54))
-        except Exception:
-            cur_base = 54
-        if cur_base <= min_sz:
-            return (lay, fonts, preset)
-        scale = max(0.4, scale * 0.92)
-    return last
 
 
 def _draw_styled_word_direct(
@@ -937,66 +792,56 @@ def _draw_styled_word_direct(
     shadow_fill: tuple | None,
     opacity: int,
 ) -> None:
-    """Disegna parola REELS-FIX v5 (stroke 0, ambient shadow 0,3,110)."""
+    """Disegna parola pulita (nessun contorno di default) + ombra opzionale."""
     if opacity <= 0:
         return
     if opacity > 255:
         opacity = 255
-    # REELS-FIX v5: stroke 0 consentito, max 8px se esplicito.
     try:
         sw = int(stroke_width or 0)
     except (TypeError, ValueError):
         sw = 0
     if sw < 0:
         sw = 0
-    if sw > 8:
-        sw = 8
     try:
         from core.renderer import _normalize_rgba
         fill_rgba = _normalize_rgba(fill, SUBTITLE_COLOR)
-        if sw > 0:
-            stroke_rgba = _normalize_rgba(stroke_color, (0, 0, 0, 255))
-        else:
-            stroke_rgba = None
+        stroke_rgba = _normalize_rgba(stroke_color, (0, 0, 0, 0))
     except Exception:
         fill_rgba = tuple(fill) if isinstance(fill, (tuple, list)) else SUBTITLE_COLOR
-        stroke_rgba = tuple(stroke_color) if isinstance(stroke_color, (tuple, list)) else None
-        if sw <= 0:
-            stroke_rgba = None
+        stroke_rgba = tuple(stroke_color) if isinstance(stroke_color, (tuple, list)) else (0, 0, 0, 0)
     if opacity < 255:
         factor = opacity / 255.0
         fill_rgba = (fill_rgba[0], fill_rgba[1], fill_rgba[2], int(round(fill_rgba[3] * factor)))
-        if stroke_rgba is not None:
-            stroke_rgba = (stroke_rgba[0], stroke_rgba[1], stroke_rgba[2], int(round(stroke_rgba[3] * factor)))
-    # Ambient shadow morbida (0,3,110); None = nessuna ombra (rispettato).
-    try:
-        if shadow_offset is None or shadow_fill is None:
-            sh, sx, sy = None, 0, 0
-        else:
-            _so = tuple(shadow_offset)
-            _sf = tuple(shadow_fill)
-            sh = tuple(int(v) for v in _sf)
+        stroke_rgba = (stroke_rgba[0], stroke_rgba[1], stroke_rgba[2], int(round(stroke_rgba[3] * factor)))
+    # Ombra prima (solo se abilitata esplicitamente e non trasparente).
+    if shadow_offset is not None and shadow_fill is not None and TYPOGRAPHY_SHADOW_ENABLED:
+        try:
+            sh = tuple(int(v) for v in shadow_fill)
             if len(sh) == 3:
                 sh = (sh[0], sh[1], sh[2], 255)
             if len(sh) >= 4 and sh[3] <= 0:
                 sh = None
             else:
-                sx, sy = int(_so[0]), int(_so[1])
-                if opacity < 255 and sh is not None:
+                sx, sy = int(shadow_offset[0]), int(shadow_offset[1])
+                if sx == 0 and sy == 0:
+                    sh = None
+                elif opacity < 255:
                     sh = (sh[0], sh[1], sh[2], int(round(sh[3] * opacity / 255.0)))
-    except (TypeError, ValueError, IndexError):
-        sh, sx, sy = (0, 0, 0, 110), 0, 3
-    if sh is not None:
-        try:
-            draw.text((int(x) + int(sx), int(y) + int(sy)), display, font=font, fill=sh)
-        except Exception:
-            pass
+        except (TypeError, ValueError, IndexError):
+            sh = None
+        if sh is not None:
+            try:
+                draw.text((x + sx, y + sy), display, font=font, fill=sh)
+            except Exception:
+                pass
     try:
-        if sw > 0 and stroke_rgba is not None:
+        if sw <= 0:
+            # Path pulito: nessun contorno nero.
+            draw.text((x, y), display, font=font, fill=fill_rgba)
+        else:
             draw.text((x, y), display, font=font, fill=fill_rgba,
                       stroke_width=sw, stroke_fill=stroke_rgba)
-        else:
-            draw.text((x, y), display, font=font, fill=fill_rgba)
     except Exception:
         try:
             draw.text((x, y), display, font=font, fill=fill_rgba)
@@ -1020,25 +865,9 @@ def _render_styled_scaled_word(
     opacity: int,
     scale: float,
 ) -> None:
-    """Tile scalata REELS-FIX v5 (stroke 0, ambient shadow 0,3,110)."""
+    """Come _render_scaled_word ma con drop shadow inclusa nella tile scalata."""
     if opacity <= 0 or scale <= 0:
         return
-    # REELS-FIX v5: clamp scala a max 1.0 (no overshoot gigante).
-    try:
-        if float(scale) > 1.0:
-            scale = 1.0
-    except Exception:
-        pass
-    try:
-        _sw0 = int(stroke_width or 0)
-    except (TypeError, ValueError):
-        _sw0 = 0
-    if _sw0 < 0:
-        stroke_width = 0
-    if shadow_offset is None:
-        shadow_offset = (0, 3)
-    if shadow_fill is None:
-        shadow_fill = (0, 0, 0, 110)
     if abs(scale - 1.0) < 1e-3:
         draw = ImageDraw.Draw(frame_img)
         _draw_styled_word_direct(draw, display, x, y, font, fill, stroke_color,
@@ -1048,13 +877,14 @@ def _render_styled_scaled_word(
         _sw = int(stroke_width or 0)
     except (TypeError, ValueError):
         _sw = 0
-    if _sw < 0:
-        _sw = 0
     pad = 32 + max(0, _sw) * 2
     try:
-        sox, soy = int(shadow_offset[0]), int(shadow_offset[1])
+        if shadow_offset is None or not TYPOGRAPHY_SHADOW_ENABLED:
+            sox, soy = 0, 0
+        else:
+            sox, soy = int(shadow_offset[0]), int(shadow_offset[1])
     except Exception:
-        sox, soy = 0, 3
+        sox, soy = 0, 0
     pad_x = pad + max(0, sox)
     pad_y = pad + max(0, soy)
     tile_w = max(1, int(word_w + pad_x * 2))
@@ -1204,34 +1034,6 @@ def _character_info_from_chunk(chunk: dict) -> dict | None:
         return None
 
 
-def _preset_text_area(info: dict | None, preset: str | None):
-    """Text Safe Area col bordo dinamico sul personaggio (v7 FIT-TO-HALF).
-
-    Negli split deriva il box dal bbox reale fittato (fino a 40px prima del
-    personaggio); altrove/static fallback. Mai solleva (fallback statico).
-    """
-    try:
-        _p = str(preset) if preset else None
-        if info is not None and _p in ("layout_split_left", "layout_split_right"):
-            _pose = None
-            try:
-                _pose = int(info.get("pose"))
-            except Exception:
-                _pose = None
-            try:
-                _punch = bool(info.get("punch_in", False))
-            except Exception:
-                _punch = False
-            return preset_safe_area_dynamic(_p, VIDEO_WIDTH, VIDEO_HEIGHT,
-                                            _pose, _punch)
-    except Exception:
-        pass
-    try:
-        return preset_safe_area(preset, VIDEO_WIDTH, VIDEO_HEIGHT)
-    except Exception:
-        return None
-
-
 def _character_side(info: dict) -> str:
     """Lato del personaggio ('left' | 'right' | 'center')."""
     if info.get("use_preset"):
@@ -1243,14 +1045,11 @@ def _character_side(info: dict) -> str:
         "right" if "right" in str(info.get("position", "")) else "center")
 
 
-def _load_chunk_character_layer(info: dict | None, text_rect=None):
+def _load_chunk_character_layer(info: dict | None):
     """Layer personaggio (immagine + XY) per il chunk, o (None, None).
 
-    Placement vincolato (scala = min(base, vincolo altezza, vincolo larghezza)
-    + centro visivo in safe zone + clamp): soggetto interamente nel frame con
-    margine, faccia mai tagliata. `text_rect` (x, y, w, h della fascia
-    sottotitoli, opzionale) evita l'overlap col testo (il testo ha priorita').
-    Errori non bloccanti (asset mancante, posa invalida): il frame viene
+    Col preset usa `get_character_layer` (scala width-based + punch_in);
+    errori non bloccanti (asset mancante, posa invalida): il frame viene
     generato senza personaggio (nessuna regressione).
     """
     if info is None:
@@ -1260,40 +1059,8 @@ def _load_chunk_character_layer(info: dict | None, text_rect=None):
             char_img, px, py = get_character_layer(
                 int(info["pose"]), info.get("layout"),
                 bool(info.get("punch_in", False)),
-                VIDEO_WIDTH, VIDEO_HEIGHT, text_rect=text_rect)
+                VIDEO_WIDTH, VIDEO_HEIGHT)
             return char_img, (px, py)
-        # Legacy v1: stesso placement vincolato (position -> zona), fallback
-        # al calcolo storico se fallisce.
-        try:
-            from core.character_selector import load_character_original
-            from core.character_geometry import compute_subject_placement
-            _orig = load_character_original(int(info["pose"]))
-            try:
-                _hint = float(info.get("scale", 0.75))
-            except (TypeError, ValueError):
-                _hint = 0.75
-            _pl = compute_subject_placement(
-                int(info["pose"]), str(info.get("position", "bottom_center")),
-                False, VIDEO_WIDTH, VIDEO_HEIGHT, src_size=_orig.size,
-                scale_hint=_hint, text_rect=text_rect)
-            try:
-                from PIL import Image as _PILImage
-                try:
-                    _rs = _PILImage.Resampling.LANCZOS
-                except AttributeError:  # Pillow < 9.1
-                    _rs = _PILImage.LANCZOS
-                _resized = _orig.resize((int(_pl["new_w"]), int(_pl["new_h"])), _rs)
-                if _resized.mode != "RGBA":
-                    _resized = _resized.convert("RGBA")
-                return _resized, (int(_pl["px"]), int(_pl["py"]))
-            except Exception:
-                pass
-        except Exception as _le:
-            try:
-                print(f"[text_animator] warning: placement legacy fallito "
-                      f"({_le}), uso bbox storica")
-            except Exception:
-                pass
         from core.character_selector import character_target_height, load_and_process_character_image
         target_h = character_target_height(info.get("scale", 0.75), VIDEO_HEIGHT)
         char_img = load_and_process_character_image(int(info["pose"]), target_h)
@@ -1326,9 +1093,9 @@ def _character_entry_offset_opacity(
     - fade: solo opacita' (con `fade=False` diventa apparizione istantanea).
     - none: gia' in posizione, opaco da subito.
 
-    `fade=True` (default): entrata con dissolvenza + slide (fade in).
-    `fade=False` solo per continuazioni gestite via jump-cut (stessa identita'
-    o punch): in quel caso lo slide e' comunque saltato dal chiamante.
+    `fade=False` serve quando il personaggio era gia' visibile nel chunk
+    precedente (cambio posa/layout): lo slide resta, ma senza dissolvenza,
+    cosi' il personaggio non sparisce mai a meta' video (anti-glitch).
     """
     p = clamp01(progress)
     t = str(transition or "fade")
@@ -1366,9 +1133,10 @@ def _character_exit_offset_opacity(
 ) -> tuple[int, int, int]:
     """Offset/uscita del personaggio nella finestra di uscita di fine chunk.
 
-    - "slide_down": scende dissolvendo (fade out, come in passato).
-      Il chunk dopo rientra con slide + fade in: transizione morbida,
-      mai sparizione di botto. Luminosita' piena fino all'inizio uscita.
+    - "slide_down": scende fuori campo basso (il chunk successivo, con lato
+      opposto, rientra con slide laterale: niente taglio netto). Con
+      `fade=False` resta a piena opacita' mentre scende (solo movimento,
+      nessuna sparizione: anti-glitch sui cambi layout).
     - "hold": resta fermo e opaco (stesso personaggio dopo, o jump-cut
       punch-in: taglio invisibile/netto senza dissolvenze).
     - altro ("with_text"): nessuna animazione propria (segue il fade di gruppo,
@@ -1408,14 +1176,21 @@ def _character_identity(info) -> tuple | None:
 
 
 def decide_char_exit_mode(current: dict | None, nxt: dict | None) -> str:
-    """Modalita' di uscita (logica v2 collaudata: animazioni sempre visibili).
+    """Modalita' di uscita del personaggio guardando il chunk successivo.
 
-    - Chunk dopo senza personaggio (o fine video) -> "with_text" (fade).
-    - Punch che cambia -> "hold" (jump-cut, niente dissolvenze).
-    - Stessa identita' dopo -> "hold" (taglio invisibile).
-    - Cambio lato split L<->R -> "slide_down" a piena opacita' (poi il chunk
-      dopo rientra dal lato opposto con slide: animazione sempre visibile).
-    - Altri cambi -> "hold" (il chunk dopo entra con slide a piena opacita').
+    Invariante anti-glitch: il personaggio svanisce SOLO quando deve
+    chiaramente scomparire (chunk dopo senza personaggio, o fine video).
+    In tutti gli altri casi resta visibile fino allo stacco:
+
+    - Chunk dopo senza personaggio (o fine video) -> "with_text" (fade di
+      gruppo: sparizione chiara e intenzionale).
+    - Punch-in che si accende/spegne -> "hold" (il jump-cut non ha dissolvenze).
+    - Stessa identita' (posa+zona+punch) dopo -> "hold" (taglio invisibile).
+    - Cambio lato (split_left <-> split_right) -> "slide_down" (scende a piena
+      opacita', poi il chunk dopo rientra dal lato opposto).
+    - Altri cambi (es. centro <-> split, legacy) -> "hold" (resta fino allo
+      stacco, il chunk dopo entra con slide a piena opacita').
+    Accetta chunk grezzi o info gia' risolte; mai eccezioni.
     """
     try:
         cur = current if isinstance(current, dict) and "pose" in current and "use_preset" in current \
@@ -1427,11 +1202,11 @@ def decide_char_exit_mode(current: dict | None, nxt: dict | None) -> str:
     if cur is None:
         return _CHAR_EXIT_WITH_TEXT
     if after is None:
-        return _CHAR_EXIT_WITH_TEXT
+        return _CHAR_EXIT_WITH_TEXT  # sparizione (o fine video): fade
     if _punch_of(cur) != _punch_of(after):
-        return _CHAR_EXIT_HOLD
+        return _CHAR_EXIT_HOLD  # jump-cut: niente transizioni morbide
     if _character_identity(cur) == _character_identity(after):
-        return _CHAR_EXIT_HOLD
+        return _CHAR_EXIT_HOLD  # stesso personaggio: taglio invisibile
     if bool(cur.get("use_preset")) and bool(after.get("use_preset")):
         try:
             cur_side = preset_side(cur.get("layout"))
@@ -1444,12 +1219,11 @@ def decide_char_exit_mode(current: dict | None, nxt: dict | None) -> str:
 
 
 def decide_char_entry_jump(prev: dict | None, current: dict | None) -> bool:
-    """Jump-cut SOLO su cambio punch (logica v2 collaudata).
+    """Vero se l'entrata del personaggio dev'essere un jump-cut istantaneo.
 
-    RIMOSSA la regola "stessa zona -> jump" che uccideva tutte le slide di
-    entrata (il personaggio cambiava posa senza animazione e sembrava fixo).
-    Ora ogni cambio posa/layout entra con slide visibile, solo il punch fa
-    stacco netto TV. Prima apparizione: slide (mai jump).
+    Solo quando il punch-in cambia rispetto al chunk precedente (stacco di
+    camera televisivo: nessuna slide, scala nuova da subito) o il video inizia
+    gia' in punch-in. Accetta chunk grezzi o info risolte; mai eccezioni.
     """
     try:
         cur = current if isinstance(current, dict) and "pose" in current and "use_preset" in current \
@@ -1614,29 +1388,23 @@ def generate_animated_chunk_frames(
         needs_pill, font_scale = False, 1.0
     elif use_preset:
         preset = char_info.get("layout")
-        area = _preset_text_area(char_info, preset)
+        area = preset_safe_area(preset, VIDEO_WIDTH, VIDEO_HEIGHT)
         needs_pill = preset_needs_text_background(preset)
         font_scale = preset_font_scale(preset)
     else:
         area, needs_pill, font_scale = None, False, 1.0
-    # Boost chunk corti (1-3 parole): +20% base, mai oltre il box
-    # (auto-fit riduce se serve). Caption singole restano protagoniste.
-    try:
-        _nw0 = len(words)
-        if 0 < int(_nw0) <= 3:
-            font_scale = float(font_scale) * 1.2
-    except Exception:
-        pass
 
-    # --- Semantic Typography REELS-FIX v5: stroke 0, ambient shadow, min 38px ---
+    # --- Semantic Typography: path multi-style o legacy single-font ---
+    # Look pulito: stroke sempre 0 (nessun contorno nero), ombra solo se
+    # abilitata esplicitamente da config (default OFF).
     use_typography = _is_typography_chunk(chunk)
     typo_preset: dict | None = None
     typo_fonts: dict | None = None
     typo_fills: dict | None = None
     typo_stroke_color: tuple = (0, 0, 0, 0)
     typo_stroke_width: int = 0
-    typo_shadow_offset = (0, 3)
-    typo_shadow_fill = (0, 0, 0, 110)
+    typo_shadow_offset = None
+    typo_shadow_fill = None
     styled_words: list[dict] | None = None
 
     if use_typography:
@@ -1671,14 +1439,8 @@ def generate_animated_chunk_frames(
                 except (TypeError, ValueError, KeyError, IndexError):
                     st = float(words[i]["start"]) if i < len(words) else float(chunk.get("start", 0.0))
                     en = float(words[i]["end"]) if i < len(words) else float(chunk.get("end", 0.0))
-                # REELS-FIX v5: uppercase solo se parola <=7 char (no espansione brutta).
-                try:
-                    from core.typography_presets import IMPACT_UPPERCASE_MAX_LEN as _MX
-                except Exception:
-                    _MX = 7
-                _do_up = bool(style == "impact" and uppercase_impact and len(word_text.strip()) <= int(_MX))
-                display = str(s.get("display", word_text.upper() if _do_up else word_text))
-                if _do_up:
+                display = str(s.get("display", word_text.upper() if (style == "impact" and uppercase_impact) else word_text))
+                if style == "impact" and uppercase_impact:
                     display = display.upper()
                 styled_words.append({
                     "word": word_text, "display": display, "style": style,
@@ -1688,15 +1450,9 @@ def generate_animated_chunk_frames(
         if not styled_words:
             # Deriva da words legacy: keyword -> impact, resto base.
             styled_words = []
-            try:
-                from core.typography_presets import IMPACT_UPPERCASE_MAX_LEN as _MX2
-            except Exception:
-                _MX2 = 7
             for w in words:
                 style = "impact" if w.get("is_keyword") else "base"
-                _ww = str(w["word"])
-                _up2 = bool(style == "impact" and uppercase_impact and len(_ww.strip()) <= int(_MX2))
-                disp = _ww.upper() if _up2 else _ww
+                disp = str(w["word"]).upper() if (style == "impact" and uppercase_impact) else str(w["word"])
                 styled_words.append({
                     "word": str(w["word"]), "display": disp, "style": style,
                     "start": float(w["start"]), "end": float(w["end"]),
@@ -1705,13 +1461,9 @@ def generate_animated_chunk_frames(
         if not styled_words:
             use_typography = False
     if use_typography and typo_preset is not None and styled_words:
-        # REELS-FIX v5 auto-fit styled: scala font fino a rientro nel box.
-        try:
-            _box_w_tmp = int(area[2]) - int(area[0]) if area else 900
-        except Exception:
-            _box_w_tmp = 900
         typo_fonts = _load_typography_fonts(typo_preset, font_scale)
-        # Attribuzione colori coerente: tema + sfondo + keyword. Stroke 0.
+        # Attribuzione colori coerente: tema (base) + sfondo (contrasto) +
+        # palette keyword del video (fallback impact). Mai contorno nero.
         typo_fills = _styled_fills(
             typo_preset,
             base_override=text_color,
@@ -1720,65 +1472,42 @@ def generate_animated_chunk_frames(
         )
         typo_stroke_color = (0, 0, 0, 0)
         try:
+            # Lo stroke resta configurabile ma di default è 0 (look pulito).
+            # Valori >0 sono permessi solo se l'utente li forza esplicitamente.
             cfg_w = int(typo_preset.get("stroke_width", TYPOGRAPHY_STROKE_WIDTH))
         except (TypeError, ValueError):
-            cfg_w = 0
+            cfg_w = TYPOGRAPHY_STROKE_WIDTH
         try:
-            _cfg_global = int(TYPOGRAPHY_STROKE_WIDTH)
+            cfg_w = int(TYPOGRAPHY_STROKE_WIDTH) if str(TYPOGRAPHY_STROKE_WIDTH).strip() != "0" else 0
         except (TypeError, ValueError):
-            _cfg_global = 0
-        typo_stroke_width = max(0, int(cfg_w or 0), int(_cfg_global or 0))
-        # Ambient shadow morbida (0,3,110); None = nessuna ombra.
-        try:
-            sh = typo_preset.get("shadow", {}) if isinstance(typo_preset, dict) else {}
-            _off = sh.get("offset", tuple(TYPOGRAPHY_SHADOW_OFFSET))
-            _fill = sh.get("fill", tuple(TYPOGRAPHY_SHADOW_FILL))
-            typo_shadow_offset = tuple(_off) if _off is not None else (0, 3)
-            typo_shadow_fill = tuple(_fill) if _fill is not None else (0, 0, 0, 110)
-        except Exception:
-            typo_shadow_offset, typo_shadow_fill = (0, 3), (0, 0, 0, 110)
-        max_text_width = int(_box_w_tmp)
-        # Auto-fit loop: se bbox eccede il box, scala 0.92 fino a min 38px.
-        try:
-            _area_box_w = int(area[2]) - int(area[0]) if area else 900
-            _area_box_h = int(area[3]) - int(area[1]) if area else 580
-        except Exception:
-            _area_box_w, _area_box_h = 900, 580
+            cfg_w = 0
+        typo_stroke_width = max(0, cfg_w if cfg_w else 0)
+        if not TYPOGRAPHY_SHADOW_ENABLED:
+            typo_shadow_offset = None
+            typo_shadow_fill = None
+        else:
+            try:
+                sh = typo_preset.get("shadow", {})
+                _off = sh.get("offset", tuple(TYPOGRAPHY_SHADOW_OFFSET))
+                _fill = sh.get("fill", tuple(TYPOGRAPHY_SHADOW_FILL))
+                typo_shadow_offset = tuple(_off) if _off else None
+                typo_shadow_fill = tuple(_fill) if _fill else None
+                # Ombra "vuota" (0,0 / alpha 0) = disabilitata di fatto.
+                if typo_shadow_offset == (0, 0):
+                    typo_shadow_offset = None
+                try:
+                    if typo_shadow_fill is not None and len(typo_shadow_fill) >= 4 and int(typo_shadow_fill[3]) <= 0:
+                        typo_shadow_fill = None
+                except Exception:
+                    pass
+                if typo_shadow_offset is None or typo_shadow_fill is None:
+                    typo_shadow_offset = None
+                    typo_shadow_fill = None
+            except Exception:
+                typo_shadow_offset = None
+                typo_shadow_fill = None
+        max_text_width = int(VIDEO_WIDTH * 0.85)
         layout = compute_styled_layout(styled_words, typo_fonts, max_text_width, area=area)
-        try:
-            from config import TYPOGRAPHY_MIN_FONT_SIZE as _TMFS
-            _tmfs = max(20, int(_TMFS))
-        except Exception:
-            _tmfs = 38
-        for _af in range(5):
-            try:
-                if not layout:
-                    break
-                _xs = [int(it["x"]) for it in layout]
-                _ys = [int(it["y"]) for it in layout]
-                _xe = [int(it["x"]) + int(it["width"]) for it in layout]
-                _ye = [int(it["y"]) + int(it["height"]) for it in layout]
-                _bw = max(_xe) - min(_xs)
-                _bh = max(_ye) - min(_ys)
-            except Exception:
-                break
-            if _bw <= _area_box_w + 1 and _bh <= _area_box_h + 1:
-                break
-            try:
-                _cur = int((typo_fonts.get("sizes", {}) or {}).get("base", 54))
-            except Exception:
-                _cur = 54
-            if _cur <= _tmfs:
-                break
-            try:
-                font_scale = max(0.4, float(font_scale) * 0.92)
-            except Exception:
-                break
-            try:
-                typo_fonts = _load_typography_fonts(typo_preset, font_scale)
-                layout = compute_styled_layout(styled_words, typo_fonts, max_text_width, area=area)
-            except Exception:
-                break
         if len(layout) != len(styled_words):
             raise TextAnimationError("Layout/words fuori sync: conteggio diverso.")
         # Fills per parola per ruolo (la tipografia vince sulla palette keyword).
@@ -1792,31 +1521,15 @@ def generate_animated_chunk_frames(
         ]
     else:
         use_typography = False
-        # --- Legacy auto-fit REELS-FIX v5: base*scale, minimo 38px ---
+        # --- Pre-calcolo layout legacy (una sola volta, fisso per tutto il chunk) ---
         try:
-            from config import SUBTITLE_MIN_FONT_SIZE as _LMFS
-            _lmfs = max(20, int(_LMFS))
-        except Exception:
-            _lmfs = 38
-        try:
-            text_font_size = int(round(int(SUBTITLE_FONT_SIZE) * float(font_scale)))
+            text_font_size = max(24, int(round(SUBTITLE_FONT_SIZE * float(font_scale))))
         except (TypeError, ValueError):
-            text_font_size = int(SUBTITLE_FONT_SIZE)
+            text_font_size = SUBTITLE_FONT_SIZE
+        font = load_font(text_font_size)
+        max_text_width = int(VIDEO_WIDTH * 0.85)
         word_texts = [w["word"] for w in words]
-        try:
-            from core.renderer import compute_auto_fit_layout as _auto_fit
-            layout, font, text_font_size = _auto_fit(word_texts, text_font_size,
-                                                     area, min_font_size=_lmfs)
-        except Exception:
-            try:
-                font = load_font(max(_lmfs, text_font_size))
-            except Exception:
-                font = load_font(text_font_size)
-            try:
-                _bw_legacy = int(area[2]) - int(area[0]) if area else int(VIDEO_WIDTH * 0.85)
-            except Exception:
-                _bw_legacy = int(VIDEO_WIDTH * 0.85)
-            layout = compute_word_layout(word_texts, font, max(40, _bw_legacy), area=area)
+        layout = compute_word_layout(word_texts, font, max_text_width, area=area)
         if len(layout) != len(words):
             raise TextAnimationError("Layout/words fuori sync: conteggio diverso.")
 
@@ -1829,12 +1542,9 @@ def generate_animated_chunk_frames(
 
     entry_dur = max(0.01, float(TEXT_ANIMATION_ENTRY_DURATION))
     exit_dur = max(0.0, float(TEXT_ANIMATION_EXIT_DURATION))
-    try:
-        scale_from = float(KEYWORD_ENTRY_SCALE_FROM)
-    except Exception:
-        scale_from = 0.85
-    if not (0.5 <= scale_from <= 1.0):
-        scale_from = 0.85
+    scale_from = float(KEYWORD_ENTRY_SCALE_FROM)
+    if not (0.1 <= scale_from <= 1.0):
+        scale_from = 0.7
     # Override narrativi per atto (hook più scattante e pop marcato;
     # chiavi assenti = default legacy, piena retrocompatibilità).
     try:
@@ -1852,30 +1562,16 @@ def generate_animated_chunk_frames(
 
     # --- Personaggio del chunk (layer UNA volta, riusato in ogni frame) ---
     # Z-index sui frame: 1. sfondo (ffmpeg) / 2. personaggio / 2.5 pill / 3. testo.
-    # La fascia testo (area) guida il placement anti-overlap (FASE 7); il
-    # keyframe finale delle transizioni coincide con lo stato stabile clampato
-    # (offset 0 a progress 1, vedi _character_entry_offset_opacity), quindi il
-    # fuori-campo esiste solo a meta' animazione (FASE 4); il punch_in e'
-    # ricappato su vincolo larghezza + faccia visibile (FASE 5).
-    try:
-        _char_text_rect = None
-        if area is not None and len(area) == 4:
-            _char_text_rect = (float(area[0]), float(area[1]),
-                               float(area[2] - area[0]), float(area[3] - area[1]))
-    except Exception:
-        _char_text_rect = None
-    char_img, char_base_xy = _load_chunk_character_layer(char_info,
-                                                         text_rect=_char_text_rect)
+    char_img, char_base_xy = _load_chunk_character_layer(char_info)
     if char_img is not None and char_base_xy is not None and char_info is not None:
         char_transition = char_info.get("transition_in", "fade") or "fade"
         char_side = _character_side(char_info)
+        char_full_travel = bool(use_preset)
+        char_entry_dur = max(0.01, _CHARACTER_ZONE_ENTRY_DURATION if use_preset else _CHARACTER_ENTRY_DURATION)
         char_entry_jump = bool(char_entry_jump)
         char_entry_fade = bool(char_entry_fade)
-        # Fix animazioni: slide LUNGA da fuori-campo a ogni cambio layout
-        # (logica v2 collaudata). Solo il jump-cut punch e la stessa identita'
-        # (hold) restano fermi; tutto il resto entra scivolando visibilmente.
-        char_full_travel = bool(use_preset and not char_entry_jump)
-        char_entry_dur = max(0.01, _CHARACTER_ZONE_ENTRY_DURATION if use_preset else _CHARACTER_ENTRY_DURATION)
+    else:
+        char_base_xy = None
 
     try:
         char_exit_dur = max(0.0, float(char_exit_duration))
@@ -1889,24 +1585,9 @@ def generate_animated_chunk_frames(
     frames: list[dict] = []
 
     # --- Pre-computazioni per-chunk (fuori dal loop frame) ---
-    # Pill: preset punch-in oppure auto-pill (testo scuro/grigio su scuro).
-    # Stroke sempre 0: la leggibilita' viene dalla pill, mai dai bordi.
-    try:
-        _want_pill = bool(needs_pill)
-        if not _want_pill and layout:
-            try:
-                _base_probe = (typo_fills.get("base") if use_typography and
-                               isinstance(typo_fills, dict) else base_rgba)
-            except Exception:
-                _base_probe = None
-            try:
-                _want_pill = bool(should_auto_pill(_base_probe, background_color))
-            except Exception:
-                _want_pill = False
-    except Exception:
-        _want_pill = bool(needs_pill)
+    # Pill: overlay pre-renderizzato una volta, poi alpha_composite (no ricalcolo bbox).
     _pill_overlay = None
-    if _want_pill and layout:
+    if needs_pill and layout:
         try:
             from core.renderer import TEXT_PILL_FILL, TEXT_PILL_PAD, TEXT_PILL_RADIUS
             _x0 = min(it["x"] for it in layout) - TEXT_PILL_PAD
@@ -1956,8 +1637,8 @@ def generate_animated_chunk_frames(
         frame_img = _new_rgba("RGBA", _canvas_size, _transparent)
 
         # Z-index 2: personaggio sotto il testo (entrata + eventuale uscita).
-        # Fade in su apparizione e cambi visibili, fade out in uscita:
-        # luminosita' piena a regime (255, mai dimmerato), mai di botto.
+        # Anti-glitch: la dissolvenza scatta SOLO in apparizione (entry_fade)
+        # o sparizione (with_text); nei cambi resta sempre visibile.
         if char_img is not None and char_base_xy is not None:
             if char_entry_jump:
                 # Jump-cut istantaneo (punch-in o continuazione identica).
@@ -1974,33 +1655,15 @@ def generate_animated_chunk_frames(
                 char_opacity, xdx, xdy = entry_opacity, 0, 0
             elif char_exit_mode == _CHAR_EXIT_SLIDE_DOWN and char_exit_dur > 0 \
                     and t >= chunk_end - char_exit_dur:
-                # Fade OUT in uscita (come in passato): scende dissolvendo,
-                # mai sparizione di botto. Luminosita' piena fino all'uscita.
                 xprog = clamp01((t - (chunk_end - char_exit_dur)) / char_exit_dur)
                 xdx, xdy, exit_opacity = _character_exit_offset_opacity(
-                    _CHAR_EXIT_SLIDE_DOWN, xprog, char_base_xy[1], fade=True)
+                    _CHAR_EXIT_SLIDE_DOWN, xprog, char_base_xy[1], fade=False)
                 char_opacity = min(entry_opacity, exit_opacity)
             else:
                 char_opacity, xdx, xdy = int(round(entry_opacity * exit_factor)), 0, 0
-            # Micro-movimento idle v2 (anti-sticker): bob+sway sinusoidali
-            # sempre attivi (anche in HOLD) per dare vita al personaggio.
-            # Fase continua su t assoluto: nessun salto tra chunk consecutivi
-            # con stessa posa (moto coerente, non reset per chunk).
-            if _IDLE_ENABLED and char_opacity > 0:
-                try:
-                    _t_rel = float(t)
-                    _idle_dy = int(round(
-                        _IDLE_BOB_AMP_Y * math.sin(2.0 * math.pi * _IDLE_BOB_FREQ * _t_rel)))
-                    _idle_dx = int(round(
-                        _IDLE_SWAY_AMP_X * math.sin(2.0 * math.pi * _IDLE_SWAY_FREQ * _t_rel + 1.1)))
-                except Exception:
-                    _idle_dx, _idle_dy = 0, 0
-            else:
-                _idle_dx, _idle_dy = 0, 0
             _paste_character_frame(
                 frame_img, char_img,
-                char_base_xy[0] + edx + xdx + _idle_dx,
-                char_base_xy[1] + edy + xdy + _idle_dy,
+                char_base_xy[0] + edx + xdx, char_base_xy[1] + edy + xdy,
                 char_opacity,
             )
 
@@ -2010,7 +1673,7 @@ def generate_animated_chunk_frames(
                 frame_img.alpha_composite(_pill_overlay)
             except (ValueError, AttributeError):
                 draw_text_background(frame_img, layout)
-        elif needs_pill or _want_pill:
+        elif needs_pill:
             draw_text_background(frame_img, layout)
 
         for wi, w in enumerate(words):
@@ -2018,12 +1681,8 @@ def generate_animated_chunk_frames(
                 continue  # non ancora iniziata
             local = _clamp01((t - word_starts[wi]) / entry_dur)
             if w["is_keyword"]:
-                # REELS-FIX v5: clamp overshoot ease_out_back a max 1.0
-                # (pop 0.85->1.0, mai oltre 100% = mai gigante).
-                try:
-                    eased = min(float(_ease_out_back(local)), 1.0)
-                except Exception:
-                    eased = min(1.0, max(0.0, float(local)))
+                eased = _ease_out_back(local)
+                # Opacita': clamp 0-255 (l'overshoot >1 va saturato).
                 if eased >= 1.0:
                     opacity = 255
                 elif eased <= 0.0:
@@ -2031,8 +1690,6 @@ def generate_animated_chunk_frames(
                 else:
                     opacity = int(round(255 * eased))
                 scale = scale_from + (1.0 - scale_from) * eased
-                if scale > 1.0:
-                    scale = 1.0
                 # Evita scale degeneri a inizio animazione.
                 if scale < 0.05:
                     scale = 0.05
@@ -2061,17 +1718,10 @@ def generate_animated_chunk_frames(
                     opacity=opacity, scale=scale,
                 )
             else:
-                # Legacy REELS-FIX v5: stroke 0 (nessun forcing a 5px).
-                try:
-                    _leg_sw = int(SUBTITLE_STROKE_WIDTH)
-                except (TypeError, ValueError):
-                    _leg_sw = 0
-                if _leg_sw < 0:
-                    _leg_sw = 0
                 _render_scaled_word(
                     frame_img, w["word"], item["x"], item["y"],
                     item["width"], item["height"], _word_fonts[wi],
-                    fills[wi], SUBTITLE_STROKE_COLOR, _leg_sw,
+                    fills[wi], SUBTITLE_STROKE_COLOR, SUBTITLE_STROKE_WIDTH,
                     opacity=opacity, scale=scale,
                 )
 
@@ -2194,7 +1844,7 @@ def generate_cta_card_frames(
             area = None
         font_scale = 1.0
     elif use_preset:
-        area = _preset_text_area(first_info, first_info.get("layout"))
+        area = preset_safe_area(first_info.get("layout"), VIDEO_WIDTH, VIDEO_HEIGHT)
         try:
             font_scale = float(preset_font_scale(first_info.get("layout")))
         except Exception:
@@ -2204,44 +1854,29 @@ def generate_cta_card_frames(
     needs_pill = True  # la card è un badge intenzionale, sempre ancorato
     card_scale = 0.92  # la card contiene più parole: leggermente più compatta
 
-    # --- Font/fill di sezione REELS-FIX v5 (stroke 0, box stretto, min 38) ---
-    try:
-        _cta_box_w = int(area[2]) - int(area[0]) if area else 900
-    except Exception:
-        _cta_box_w = 900
+    # --- Font/fill di sezione (una volta sola: niente cambi a metà card) ---
     if use_typography and typo_preset is not None:
         typo_fonts = _load_typography_fonts(typo_preset, font_scale * card_scale)
         typo_fills = _styled_fills(
             typo_preset, base_override=text_color,
             background_color=background_color, keyword_colors=keyword_colors)
-        max_text_width = int(_cta_box_w)
+        max_text_width = int(VIDEO_WIDTH * 0.85)
         layout = compute_styled_layout(section, typo_fonts, max_text_width, area=area)
         if len(layout) != len(section):
             raise TextAnimationError("Layout/words fuori sync nella CTA card.")
         fills = [typo_fills.get(layout[i].get("style", "base"), typo_fills["base"])
                  for i in range(len(layout))]
         stroke_color, stroke_width = (0, 0, 0, 0), 0
-        shadow_off, shadow_fill = (0, 3), (0, 0, 0, 110)
+        shadow_off, shadow_fill = None, None
     else:
         use_typography = False
         try:
-            from config import SUBTITLE_MIN_FONT_SIZE as _CMFS
-            _cmfs = max(20, int(_CMFS))
-        except Exception:
-            _cmfs = 38
-        try:
-            text_font_size = max(_cmfs, int(round(int(SUBTITLE_FONT_SIZE) * float(font_scale) * card_scale)))
+            text_font_size = max(24, int(round(SUBTITLE_FONT_SIZE * float(font_scale) * card_scale)))
         except (TypeError, ValueError):
-            text_font_size = max(_cmfs, int(SUBTITLE_FONT_SIZE))
-        try:
-            from core.renderer import compute_auto_fit_layout as _cta_fit
-            layout, font, text_font_size = _cta_fit(
-                [s["word"] for s in section], text_font_size, area, min_font_size=_cmfs)
-            max_text_width = int(_cta_box_w)
-        except Exception:
-            font = load_font(text_font_size)
-            max_text_width = int(_cta_box_w)
-            layout = compute_word_layout([s["word"] for s in section], font, max_text_width, area=area)
+            text_font_size = SUBTITLE_FONT_SIZE
+        font = load_font(text_font_size)
+        max_text_width = int(VIDEO_WIDTH * 0.85)
+        layout = compute_word_layout([s["word"] for s in section], font, max_text_width, area=area)
         if len(layout) != len(section):
             raise TextAnimationError("Layout/words fuori sync nella CTA card.")
         base_rgba = _to_rgba(text_color, SUBTITLE_COLOR)
@@ -2256,27 +1891,17 @@ def generate_cta_card_frames(
         last_exit = 0.15
     try:
         scale_from = float(KEYWORD_ENTRY_SCALE_FROM)
-        if not (0.5 <= scale_from <= 1.0):
-            scale_from = 0.85
+        if not (0.1 <= scale_from <= 1.0):
+            scale_from = 0.7
     except (TypeError, ValueError):
-        scale_from = 0.85
+        scale_from = 0.7
 
     # --- Personaggio bloccato (layer unico per tutta la card) ---
-    # CTA card = finale stabile: sempre slide corta/morbida, mai full-travel.
-    # La fascia testo guida il placement anti-overlap come nel path normale.
-    try:
-        _cta_text_rect = None
-        if area is not None and len(area) == 4:
-            _cta_text_rect = (float(area[0]), float(area[1]),
-                              float(area[2] - area[0]), float(area[3] - area[1]))
-    except Exception:
-        _cta_text_rect = None
-    char_img, char_base_xy = _load_chunk_character_layer(first_info,
-                                                         text_rect=_cta_text_rect)
+    char_img, char_base_xy = _load_chunk_character_layer(first_info)
     if char_img is not None and char_base_xy is not None and first_info is not None:
         char_transition = first_info.get("transition_in", "fade") or "fade"
         char_side = _character_side(first_info)
-        char_full_travel = False
+        char_full_travel = bool(use_preset)
         char_entry_dur = max(0.01, _CHARACTER_ZONE_ENTRY_DURATION if use_preset else _CHARACTER_ENTRY_DURATION)
     else:
         char_base_xy = None
@@ -2357,28 +1982,15 @@ def generate_cta_card_frames(
                     cop, xdx, xdy = entry_opacity, 0, 0
                 elif exit_mode == _CHAR_EXIT_SLIDE_DOWN and char_exit_dur > 0 \
                         and t >= ce - char_exit_dur:
-                    # Fade out anche qui: scende dissolvendo (mai sparizione).
                     xp = clamp01((t - (ce - char_exit_dur)) / char_exit_dur)
                     xdx, xdy, xop = _character_exit_offset_opacity(
-                        _CHAR_EXIT_SLIDE_DOWN, xp, char_base_xy[1], fade=True)
+                        _CHAR_EXIT_SLIDE_DOWN, xp, char_base_xy[1], fade=False)
                     cop = min(entry_opacity, xop)
                 else:
                     cop, xdx, xdy = int(round(entry_opacity * exit_factor)), 0, 0
-                # Idle respiratorio anche su CTA card (finale vivo, mai sticker).
-                if _IDLE_ENABLED and cop > 0:
-                    try:
-                        _cdx = int(round(_IDLE_SWAY_AMP_X * math.sin(
-                            2.0 * math.pi * _IDLE_SWAY_FREQ * float(t) + 1.1)))
-                        _cdy = int(round(_IDLE_BOB_AMP_Y * math.sin(
-                            2.0 * math.pi * _IDLE_BOB_FREQ * float(t))))
-                    except Exception:
-                        _cdx, _cdy = 0, 0
-                else:
-                    _cdx, _cdy = 0, 0
                 _paste_character_frame(
                     frame_img, char_img,
-                    char_base_xy[0] + edx + xdx + _cdx,
-                    char_base_xy[1] + edy + xdy + _cdy, cop)
+                    char_base_xy[0] + edx + xdx, char_base_xy[1] + edy + xdy, cop)
             if _cta_pill is not None:
                 try:
                     frame_img.alpha_composite(_cta_pill)
@@ -2396,12 +2008,9 @@ def generate_cta_card_frames(
                     elif local <= 0.0:
                         continue
                     else:
-                        try:
-                            eased = min(float(_cta_ease_back(local)), 1.0)
-                        except Exception:
-                            eased = min(1.0, max(0.0, float(local)))
+                        eased = _cta_ease_back(local)
                         opacity = int(round(255 * min(1.0, max(0.0, eased))))
-                        scale = min(1.0, max(0.05, scale_from + (1.0 - scale_from) * eased))
+                        scale = max(0.05, scale_from + (1.0 - scale_from) * eased)
                 else:
                     if local >= 1.0:
                         opacity, scale = 255, 1.0
@@ -2423,16 +2032,10 @@ def generate_cta_card_frames(
                         fills[wi], stroke_color, stroke_width,
                         shadow_off, shadow_fill, opacity=opacity, scale=scale)
                 else:
-                    try:
-                        _cta_sw = int(SUBTITLE_STROKE_WIDTH)
-                    except (TypeError, ValueError):
-                        _cta_sw = 0
-                    if _cta_sw < 0:
-                        _cta_sw = 0
                     _render_scaled_word(
                         frame_img, w["word"], item["x"], item["y"],
                         item["width"], item["height"], _cta_fonts[wi],
-                        fills[wi], SUBTITLE_STROKE_COLOR, _cta_sw,
+                        fills[wi], SUBTITLE_STROKE_COLOR, SUBTITLE_STROKE_WIDTH,
                         opacity=opacity, scale=scale)
             fname = f"chunk_{start_index + k:04d}_frame_{fi:05d}.png"
             fpath = os.path.join(output_dir, fname)
@@ -2440,433 +2043,6 @@ def generate_cta_card_frames(
             frames.append({"image_path": fpath, "start": t, "end": frame_end})
         per_chunk_frames.append(frames)
     return per_chunk_frames
-
-
-# ---------------------------------------------------------------------------
-# Continuity Engine v3 — Full-Timeline Renderer (spec §1+§2+§3+§5)
-# ---------------------------------------------------------------------------
-# Renderizza l'INTERA timeline come traccia continua: il character persiste
-# senza reset ai confini chunk (alpha invariato), lo slide X usa out_cubic
-# 0.3s, slide_up solo a inizio/dopo gap, jump-cut intermedi. Il testo resta
-# per-chunk (normale che cambi), ma il character non blinka mai.
-
-_TIMELINE_SLIDE_X_DUR: float = 0.30
-
-
-def _timeline_slide_x(x_from: int, x_to: int, progress: float) -> int:
-    """Slide X con out_cubic 0.3s (spec §3), mai tocca l'opacita'."""
-    try:
-        from core.layout_presets import interpolate_x_out_cubic as _ix
-        return int(_ix(int(x_from), int(x_to), float(progress)))
-    except Exception:
-        try:
-            p = max(0.0, min(1.0, float(progress)))
-            eased = 1.0 - pow(1.0 - p, 3)
-            return int(round(float(x_from) + (float(x_to) - float(x_from)) * eased))
-        except Exception:
-            return int(x_to)
-
-
-def _active_chunk_at(chunks: list[dict], t: float) -> dict | None:
-    """Chunk testuale attivo a t (start<=t<end), o None nei gap."""
-    try:
-        for ch in chunks:
-            try:
-                s = float((ch or {}).get("start", 0.0))
-                e = float((ch or {}).get("end", s))
-            except (TypeError, ValueError):
-                continue
-            if s <= t < e:
-                return ch
-        return None
-    except Exception:
-        return None
-
-
-def render_full_timeline_frames(
-    chunks: list[dict],
-    background_color: str,
-    text_color,
-    keyword_colors: dict | None = None,
-    output_dir: str = TEMP_DIR,
-    fps: int = VIDEO_FPS,
-    total_duration: float | None = None,
-    on_progress=None,
-    typography_niche: str | None = None,
-    typography_preset: dict | None = None,
-) -> list[dict]:
-    """Renderizza la timeline COMPLETA come sequenza continua (spec §1+§5).
-
-    - Unico asse temporale 0..total_duration (default: max chunk end).
-    - Character da `Timeline Manager` (character_selector.get_timeline_for_chunks):
-      persistente per segmento, slide_up solo a inizio/dopo gap, slide_x 0.3s
-      out_cubic sui cambi lato, jump-cut istantaneo per cambi posa, idle
-      bob/sway a fase assoluta (nessun reset tra chunk).
-    - Testo: parole del chunk attivo con entry pop/fade + exit fade di gruppo
-      (il testo puo' cambiare per chunk; il character MAI).
-    - Frame PNG trasparenti (sfondo via ffmpeg), salvati in parallelo
-      ThreadPool con risorse preloadate UNA volta (font+character in RAM).
-    - Fail-safe: ritorna [] (mai solleva TextAnimationError) cosi' il chiamante
-      usa il fallback legacy per-chunk.
-
-    Returns:
-        Lista frame {"image_path","start","end"} ordinata per t.
-    """
-    try:
-        if fps is None or fps <= 0:
-            fps = VIDEO_FPS
-        if not chunks:
-            return []
-        try:
-            ends = [float((c or {}).get("end", 0.0)) for c in chunks]
-            t_end = float(total_duration) if total_duration else max(ends)
-        except (TypeError, ValueError):
-            return []
-        if t_end <= 0:
-            return []
-        os.makedirs(output_dir, exist_ok=True)
-
-        # --- Preload RAM una sola volta (spec §5) ---
-        try:
-            _get_shared_font_manager()
-        except Exception:
-            pass
-        try:
-            from core.character_selector import (
-                preload_character_assets as _preload_chars,
-                get_timeline_for_chunks as _get_timeline,
-            )
-            try:
-                _preload_chars()
-            except Exception:
-                pass
-            segments = _get_timeline(chunks)
-        except Exception:
-            segments = []
-        try:
-            preload_character_layers()
-        except Exception:
-            pass
-
-        # --- Layer character per segmento (una sola volta, riusati) ---
-        # Nota FASE 7: i segmenti attraversano piu' chunk con fasce testo
-        # diverse, quindi niente text_rect qui (placement stabile clampato +
-        # safe area dinamiche strutturali: l'overlap e' impossibile).
-        seg_layers: list[dict] = []
-        try:
-            for s_idx, seg in enumerate(segments):
-                if seg.get("gap") or seg.get("pose") is None:
-                    seg_layers.append({"img": None, "xy": None})
-                    continue
-                try:
-                    img, xy = _load_chunk_character_layer({
-                        "pose": seg.get("pose"), "layout": seg.get("layout"),
-                        "layout_preset": seg.get("layout"),
-                        "punch_in": seg.get("punch_in", False),
-                        "use_preset": seg.get("use_preset", True),
-                        "transition_in": "slide_up",
-                    })
-                except Exception:
-                    img, xy = None, None
-                seg_layers.append({"img": img, "xy": xy})
-        except Exception:
-            seg_layers = [{"img": None, "xy": None} for _ in segments]
-
-        def _seg_at(t: float):
-            try:
-                for k, s in enumerate(segments):
-                    if float(s["start"]) <= t < float(s["end"]):
-                        return k, s
-                return None, None
-            except Exception:
-                return None, None
-
-        def _prev_real_seg(k: int):
-            try:
-                j = k - 1
-                while j >= 0:
-                    if not segments[j].get("gap") and seg_layers[j].get("img") is not None:
-                        return j, segments[j]
-                    j -= 1
-                return None, None
-            except Exception:
-                return None, None
-
-        # --- Layout testo per chunk (una sola volta, come generate_animated...) ---
-        chunk_text: list[dict] = []
-        try:
-            for ch in chunks:
-                try:
-                    info = _character_info_from_chunk(ch)
-                    use_p = bool(info is not None and info.get("use_preset"))
-                    exp = None
-                    area = None
-                    needs_pill = False
-                    fscale = 1.0
-                    if use_p:
-                        area = _preset_text_area(info, info.get("layout"))
-                        needs_pill = preset_needs_text_background(info.get("layout"))
-                        fscale = preset_font_scale(info.get("layout"))
-                    is_typo = _is_typography_chunk(ch)
-                    if is_typo:
-                        pr = _resolve_typography_preset(ch, typography_niche, typography_preset)
-                        fonts = _load_typography_fonts(pr, fscale)
-                        fills = _styled_fills(pr, base_override=text_color,
-                                              background_color=background_color,
-                                              keyword_colors=keyword_colors)
-                        raw = ch.get("styled_words") or []
-                        sw = []
-                        words_timing = enrich_chunk_words(ch, keyword_colors)
-                        for ii, s in enumerate(raw):
-                            if not isinstance(s, dict):
-                                continue
-                            st = s.get("style", "base")
-                            if st not in ("base", "impact", "accent"):
-                                st = "base"
-                            wt = str(s.get("word", ""))
-                            if not wt.strip():
-                                continue
-                            try:
-                                sst = float(s.get("start", words_timing[ii]["start"] if ii < len(words_timing) else ch.get("start", 0.0)))
-                                sen = float(s.get("end", words_timing[ii]["end"] if ii < len(words_timing) else ch.get("end", 0.0)))
-                            except Exception:
-                                sst = float(ch.get("start", 0.0))
-                                sen = float(ch.get("end", sst))
-                            disp = str(s.get("display", wt))
-                            sw.append({"word": wt, "display": disp, "style": st,
-                                       "start": sst, "end": sen,
-                                       "is_keyword": st == "impact"})
-                        if not sw:
-                            is_typo = False
-                        else:
-                            try:
-                                _tl_bw = int(area[2]) - int(area[0]) if area else 900
-                            except Exception:
-                                _tl_bw = 900
-                            lay = compute_styled_layout(sw, fonts, max(40, _tl_bw), area=area)
-                            wfonts = [fonts.get(lay[k].get("style", "base"), fonts.get("base")) for k in range(len(lay))]
-                            chunk_text.append({"mode": "typo", "words": sw, "layout": lay,
-                                               "fonts": wfonts, "fills": [fills.get(lay[k].get("style", "base"), fills["base"]) for k in range(len(lay))],
-                                               "needs_pill": needs_pill, "preset": pr})
-                            continue
-                    # Legacy path REELS-FIX v5 (min 38px, box stretto)
-                    try:
-                        from config import SUBTITLE_MIN_FONT_SIZE as _TLMFS
-                        _tlmfs = max(20, int(_TLMFS))
-                    except Exception:
-                        _tlmfs = 38
-                    fsize = max(_tlmfs, int(round(int(SUBTITLE_FONT_SIZE) * float(fscale))))
-                    try:
-                        from core.renderer import compute_auto_fit_layout as _tl_fit
-                        _tl_words_tmp = [w["word"] for w in enrich_chunk_words(ch, keyword_colors)]
-                        lay_tmp, font, fsize = _tl_fit(_tl_words_tmp, fsize, area, min_font_size=_tlmfs)
-                        words = enrich_chunk_words(ch, keyword_colors)
-                        lay = lay_tmp
-                    except Exception:
-                        font = load_font(fsize)
-                        words = enrich_chunk_words(ch, keyword_colors)
-                        try:
-                            _tl_bw2 = int(area[2]) - int(area[0]) if area else int(VIDEO_WIDTH * 0.85)
-                        except Exception:
-                            _tl_bw2 = int(VIDEO_WIDTH * 0.85)
-                        lay = compute_word_layout([w["word"] for w in words], font,
-                                                  max(40, _tl_bw2), area=area)
-                    base_rgba = _to_rgba(text_color, SUBTITLE_COLOR)
-                    fills = [_resolve_word_fill(normalize_word(w["word"]), base_rgba, keyword_colors) for w in words]
-                    chunk_text.append({"mode": "legacy", "words": words, "layout": lay,
-                                       "fonts": [font] * len(words), "fills": fills,
-                                       "needs_pill": needs_pill, "preset": None})
-                except Exception:
-                    chunk_text.append({"mode": "legacy", "words": [], "layout": [],
-                                       "fonts": [], "fills": [], "needs_pill": False, "preset": None})
-        except Exception:
-            chunk_text = []
-
-        try:
-            entry_dur_cfg = max(0.01, float(TEXT_ANIMATION_ENTRY_DURATION))
-        except Exception:
-            entry_dur_cfg = 0.18
-        try:
-            exit_dur_cfg = max(0.0, float(TEXT_ANIMATION_EXIT_DURATION))
-        except Exception:
-            exit_dur_cfg = 0.15
-        try:
-            char_entry_dur = max(0.15, float(_CHARACTER_ZONE_ENTRY_DURATION))
-        except Exception:
-            char_entry_dur = 0.55
-
-        num_frames = max(1, int(math.ceil(float(t_end) * float(fps))))
-        step = 1.0 / float(fps)
-
-        import concurrent.futures as _fut
-
-        def _render_frame(fi: int) -> dict | None:
-            try:
-                t = fi * step
-                if t >= t_end:
-                    t = t_end - 1e-6
-                fend = min(t + step, t_end)
-                img = Image.new("RGBA", (VIDEO_WIDTH, VIDEO_HEIGHT), (0, 0, 0, 0))
-                # --- Character persistente (mai reset ai confini chunk) ---
-                k, seg = _seg_at(t)
-                if seg is not None and not seg.get("gap"):
-                    layer = seg_layers[k] if 0 <= k < len(seg_layers) else {"img": None, "xy": None}
-                    cimg = layer.get("img")
-                    cxy = layer.get("xy")
-                    if cimg is not None and cxy is not None:
-                        bx, by = int(cxy[0]), int(cxy[1])
-                        entry = str(seg.get("entry", "jump"))
-                        opacity = 255
-                        dx, dy = 0, 0
-                        if entry == "slide_up" and (t - float(seg["start"])) < char_entry_dur:
-                            prog = clamp01((t - float(seg["start"])) / char_entry_dur)
-                            _edx, _edy, opacity = _character_entry_offset_opacity(
-                                "slide_up", _character_side({
-                                    "use_preset": True, "layout": seg.get("layout"),
-                                    "position": "bottom_center"}),
-                                prog, cimg.size[0], bx, by,
-                                full_travel=True, fade=True)
-                            dx, dy = _edx, _edy
-                        elif entry == "slide_x" and (t - float(seg["start"])) < _TIMELINE_SLIDE_X_DUR:
-                            pk, prev = _prev_real_seg(k)
-                            if prev is not None and seg_layers[pk].get("xy") is not None:
-                                try:
-                                    x0 = int(seg_layers[pk]["xy"][0])
-                                except Exception:
-                                    x0 = bx
-                                prog = clamp01((t - float(seg["start"])) / _TIMELINE_SLIDE_X_DUR)
-                                bx = _timeline_slide_x(x0, bx, prog)
-                            opacity = 255  # mai fade sullo slide X (spec §3)
-                        # Idle respiratorio a fase assoluta (continuo tra segmenti)
-                        idx_, idy_ = 0, 0
-                        if _IDLE_ENABLED:
-                            try:
-                                idy_ = int(round(_IDLE_BOB_AMP_Y * math.sin(2.0 * math.pi * _IDLE_BOB_FREQ * float(t))))
-                                idx_ = int(round(_IDLE_SWAY_AMP_X * math.sin(2.0 * math.pi * _IDLE_SWAY_FREQ * float(t) + 1.1)))
-                            except Exception:
-                                idx_, idy_ = 0, 0
-                        _paste_character_frame(img, cimg, bx + dx + idx_, by + dy + idy_, opacity)
-                # --- Testo del chunk attivo ---
-                ch = _active_chunk_at(chunks, t)
-                if ch is not None:
-                    try:
-                        ci = chunks.index(ch)
-                    except ValueError:
-                        ci = -1
-                    if 0 <= ci < len(chunk_text):
-                        ct = chunk_text[ci]
-                        words = ct.get("words", [])
-                        layout = ct.get("layout", [])
-                        if words and layout and len(words) == len(layout):
-                            if ct.get("needs_pill"):
-                                try:
-                                    draw_text_background(img, layout)
-                                except Exception:
-                                    pass
-                            try:
-                                cs = float(ch.get("start", t))
-                                ce = float(ch.get("end", t_end))
-                            except Exception:
-                                cs, ce = t, t_end
-                            if exit_dur_cfg > 0 and t >= ce - exit_dur_cfg:
-                                ef = 1.0 - ease_in_cubic(clamp01((t - (ce - exit_dur_cfg)) / exit_dur_cfg))
-                            else:
-                                ef = 1.0
-                            for wi, w in enumerate(words):
-                                try:
-                                    ws = float(w.get("start", cs))
-                                except Exception:
-                                    continue
-                                if t < ws:
-                                    continue
-                                local = clamp01((t - ws) / entry_dur_cfg)
-                                is_kw = bool(w.get("is_keyword", w.get("style") == "impact"))
-                                if is_kw:
-                                    try:
-                                        eased = min(float(ease_out_back(local)), 1.0)
-                                    except Exception:
-                                        eased = min(1.0, max(0.0, float(local)))
-                                    if eased <= 0.0:
-                                        continue
-                                    op = int(round(255 * min(1.0, max(0.0, eased)))) if eased < 1.0 else 255
-                                    sc = 0.85 + 0.15 * eased
-                                    if sc > 1.0:
-                                        sc = 1.0
-                                else:
-                                    if local >= 1.0:
-                                        op, sc = 255, 1.0
-                                    elif local <= 0.0:
-                                        continue
-                                    else:
-                                        op = int(round(255 * ease_out_cubic(local)))
-                                        sc = 1.0
-                                if ef < 1.0:
-                                    op = int(round(op * ef))
-                                if op <= 0:
-                                    continue
-                                item = layout[wi]
-                                if ct.get("mode") == "typo":
-                                    _render_styled_scaled_word(
-                                        img, w.get("display", w.get("word", "")),
-                                        item["x"], item["y"], item["width"], item["height"],
-                                        ct["fonts"][wi], ct["fills"][wi],
-                                        (0, 0, 0, 0), 0, (0, 3), (0, 0, 0, 110),
-                                        opacity=op, scale=min(1.0, max(0.05, sc)))
-                                else:
-                                    # REELS-FIX v5: stroke 0.
-                                    try:
-                                        _sw = int(SUBTITLE_STROKE_WIDTH)
-                                    except (TypeError, ValueError):
-                                        _sw = 0
-                                    if _sw < 0:
-                                        _sw = 0
-                                    _render_scaled_word(
-                                        img, w.get("word", ""), item["x"], item["y"],
-                                        item["width"], item["height"], ct["fonts"][wi],
-                                        ct["fills"][wi], SUBTITLE_STROKE_COLOR,
-                                        _sw, opacity=op, scale=sc)
-                fname = f"timeline_frame_{fi:05d}.png"
-                fpath = os.path.join(output_dir, fname)
-                try:
-                    img.save(fpath, compress_level=1)
-                except Exception:
-                    return None
-                return {"image_path": fpath, "start": t, "end": fend}
-            except Exception:
-                return None
-
-        try:
-            import os as _os
-            cpu = max(2, (_os.cpu_count() or 4))
-        except Exception:
-            cpu = 4
-        workers = max(2, min(8, cpu))
-        results: list[dict] = [None] * num_frames  # type: ignore
-        try:
-            with _fut.ThreadPoolExecutor(max_workers=workers) as ex:
-                fut_map = {ex.submit(_render_frame, fi): fi for fi in range(num_frames)}
-                done = 0
-                for fu in _fut.as_completed(fut_map):
-                    fi = fut_map[fu]
-                    try:
-                        r = fu.result()
-                    except Exception:
-                        r = None
-                    if r is not None:
-                        results[fi] = r
-                    done += 1
-                    if on_progress is not None and (done % 30 == 0 or done == num_frames):
-                        try:
-                            on_progress(done, num_frames)
-                        except Exception:
-                            pass
-        except Exception:
-            return []
-        frames = [r for r in results if r is not None]
-        frames.sort(key=lambda f: f["start"])
-        return frames
-    except Exception:
-        return []
 
 
 def render_all_chunks_animated(
@@ -2901,12 +2077,12 @@ def render_all_chunks_animated(
         typography_preset: preset dict esplicito (da core/typography_presets.get_preset).
 
     Il lookahead sul chunk successivo decide l'uscita del personaggio
-    (vedi `decide_char_exit_mode`): fade out (slide_down dissolvente o fade
-    di gruppo) quando cambia/scompare, hold a piena luminosita' solo su
-    continuazioni identiche. Il lookbehind decide l'entrata: fade in + slide
-    su prima apparizione e ogni cambio visibile; jump-cut istantaneo solo
-    per punch-in e continuazioni identiche (taglio invisibile).
-    Risultato: entrate/uscite in dissolvenza come in passato, mai di botto.
+    (vedi `decide_char_exit_mode`): sparizione solo se il personaggio deve
+    chiaramente scomparire, altrimenti hold/slide_down a piena visibilita'.
+    Il lookbehind sul chunk precedente decide l'entrata: dissolvenza solo
+    alla prima apparizione, slide a piena opacita' nei cambi, jump-cut
+    istantaneo per punch-in e continuazioni identiche (taglio invisibile).
+    Risultato: il personaggio resta stabile finche' non deve scomparire.
 
     Returns:
         Lista di chunk arricchiti: {**chunk, "frames": [...], "frame_paths": [...],
@@ -2916,54 +2092,18 @@ def render_all_chunks_animated(
     _parallel_ok = _os.environ.get("RENDER_PARALLEL", "1").strip().lower() not in ("0", "false", "no", "off", "")
     enriched_all: list[dict] = []
     total = len(chunks)
-    # Risoluzione character UNA volta per chunk (stile "upgrade 2": mai lavoro
-    # ripetuto): `resolve_chunk_layout` e' pura, quindi memoizzare e' identico
-    # a richiamarla ma evita ~2x resolve per chunk nel lookahead/lookbehind.
-    # Le funzioni decide_* accettano info gia' risolte (fast-path dedicato).
-    infos: list[dict | None] = []
-    for _ch in (chunks or []):
-        try:
-            infos.append(_character_info_from_chunk(_ch))
-        except Exception:
-            infos.append(None)
-    # Warmup silenzioso dei layer effettivamente usati (mai I/O disco dentro
-    # il ThreadPool): solo combo (posa, layout, punch) distinte dei chunk.
-    # Fail-safe: errori ignorati (il per-chunk fara' fallback senza character).
-    try:
-        if CHARACTER_ENABLED and any(_inf is not None for _inf in infos):
-            from core.renderer import get_character_layer as _warm_layer
-            _seen: set[tuple] = set()
-            for _inf in infos:
-                try:
-                    if not isinstance(_inf, dict) or _inf.get("pose") is None:
-                        continue
-                    _key = (int(_inf.get("pose")), str(_inf.get("layout")),
-                            bool(_inf.get("punch_in", False)))
-                    if _key in _seen:
-                        continue
-                    _seen.add(_key)
-                    _warm_layer(int(_inf["pose"]), _inf.get("layout"),
-                                bool(_inf.get("punch_in", False)),
-                                VIDEO_WIDTH, VIDEO_HEIGHT)
-                except Exception:
-                    continue
-    except Exception:
-        pass
     # Stati personaggio per chunk (lookahead/lookbehind), calcolati una volta:
     # servono sia al path normale sia alla CTA card (stessa stabilita').
     states: list[dict] = []
     for i, chunk in enumerate(chunks):
         nxt = chunks[i + 1] if i + 1 < total else None
         prev = chunks[i - 1] if i - 1 >= 0 else None
-        cur_info = infos[i] if i < len(infos) else None
-        prev_info = infos[i - 1] if i - 1 >= 0 and (i - 1) < len(infos) else None
-        # decide_* con i chunk GREZZI (come prima): leggono anche
-        # `narrative_role` per i confini hook/corpo/CTA (le info risolte non
-        # hanno quella chiave: passar loro le info cambierebbe la regia).
+        exit_mode = decide_char_exit_mode(chunk, nxt)
         try:
-            exit_mode = decide_char_exit_mode(chunk, nxt)
+            cur_info = _character_info_from_chunk(chunk)
+            prev_info = _character_info_from_chunk(prev) if prev is not None else None
         except Exception:
-            exit_mode = _CHAR_EXIT_WITH_TEXT
+            cur_info, prev_info = None, None
         try:
             # Stesso identico personaggio del chunk prima: taglio invisibile
             # (niente replay dell'entrata: resterebbe un blink a ogni stacco).
@@ -2972,11 +2112,9 @@ def render_all_chunks_animated(
                 and _character_identity(cur_info) == _character_identity(prev_info)
             )
             entry_jump = bool(same_as_prev or decide_char_entry_jump(prev, chunk))
-            # Fade IN in entrata (come in passato): prima apparizione E ogni
-            # cambio visibile (posa/layout diversi) dissolvono entrando.
-            # Solo le continuazioni identiche (jump, taglio invisibile) e i
-            # punch (stacco TV istantaneo) restano senza dissolvenza.
-            entry_fade = not same_as_prev
+            # Dissolvenza in entrata SOLO alla prima apparizione: se il
+            # personaggio era gia' visibile, entra a piena opacita'.
+            entry_fade = prev_info is None
         except Exception:
             entry_jump, entry_fade = False, True
         states.append({
@@ -3045,8 +2183,7 @@ def render_all_chunks_animated(
                 _cpu = max(2, (_os.cpu_count() or 4))
             except Exception:
                 _cpu = 4
-            # v2: sfrutta tutti i core (cap 8 per memoria sicura: ~8MB/frame).
-            _workers = max(2, min(8, _cpu, len(normal_idx)))
+            _workers = max(2, min(4, _cpu - 1, len(normal_idx)))
 
             def _render_one(k: int):
                 st = states[k]
