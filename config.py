@@ -280,7 +280,7 @@ CHARACTER_MIN_BLOCK_DURATION = _get_float("CHARACTER_MIN_BLOCK_DURATION", 2.5)  
 CHARACTER_DISCONTINUOUS_MODE = _get_int("CHARACTER_DISCONTINUOUS_MODE", 1)  # 1 = ON (scompare nei beat), 0 = sempre visibile
 CHARACTER_HOOK_VISIBLE = _get_int("CHARACTER_HOOK_VISIBLE", 1)  # 1 = sempre visibile in Hook
 CHARACTER_CTA_VISIBLE = _get_int("CHARACTER_CTA_VISIBLE", 1)  # 1 = sempre visibile in CTA
-CHARACTER_BODY_VISIBLE_RATIO = _get_float("CHARACTER_BODY_VISIBLE_RATIO", 0.3)  # frazione beat Body visibili (~30%)
+CHARACTER_BODY_VISIBLE_RATIO = _get_float("CHARACTER_BODY_VISIBLE_RATIO", 0.6)  # frazione blocchi Body visibili (~60%: pause nascoste brevi e distribuite, mai lunghi tratti senza personaggio)
 
 def _get_pose_side_map(key: str, default: str) -> dict[int, str]:
     """Mappa posa -> vincolo lato (any|center|left|right|split).

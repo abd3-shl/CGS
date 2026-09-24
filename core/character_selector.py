@@ -65,7 +65,7 @@ except Exception:
     CHARACTER_DISCONTINUOUS_MODE = 1
     CHARACTER_HOOK_VISIBLE = 1
     CHARACTER_CTA_VISIBLE = 1
-    CHARACTER_BODY_VISIBLE_RATIO = 0.3
+    CHARACTER_BODY_VISIBLE_RATIO = 0.6
     CHARACTER_POSE_SIDE_MAP = {1: "any", 2: "center", 3: "center", 4: "left", 5: "split"}
 
     def get_pose_side_constraint(pose: int) -> str:  # type: ignore
@@ -1144,7 +1144,9 @@ def _apply_macro_block_stabilization(
 
     - Raggruppa per ruolo hook/body/cta + durata >= MIN_DURATION.
     - Visibilita': Hook/CTA secondo config, Body solo BODY_VISIBLE_RATIO
-      (primi blocchi body); con DISCONTINUOUS_MODE=0 tutto visibile.
+      (~60% di default); i blocchi nascosti sono distribuiti uniformemente
+      (respiri brevi da un blocco solo, mai lunghi tratti senza personaggio);
+      con DISCONTINUOUS_MODE=0 tutto visibile.
     - Ogni blocco visibile usa UNICA posa + UNICO lato (stabile per tutta
       l'apparizione, testo ancorato opposto). Tra blocchi visibili adiacenti
       si evita la ripetizione: posa diversa e, quando possibile, lato diverso
@@ -1179,22 +1181,37 @@ def _apply_macro_block_stabilization(
             body_ratio = float(CHARACTER_BODY_VISIBLE_RATIO)
             body_ratio = min(1.0, max(0.0, body_ratio))
         except Exception:
-            body_ratio = 0.3
+            body_ratio = 0.6
         roles = [_macro_role(chunks[i] if i < n_chunks else None, i, n) for i in range(n)]
         blocks = _build_macro_time_blocks(chunks[:n], roles)
-        # Visibilita' per blocco.
+        # Visibilita' per blocco: i blocchi nascosti ("respiri" solo testo)
+        # sono distribuiti uniformemente nel body (mai in fila e mai ai bordi
+        # quando possibile: il body si apre e si chiude col personaggio).
+        # Cosi' le pause senza character durano un blocco solo (~2.5-4s).
         body_blocks = [b for b in blocks if b and roles[b[0]] == "body"]
         try:
             num_keep = int(round(len(body_blocks) * body_ratio)) if body_blocks else 0
         except Exception:
             num_keep = 0
         num_keep = max(0, min(len(body_blocks), num_keep))
-        keep_body_ids = set()
-        for k in range(num_keep):
+        hidden_quota = len(body_blocks) - num_keep
+        hide_body_ids: set[int] = set()
+        if hidden_quota > 0 and body_blocks:
             try:
-                keep_body_ids.add(id(body_blocks[k]))
+                n_b = len(body_blocks)
+                for j in range(hidden_quota):
+                    pos = int((j + 0.5) * n_b / hidden_quota)
+                    pos = max(0, min(n_b - 1, pos))
+                    guard = 0
+                    while id(body_blocks[pos]) in hide_body_ids and guard < n_b:
+                        pos = (pos + 1) % n_b
+                        guard += 1
+                    hide_body_ids.add(id(body_blocks[pos]))
             except Exception:
-                continue
+                pass
+        keep_body_ids = set(
+            id(b) for b in body_blocks if id(b) not in hide_body_ids
+        )
         plan_by_idx: dict[int, dict] = {}
         for i in range(n):
             try:
