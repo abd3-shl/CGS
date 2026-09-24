@@ -64,6 +64,40 @@ def ease_out_back(t: float) -> float:
     return 1.0 + c3 * pow(t - 1.0, 3) + c1 * pow(t - 1.0, 2)
 
 
+def ease_in_out_cubic(t: float) -> float:
+    """Accelera poi decelera, per spostamenti fluidi del personaggio.
+
+    Uso visivo: morph di posizione (vecchia -> nuova) e slide di continuita':
+    partenza e arrivo morbidi, niente scatti ai bordi. Ritmo coerente.
+    """
+    t = clamp01(t)
+    if t < 0.5:
+        return 4.0 * t * t * t
+    return 1.0 - pow(-2.0 * t + 2.0, 3) / 2.0
+
+
+def ease_out_quad(t: float) -> float:
+    """Decelerazione morbida piu' leggera del cubic, per fade delicati.
+
+    Uso visivo: fade-in/fade-out del personaggio (opacita' 0->1, 1->0):
+    ingresso/uscita fluidi senza scatti, ritmo normale non frenetico.
+    """
+    t = clamp01(t)
+    return 1.0 - (1.0 - t) * (1.0 - t)
+
+
+def ease_in_out_quad(t: float) -> float:
+    """Fade+slide bilanciato, per transizioni di continuita'.
+
+    Uso visivo: alternativa a in_out_cubic quando lo spostamento e' breve
+    (stesso lato): movimento dolce senza overshoot.
+    """
+    t = clamp01(t)
+    if t < 0.5:
+        return 2.0 * t * t
+    return 1.0 - pow(-2.0 * t + 2.0, 2) / 2.0
+
+
 def ease_out_bounce(t: float) -> float:
     """Rimbalzo, alternativa piu' marcata per l'entrata keyword.
 

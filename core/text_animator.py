@@ -6,12 +6,20 @@ Ogni parola del chunk entra in scena esattamente al suo timestamp `start`
 e resta visibile accumulandosi accanto alle precedenti; tutte le parole
 scompaiono insieme a `chunk.end` (uscita di gruppo).
 
-- Parole normali/base: entrata minimal (solo fade con `ease_out_cubic`).
-- Keyword/impact: entrata marcata (opacita' + scala 0.7 -> 1.0 con `ease_out_back`,
-  effetto "pop" premium; `ease_out_bounce` resta disponibile come variante
-  piu' giocosa ma di default si usa `ease_out_back`, meno distraente su
-  caption da 2-3 parole).
-- Uscita: uguale per tutte, fade di gruppo con `ease_in_cubic`.
+Tier moto T0-T3 (path tipografico; legacy solo T0/T2 per stabilita'):
+- T0 base: entrata minimal (solo fade con `ease_out_cubic`, scala 1.0).
+- T1 accent: rise-fade (opacita' + y +lift->0 con `ease_out_cubic`,
+  MAI scala per non deformare handwritten; max 1 per chunk).
+- T2 impact/keyword: pop premium (opacita' + scala pop_from->1.0 con
+  `ease_out_back`; pop_from da preset nicchia 0.6-0.8, hook override vince).
+  Unificazione: style==impact <=> keyword ai fini del MOTO (keywords.py resta
+  fonte del COLORE, text_tagger resta fonte del MOTO).
+- T3 hero: 1 parola/video (verbo CTA o climax hook, mai numeri): pop marcato
+  0.6->1.0 in 0.22s + exit ritardata di 0.06s (~2 frame).
+- T3-num: impact con cifre: pop corto dedicato 0.15s, mai hero.
+- Uscita: fade di gruppo con `ease_in_cubic`; solo hero ha delay dedicato.
+  `ease_out_bounce`/`elastic` restano disponibili ma non usati di default
+  (troppo giocosi per caption da 2-3 parole).
 
 Il layout e' pre-calcolato UNA VOLTA per chunk (via
 `core/renderer.compute_word_layout` per il path legacy, oppure
@@ -27,10 +35,12 @@ NESSUNA ombra di default (look pulito TikTok): leggibilità da contrasto
 tema + pill sul punch-in. Colori sempre coerenti col tema (base dal tema,
 highlight/accent validati per contrasto sullo sfondo).
 
-Personaggio (mezzo busto/mezza figura, mai figura intera): slide rapida da
-fuori campo in 0.2s; cambio lato split -> slide_down 0.2s + rientro dal lato
-opposto; punch_in -> JUMP-CUT netto (stacco di camera, nessuna transizione
-morbida); stesso preset+posa -> hold invisibile.
+Personaggio (mezzo busto/mezza figura, mai figura intera): idle breathing
+leggero (solo bob verticale dolce 4px@0.4Hz, nessuna rotazione laterale);
+prima apparizione slide&pop 0.20s da +300px (back+quad); cambi posa/lato
+morph smart 0.40s dalla vecchia posizione (opaco, niente flash); sparizione
+slide-drop +400px + fade 0.16s; punch_in zoom fluido 0.60s (mai jump secco);
+stessa identita' -> hold invisibile; gap TTS coperti da tail anti-blink.
 
 Struttura narrativa (hook/corpo/CTA, vedi core/narrative_structure.py):
 i chunk portano narrative_role + override anim_entry_mult/anim_pop_from
@@ -51,6 +61,17 @@ from PIL import Image, ImageDraw
 
 from config import (
     CHARACTER_ENABLED,
+    CHARACTER_ENTRY_DURATION,
+    CHARACTER_EXIT_DURATION,
+    CHARACTER_FIRST_ENTRY_DURATION,
+    CHARACTER_GAP_HOLD_ENABLED,
+    CHARACTER_GAP_HOLD_MAX,
+    CHARACTER_IDLE_AMP_Y,
+    CHARACTER_IDLE_ENABLED,
+    CHARACTER_IDLE_FREQ,
+    CHARACTER_IDLE_TILT_DEG,
+    CHARACTER_MORPH_DURATION,
+    CHARACTER_PUNCH_ZOOM_DURATION,
     VIDEO_WIDTH,
     VIDEO_HEIGHT,
     VIDEO_FPS,
@@ -62,8 +83,14 @@ from config import (
     TEXT_ANIMATION_ENTRY_DURATION,
     TEXT_ANIMATION_EXIT_DURATION,
     KEYWORD_ENTRY_SCALE_FROM,
+    TEXT_ANIMATION_ACCENT_LIFT_PX,
+    TEXT_ANIMATION_HERO_SCALE_FROM,
+    TEXT_ANIMATION_HERO_ENTRY_DURATION,
+    TEXT_ANIMATION_HERO_EXIT_DELAY,
+    TEXT_ANIMATION_NUMBER_ENTRY_DURATION,
     TYPOGRAPHY_ENGINE_ENABLED,
     TYPOGRAPHY_BASE_FONT_SIZE,
+    TYPOGRAPHY_BASE_WEIGHT,
     TYPOGRAPHY_IMPACT_SCALE,
     TYPOGRAPHY_ACCENT_SCALE,
     TYPOGRAPHY_STROKE_WIDTH,
@@ -75,6 +102,8 @@ from core.easing import (
     clamp01,
     ease_out_cubic,
     ease_out_back,
+    ease_out_quad,
+    ease_in_out_cubic,
     ease_in_cubic,
 )
 from core.keywords import normalize_word
@@ -103,9 +132,62 @@ from core.layout_presets import (
 _CHARACTER_ENTRY_DURATION = 0.35
 _CHARACTER_SLIDE_UP_PX = 320
 _CHARACTER_SLIDE_SIDE_PX = 260
-# Slide rapide del sistema a zone (motion graphics 9:16): 0.2s in/out.
-_CHARACTER_ZONE_ENTRY_DURATION = 0.20
-_CHARACTER_ZONE_EXIT_DURATION = 0.20
+# Entrata slide&pop: offset Y fisso +300px (spec), durata ENTRY (~0.20s).
+_CHARACTER_ENTRY_SLIDE_Y = 300
+# Uscita slide-drop: verso +400px con ease_in_cubic, durata EXIT (~0.16s).
+_CHARACTER_EXIT_DROP_Y = 400
+# Sistema a zone: prima apparizione fade+slide/zoom ENTRY (~0.20s, ~6 frame);
+# uscita slide-drop+fade EXIT (~0.16s, ~5 frame) quando sparisce; morph di
+# continuita' 0.40s e zoom punch smart 0.60s restano morbidi (ritmo coerente).
+# Valori da config (override via env), fallback storici se import fallisce.
+try:
+    _CHARACTER_ZONE_ENTRY_DURATION = max(0.05, float(CHARACTER_ENTRY_DURATION))
+except Exception:
+    _CHARACTER_ZONE_ENTRY_DURATION = 0.20
+try:
+    _CHARACTER_ZONE_FIRST_DURATION = max(0.05, float(CHARACTER_FIRST_ENTRY_DURATION))
+except Exception:
+    _CHARACTER_ZONE_FIRST_DURATION = 0.20
+try:
+    _CHARACTER_ZONE_EXIT_DURATION = max(0.05, float(CHARACTER_EXIT_DURATION))
+except Exception:
+    _CHARACTER_ZONE_EXIT_DURATION = 0.16
+try:
+    _CHARACTER_MORPH_DURATION = max(0.05, float(CHARACTER_MORPH_DURATION))
+except Exception:
+    _CHARACTER_MORPH_DURATION = 0.40
+try:
+    _CHARACTER_PUNCH_DURATION = max(0.20, float(CHARACTER_PUNCH_ZOOM_DURATION))
+except Exception:
+    _CHARACTER_PUNCH_DURATION = 0.60
+# Zoom-in dolce per transizione "zoom_in" (center alternativi): scala 0.92->1.0.
+_CHARACTER_ZOOM_FROM = 0.92
+_CHARACTER_ZOOM_DURATION = 0.45
+# Idle breathing leggero ma visibile (spec): solo bob verticale dolce
+# dy=sin(2*pi*f*t)*amp_y (4px@0.4Hz); tilt disabilitato (0 = nessuna
+# rotazione laterale, niente dondolio). Overhead <5ms: bob = offset intero
+# (costo zero); il ramo tilt resta solo se l'utente lo riabilita via env.
+try:
+    _IDLE_ENABLED = int(CHARACTER_IDLE_ENABLED) != 0
+except Exception:
+    _IDLE_ENABLED = True
+try:
+    _IDLE_AMP_Y = max(0.0, float(CHARACTER_IDLE_AMP_Y))
+except Exception:
+    _IDLE_AMP_Y = 4.0
+try:
+    _IDLE_FREQ = max(0.05, float(CHARACTER_IDLE_FREQ))
+except Exception:
+    _IDLE_FREQ = 0.4
+try:
+    _IDLE_TILT_DEG = max(0.0, float(CHARACTER_IDLE_TILT_DEG))
+except Exception:
+    _IDLE_TILT_DEG = 0.0
+_IDLE_TILT_STEP = 0.3  # quantizzazione tilt per cache (<=9 varianti per size)
+_TWO_PI = 6.283185307179586
+# Cache rotazioni tilt: {(id(img), tilt_q): img ruotata} con lock, cap 64.
+_tilt_cache: dict[tuple[int, float], Image.Image] = {}
+_tilt_cache_lock = threading.Lock()
 # --- OTTIMIZZAZIONI VELOCITA' (P0) ---
 # Singleton FontManager condiviso: evita mkdir+scan disco per ogni chunk.
 _shared_font_manager = None
@@ -280,6 +362,173 @@ def _resolve_word_fill(word_norm: str, base_rgba: tuple, keyword_colors: dict | 
 
 
 # ---------------------------------------------------------------------------
+# Tier animazioni testo T0-T3 (premium senza over-engineering)
+# ---------------------------------------------------------------------------
+# Unificazione moto/colore (singola fonte di verita'):
+# - moto  = (style, is_hero, is_number) da text_tagger/narrative_structure
+#   (style==impact <=> keyword ai fini dell'animazione; keywords.py resta
+#   fonte del COLORE, text_tagger resta fonte del MOTO);
+# - colore = _styled_fills (tema + highlight preset + palette keyword fallback).
+# Tier:
+#   T0 base   fade (solo opacita', scala 1, draw diretto: costo ~0);
+#   T1 accent rise-fade (opacita' + y lift px, MAI scala: non deforma
+#     handwritten; costo +5%, solo offset, nessun resize);
+#   T2 impact pop standard (opacita' + scala ease_out_back, tile resize);
+#   T3 hero   1 parola/video (pop marcato + durata lunga + exit ritardata);
+#   T3-num    impact con cifre (pop corto dedicato, mai hero).
+# Path legacy (senza styled_words) usa solo T0/T2 per stabilita'.
+
+def _has_digit_fast(text: str) -> bool:
+    """Vero se contiene una cifra (numeri/dati -> pop corto, mai hero)."""
+    try:
+        for _c in str(text or ""):
+            if "0" <= _c <= "9":
+                return True
+        return False
+    except Exception:
+        return False
+
+
+def _resolve_motion_params(
+    preset: dict | None,
+    chunk: dict | None,
+) -> tuple[float, float, float, float, float, float]:
+    """Risolvi (entry_dur, scale_from, accent_lift, hero_dur, hero_from,
+    number_dur) con priorita' stabile e clamp.
+
+    - entry_dur: base config * anim_entry_mult del chunk (hook scattante);
+      hero usa poi HERO_ENTRY_DURATION (override, non moltiplicato).
+    - scale_from: chunk anim_pop_from esplicito (hook) > preset anim.pop_from
+      (nicchia) > KEYWORD_ENTRY_SCALE_FROM globale.
+    Mai eccezioni: fallback ai default storici.
+    """
+    try:
+        _entry_base = max(0.01, float(TEXT_ANIMATION_ENTRY_DURATION))
+    except (TypeError, ValueError, NameError):
+        _entry_base = 0.18
+    try:
+        _mult = float((chunk or {}).get("anim_entry_mult", 1.0)) if isinstance(chunk, dict) else 1.0
+        if 0.3 <= _mult <= 1.5:
+            entry_dur = max(0.01, _entry_base * _mult)
+        else:
+            entry_dur = _entry_base
+    except (TypeError, ValueError, AttributeError):
+        entry_dur = _entry_base
+    try:
+        _global_from = float(KEYWORD_ENTRY_SCALE_FROM)
+        if not (0.1 <= _global_from <= 1.0):
+            _global_from = 0.7
+    except (TypeError, ValueError, NameError):
+        _global_from = 0.7
+    # Preset nicchia (se disponibile) come default di tier.
+    try:
+        _preset_from = float((preset or {}).get("anim", {}).get("pop_from", _global_from))
+        if not (0.1 <= _preset_from <= 1.0):
+            _preset_from = _global_from
+    except (TypeError, ValueError, AttributeError):
+        _preset_from = _global_from
+    scale_from = _preset_from
+    # Override esplicito per-chunk (hook narrativo) vince su tutto.
+    try:
+        if isinstance(chunk, dict) and "anim_pop_from" in chunk:
+            _pop = float(chunk.get("anim_pop_from", scale_from))
+            if 0.1 <= _pop <= 1.0:
+                scale_from = _pop
+    except (TypeError, ValueError, AttributeError):
+        pass
+    try:
+        _lift = float(TEXT_ANIMATION_ACCENT_LIFT_PX)
+        _lift = min(24.0, max(0.0, _lift))
+    except (TypeError, ValueError, NameError):
+        _lift = 10.0
+    try:
+        _hero_dur = max(0.05, float(TEXT_ANIMATION_HERO_ENTRY_DURATION))
+    except (TypeError, ValueError, NameError):
+        _hero_dur = 0.22
+    try:
+        _hero_from = float(TEXT_ANIMATION_HERO_SCALE_FROM)
+        if not (0.1 <= _hero_from <= 1.0):
+            _hero_from = 0.6
+    except (TypeError, ValueError, NameError):
+        _hero_from = 0.6
+    try:
+        _num_dur = max(0.05, float(TEXT_ANIMATION_NUMBER_ENTRY_DURATION))
+    except (TypeError, ValueError, NameError):
+        _num_dur = 0.15
+    try:
+        _hero_delay = max(0.0, float(TEXT_ANIMATION_HERO_EXIT_DELAY))
+        _hero_delay = min(0.20, _hero_delay)
+    except (TypeError, ValueError, NameError):
+        _hero_delay = 0.06
+    return entry_dur, scale_from, _lift, _hero_dur, _hero_from, _num_dur
+
+
+def _hero_exit_delay() -> float:
+    """Ritardo exit hero in secondi (clamp 0-0.20, default 0.06 ~2 frame)."""
+    try:
+        _d = max(0.0, float(TEXT_ANIMATION_HERO_EXIT_DELAY))
+        return min(0.20, _d)
+    except (TypeError, ValueError, NameError):
+        return 0.06
+
+
+def _word_tier(word: dict) -> tuple[str, bool, bool]:
+    """Tier moto per parola tipografica: (style, is_hero, is_number).
+
+    Normalizza style a base/impact/accent; is_hero vale solo su impact senza
+    cifre (numeri mai hero); is_number da flag o digit check. Mai eccezioni.
+    """
+    try:
+        _style = str((word or {}).get("style", "base"))
+    except Exception:
+        _style = "base"
+    if _style not in ("base", "impact", "accent"):
+        # Compat legacy: is_keyword True <=> impact (unificazione).
+        try:
+            _style = "impact" if bool((word or {}).get("is_keyword", False)) else "base"
+        except Exception:
+            _style = "base"
+    try:
+        _is_num = bool((word or {}).get("is_number", False)) or _has_digit_fast(
+            str((word or {}).get("word", "")))
+    except Exception:
+        _is_num = False
+    try:
+        _is_hero = bool((word or {}).get("is_hero", False))
+    except Exception:
+        _is_hero = False
+    if _style != "impact" or _is_num:
+        _is_hero = False
+    return _style, _is_hero, _is_num
+
+
+def _hero_exit_factor(
+    t: float,
+    chunk_end: float,
+    exit_dur: float,
+    exit_factor_base: float,
+) -> float:
+    """Exit factor ritardato per hero: resta 1.0 per hero_delay, poi fade compresso.
+
+    Mantiene l'allineamento a chunk_end (nessun frame oltre): se exit_dur <=
+    delay, usa il fade base. Curva identica al gruppo (ease_in_cubic).
+    """
+    try:
+        if exit_dur <= 0:
+            return exit_factor_base
+        _delay = _hero_exit_delay()
+        if _delay <= 0.0 or exit_dur <= _delay + 1e-6:
+            return exit_factor_base
+        _start = chunk_end - exit_dur + _delay
+        if t < _start:
+            return 1.0
+        _p = clamp01((t - _start) / max(1e-6, exit_dur - _delay))
+        return 1.0 - ease_in_cubic(_p)
+    except Exception:
+        return exit_factor_base
+
+
+# ---------------------------------------------------------------------------
 # Semantic Typography Engine v1 — helpers multi-style
 # ---------------------------------------------------------------------------
 
@@ -329,13 +578,81 @@ def _resolve_typography_preset(chunk: dict, explicit_niche=None, explicit_preset
     return get_preset(niche)
 
 
+def _resolve_base_weight() -> int:
+    """Peso desiderato del font base (default 600 = SemiBold, clamp 400-800)."""
+    try:
+        w = int(TYPOGRAPHY_BASE_WEIGHT)
+    except (TypeError, ValueError, NameError):
+        w = 600
+    return min(800, max(400, w))
+
+
+def _apply_font_weight(font, weight: int) -> bool:
+    """Imposta l'asse Weight di un font variabile (es. 600 = SemiBold).
+
+    Cerca l'asse "Weight" tra quelli del file (ordine qualunque: funziona con
+    Inter[opsz,wght], Roboto[wdth,wght] e single-axis), preserva i default
+    degli altri assi e clamp al range del font. Ritorna True se applicato.
+    Ritorna False per font statici (Anton, Poppins, ...): per quelli il
+    chiamante usa il grassetto sintetico (stroke 1px stesso colore).
+    Mai eccezioni.
+    """
+    if font is None:
+        return False
+    try:
+        axes = font.get_variation_axes()
+    except Exception:
+        return False
+    if not axes:
+        return False
+    try:
+        w_idx = None
+        for i, ax in enumerate(axes):
+            try:
+                nm = ax.get("name", b"") if isinstance(ax, dict) else b""
+                nm = bytes(nm).lower() if isinstance(nm, bytes) else str(nm).lower().encode("utf-8", "ignore")
+            except Exception:
+                continue
+            if b"weight" in nm:
+                w_idx = i
+                break
+        if w_idx is None:
+            return False
+        coords: list = []
+        for i, ax in enumerate(axes):
+            try:
+                lo = float(ax["minimum"])
+                de = float(ax["default"])
+                hi = float(ax["maximum"])
+            except (KeyError, TypeError, ValueError):
+                return False
+            if i == w_idx:
+                coords.append(int(round(min(hi, max(lo, float(weight))))))
+            else:
+                coords.append(de)
+        font.set_variation_by_axes(coords)
+        return True
+    except Exception:
+        return False
+
+
+# Grassetto sintetico per font base statici (Poppins/Lato/...): 1px con lo
+# stesso colore del fill = inspessimento leggero, nessun contorno nero.
+_BASE_SYNTHETIC_STROKE_WIDTH = 1
+
+
 def _load_typography_fonts(preset: dict, font_scale: float = 1.0) -> dict:
     """Carica i 3 font PIL del preset alle dimensioni ponderate.
 
-    - base:   size standard (es. 60px) * font_scale del layout preset
-    - impact: base * impact_scale (1.3x-1.5x, es. 80-90px)
-    - accent: base * accent_scale (1.1x)
-    Ritorna {"base": font, "impact": font, "accent": font, "sizes": {...}, "paths": {...}}.
+    - base:   size standard (es. 60px) * font_scale del layout preset,
+      SEMPRE al peso TYPOGRAPHY_BASE_WEIGHT (600 = SemiBold: leggermente più
+      in grassetto del Regular, non troppo). Vedi `_apply_font_weight`.
+    - impact: base * impact_scale (1.3x-1.5x, es. 80-90px, peso suo proprio)
+    - accent: base * accent_scale (1.1x, peso suo proprio)
+    Ritorna {"base": font, "impact": font, "accent": font, "sizes": {...},
+    "paths": {...}, "names": {...}, "base_weight": int,
+    "base_weight_applied": bool}. Se False (font statico), il rendering usa
+    il grassetto sintetico per le parole base (vedi _BASE_SYNTHETIC_STROKE_WIDTH).
     Mai eccezioni: fallback a renderer.load_font.
     """
     try:
@@ -364,8 +681,12 @@ def _load_typography_fonts(preset: dict, font_scale: float = 1.0) -> dict:
         "impact": max(24, int(round(base_size * impact_scale))),
         "accent": max(24, int(round(base_size * accent_scale))),
     }
+    # Peso base (600 = SemiBold): nella chiave cache del base, così istanze
+    # con pesi diversi non si condividono mai.
+    base_weight = _resolve_base_weight()
     fonts_cfg = preset.get("fonts", {}) if isinstance(preset, dict) else {}
-    out: dict = {"sizes": sizes, "paths": {}, "names": {}}
+    out: dict = {"sizes": sizes, "paths": {}, "names": {},
+                 "base_weight": base_weight, "base_weight_applied": False}
     try:
         manager = _get_shared_font_manager()
     except Exception:
@@ -388,7 +709,7 @@ def _load_typography_fonts(preset: dict, font_scale: float = 1.0) -> dict:
                 except Exception:
                     path = ""
             if path:
-                key = (path, sizes[role])
+                key = (path, sizes[role], base_weight) if role == "base" else (path, sizes[role])
                 cached = _typo_font_cache.get(key)
                 if cached is not None:
                     font_obj = cached
@@ -424,7 +745,7 @@ def _load_typography_fonts(preset: dict, font_scale: float = 1.0) -> dict:
                     if fb_path:
                         try:
                             from PIL import ImageFont as _IF
-                            key = (fb_path, sizes[role])
+                            key = (fb_path, sizes[role], base_weight) if role == "base" else (fb_path, sizes[role])
                             cached = _typo_font_cache.get(key)
                             if cached is not None:
                                 font_obj = cached
@@ -446,6 +767,13 @@ def _load_typography_fonts(preset: dict, font_scale: float = 1.0) -> dict:
         out[role] = font_obj
         out["paths"][role] = chosen_path
         out["names"][role] = chosen_name
+    # Peso SemiBold sul base (testo chiaro): True su variabile, False su
+    # statico (il rendering usa allora il grassetto sintetico per il base).
+    # Idempotente sulle istanze cachate (stesso peso = nessun cambio).
+    try:
+        out["base_weight_applied"] = bool(_apply_font_weight(out.get("base"), base_weight))
+    except Exception:
+        out["base_weight_applied"] = False
     # Garanzia anti-collasso: se due ruoli hanno risolto lo STESSO file font,
     # prova a differenziare l'accent con un fallback alternativo (evita che
     # base/accent risultino visivamente identici).
@@ -1021,17 +1349,55 @@ def _render_scaled_word(
 
 
 def _character_info_from_chunk(chunk: dict) -> dict | None:
-    """Metadati character dal chunk arricchito (None se assenti/disabilitati).
+    """Metadati character dal chunk arricchito (None se assenti/disabilitati/nascosti).
 
-    Risolve tramite `resolve_chunk_layout` (singola fonte condivisa col text
-    engine): ritorna pose/use_preset/layout_preset/transition_in + campi legacy.
+    Presenza discontinua (Breath & Focus): se chunk["character"]["visible"]
+    e' False (o char_visible False / guard_hidden) il personaggio e' HIDDEN
+    in questo chunk (nessun layer, schermo pulito solo testo). Risolve
+    tramite `resolve_chunk_layout` (singola fonte condivisa col text engine).
     """
     if not CHARACTER_ENABLED:
         return None
     try:
+        if isinstance(chunk, dict):
+            _ch = chunk.get("character")
+            if isinstance(_ch, dict) and not bool(_ch.get("visible", True)):
+                return None
+            if chunk.get("char_visible") is False:
+                return None
+            if chunk.get("guard_hidden") is True:
+                return None
+    except Exception:
+        pass
+    try:
         return resolve_chunk_layout(chunk)
     except Exception:
         return None
+
+
+def _character_event_of(chunk: dict | None) -> str:
+    """Evento macro-blocco del chunk (ENTRY/SUSTAIN/EXIT/NONE, mai eccezioni)."""
+    try:
+        from core.character_animator import CharacterFrameAnimator as _A
+        return _A.event_of(chunk)
+    except Exception:
+        pass
+    try:
+        if not isinstance(chunk, dict):
+            return "NONE"
+        _ch = chunk.get("character")
+        if isinstance(_ch, dict):
+            if not bool(_ch.get("visible", True)):
+                return "NONE"
+            _ev = str(_ch.get("event", "") or "").strip().upper()
+            if _ev in ("ENTRY", "SUSTAIN", "EXIT", "NONE"):
+                return _ev
+        _ev2 = str(chunk.get("char_event", "") or "").strip().upper()
+        if _ev2 in ("ENTRY", "SUSTAIN", "EXIT", "NONE"):
+            return _ev2
+        return "SUSTAIN" if chunk.get("pose") is not None else "NONE"
+    except Exception:
+        return "NONE"
 
 
 def _character_side(info: dict) -> str:
@@ -1071,6 +1437,58 @@ def _load_chunk_character_layer(info: dict | None):
         return None, None
 
 
+def _character_entry_transform(
+    transition: str,
+    side: str,
+    progress: float,
+    img_w: int = 0,
+    base_x: int = 0,
+    base_y: int = 0,
+    full_travel: bool = False,
+    fade: bool = True,
+) -> tuple[int, int, int, float]:
+    """Offset (dx, dy), opacita' 0-255 e scala del personaggio al `progress`.
+
+    Entrata slide&pop (spec ~0.20s, ~6 frame): fade fluido (ease_out_quad) +
+    slide con ease_out_back (overshoot leggero, effetto pop premium) da offset
+    Y fisso +300px, o zoom dolce 0.92->1.0 per "zoom_in". L'overshoot supera di
+    poco la posizione finale e rientra: niente scatti, ritmo coerente.
+    """
+    p = clamp01(progress)
+    t = str(transition or "fade")
+    if t == "slide_side":
+        t = "slide_from_left" if side == "left" else "slide_from_right"
+    elif t == "slide_from_bottom":
+        t = "slide_up"
+    if t in ("none",):
+        return (0, 0, 255, 1.0)
+    # Fade fluido (quad) + pop con overshoot leggero (back): ingresso premium.
+    fade_eased = ease_out_quad(p)
+    pop_eased = ease_out_back(p)
+    move_eased = ease_out_cubic(p)
+    opacity = int(round(255 * fade_eased)) if fade else 255
+    if t == "fade":
+        return (0, 0, opacity, 1.0)
+    if t in ("zoom", "zoom_in", "scale_in", "scale-in"):
+        scale = _CHARACTER_ZOOM_FROM + (1.0 - _CHARACTER_ZOOM_FROM) * move_eased
+        return (0, 0, opacity, float(scale))
+    if t in ("slide_from_left", "slide_from_right"):
+        if full_travel and img_w > 0:
+            start_x = -img_w if t == "slide_from_left" else VIDEO_WIDTH
+            dx = int(round((start_x - base_x) * (1.0 - pop_eased)))
+        else:
+            direction = -1 if t == "slide_from_left" else 1
+            dx = int(round(direction * _CHARACTER_SLIDE_SIDE_PX * (1.0 - pop_eased)))
+        return (dx, 0, opacity, 1.0)
+    # slide_up (default anche per valori ignoti: mai un taglio secco a sorpresa)
+    # Spec: offset Y fisso +300px (non full off-screen), pop con overshoot.
+    if full_travel:
+        dy = int(round(_CHARACTER_ENTRY_SLIDE_Y * (1.0 - pop_eased)))
+    else:
+        dy = int(round(_CHARACTER_SLIDE_UP_PX * (1.0 - pop_eased)))
+    return (0, dy, opacity, 1.0)
+
+
 def _character_entry_offset_opacity(
     transition: str,
     side: str,
@@ -1081,48 +1499,121 @@ def _character_entry_offset_opacity(
     full_travel: bool = False,
     fade: bool = True,
 ) -> tuple[int, int, int]:
-    """Offset (dx, dy) e opacita' 0-255 del personaggio al `progress` 0..1.
+    """Offset (dx, dy) e opacita' 0-255 (compat: ignora la scala zoom_in).
 
-    Sistema a zone (`full_travel=True`): slide da completamente fuori campo
-    (bordo schermo -> posizione preset) in stile motion graphics.
-    Legacy v1 (`full_travel=False`): offset corti (320/260px) come storico.
-
-    - slide_from_left/slide_from_right (o slide_side legacy): entrata
-      orizzontale (con fade se `fade=True`, altrimenti a piena opacita').
-    - slide_up (o slide_from_bottom): risalita dal basso (idem).
-    - fade: solo opacita' (con `fade=False` diventa apparizione istantanea).
-    - none: gia' in posizione, opaco da subito.
-
-    `fade=False` serve quando il personaggio era gia' visibile nel chunk
-    precedente (cambio posa/layout): lo slide resta, ma senza dissolvenza,
-    cosi' il personaggio non sparisce mai a meta' video (anti-glitch).
+    Per lo zoom_in la scala e' gestita dal chiamante via
+    `_character_entry_transform` (0.92->1.0 fluido); qui ritorna solo
+    offset+opacita' per non rompere i chiamanti legacy.
     """
-    p = clamp01(progress)
-    t = str(transition or "fade")
-    if t == "slide_side":
-        t = "slide_from_left" if side == "left" else "slide_from_right"
-    elif t == "slide_from_bottom":
-        t = "slide_up"
-    if t == "none":
-        return (0, 0, 255)
-    eased = ease_out_cubic(p)
-    opacity = int(round(255 * eased)) if fade else 255
-    if t == "fade":
-        return (0, 0, opacity)
-    if t in ("slide_from_left", "slide_from_right"):
-        if full_travel and img_w > 0:
-            start_x = -img_w if t == "slide_from_left" else VIDEO_WIDTH
-            dx = int(round((start_x - base_x) * (1.0 - eased)))
-        else:
-            direction = -1 if t == "slide_from_left" else 1
-            dx = int(round(direction * _CHARACTER_SLIDE_SIDE_PX * (1.0 - eased)))
-        return (dx, 0, opacity)
-    # slide_up (default anche per valori ignoti: mai un taglio secco a sorpresa)
-    if full_travel:
-        dy = int(round((VIDEO_HEIGHT - base_y) * (1.0 - eased)))
-    else:
-        dy = int(round(_CHARACTER_SLIDE_UP_PX * (1.0 - eased)))
-    return (0, dy, opacity)
+    dx, dy, op, _scale = _character_entry_transform(
+        transition, side, progress, img_w, base_x, base_y, full_travel, fade)
+    return (dx, dy, op)
+
+
+def _character_morph_offset(
+    from_xy: tuple[int, int] | None,
+    to_xy: tuple[int, int],
+    progress: float,
+) -> tuple[int, int]:
+    """Offset di morph da posizione precedente a quella corrente (smart animate).
+
+    Il character parte dalla vecchia posizione (continuità, niente flash di
+    sfondo) e scivola alla nuova con ease_in_out_cubic (partenza/arrivo
+    morbidi). Sempre a piena opacita': niente sparizioni nei cambi posa/lato.
+    Se from_xy e' None o uguale a to_xy, ritorna (0,0).
+    """
+    try:
+        if from_xy is None:
+            return (0, 0)
+        fx, fy = int(from_xy[0]), int(from_xy[1])
+        tx, ty = int(to_xy[0]), int(to_xy[1])
+    except (TypeError, ValueError, IndexError):
+        return (0, 0)
+    dx0, dy0 = fx - tx, fy - ty
+    if dx0 == 0 and dy0 == 0:
+        return (0, 0)
+    e = ease_in_out_cubic(clamp01(progress))
+    return (int(round(dx0 * (1.0 - e))), int(round(dy0 * (1.0 - e))))
+
+
+def _idle_bob_tilt(t_abs: float) -> tuple[int, float]:
+    """Respiro idle leggero al tempo assoluto video `t_abs` (secondi).
+
+    - Bob verticale dolce: dy = sin(2*pi*freq*t) * amp_y (default 0.4Hz, 4px:
+      leggero ma percettibile, mai statico).
+    - Tilt disabilitato di default (0.0 gradi: nessuna rotazione laterale, il
+      dondolio destra-sinistra rendeva il video instabile). Resta attivo solo
+      se l'utente imposta CHARACTER_IDLE_TILT_DEG > 0 via env.
+    Ritorna (dy_px_int, tilt_deg_float). Costo ~1us (sin+cos). Con idle
+    disabilitato o ampiezze zero ritorna (0, 0.0) senza calcoli trig.
+    """
+    try:
+        if not _IDLE_ENABLED or (_IDLE_AMP_Y <= 0 and _IDLE_TILT_DEG <= 0):
+            return (0, 0.0)
+        phase = _TWO_PI * _IDLE_FREQ * float(t_abs)
+    except (TypeError, ValueError):
+        return (0, 0.0)
+    try:
+        dy = int(round(math.sin(phase) * _IDLE_AMP_Y)) if _IDLE_AMP_Y > 0 else 0
+    except Exception:
+        dy = 0
+    try:
+        tilt = float(math.cos(phase) * _IDLE_TILT_DEG) if _IDLE_TILT_DEG > 0 else 0.0
+    except Exception:
+        tilt = 0.0
+    return (dy, tilt)
+
+
+def _get_tilted_char(char_img: Image.Image, tilt_deg: float):
+    """Layer ruotato di `tilt_deg` attorno al punto inferiore centrale (w/2, h).
+
+    L'ancoraggio in basso evita che il personaggio si stacchi dal fondo: la
+    base resta ferma, la testa culla lateralmente. Tilt quantizzato a step
+    0.3 gradi e cachato (<=9 varianti per size): hit = lookup <1ms, miss =
+    una rotazione BILINEAR ammortizzata. tilt ~0 o idle OFF = layer originale.
+    Mai eccezioni (fallback: originale).
+    """
+    try:
+        if char_img is None:
+            return char_img
+        if not _IDLE_ENABLED:
+            return char_img
+        try:
+            tilt = float(tilt_deg)
+        except (TypeError, ValueError):
+            return char_img
+        if abs(tilt) < 1e-9:
+            return char_img
+        q = round(tilt / _IDLE_TILT_STEP) * _IDLE_TILT_STEP
+        q = max(-3.0, min(3.0, float(q)))
+        if abs(q) < 1e-9:
+            return char_img
+        key = (id(char_img), q)
+        hit = _tilt_cache.get(key)
+        if hit is not None:
+            return hit
+        with _tilt_cache_lock:
+            hit = _tilt_cache.get(key)
+            if hit is not None:
+                return hit
+            try:
+                w, h = char_img.size
+                rotated = char_img.rotate(
+                    q, resample=Image.BILINEAR, center=(w / 2.0, float(h)))
+                if rotated.mode != "RGBA":
+                    rotated = rotated.convert("RGBA")
+            except Exception:
+                return char_img
+            if len(_tilt_cache) < 64:
+                if len(_tilt_cache) >= 60:
+                    _tilt_cache.clear()
+                _tilt_cache[key] = rotated
+            return rotated
+    except Exception:
+        try:
+            return char_img
+        except Exception:
+            return None
 
 
 def _character_exit_offset_opacity(
@@ -1175,21 +1666,38 @@ def _character_identity(info) -> tuple | None:
         return None
 
 
+def _same_pose(a: dict | None, b: dict | None) -> bool:
+    """Vero se entrambi hanno la STESSA posa (stessa immagine), o None altrimenti.
+
+    E' il check anti-sparizione: stessa posa = stessa immagine = il
+    personaggio non deve mai uscire di scena (niente slide_down, niente
+    rientro da fuori campo). Mai eccezioni.
+    """
+    try:
+        if not isinstance(a, dict) or not isinstance(b, dict):
+            return False
+        if a.get("pose") is None or b.get("pose") is None:
+            return False
+        return int(a.get("pose")) == int(b.get("pose"))
+    except Exception:
+        return False
+
+
 def decide_char_exit_mode(current: dict | None, nxt: dict | None) -> str:
     """Modalita' di uscita del personaggio guardando il chunk successivo.
 
-    Invariante anti-glitch: il personaggio svanisce SOLO quando deve
-    chiaramente scomparire (chunk dopo senza personaggio, o fine video).
-    In tutti gli altri casi resta visibile fino allo stacco:
+    Invariante anti-blink (fix sparizione/riapparizione): il personaggio resta
+    visibile fino allo stacco OGNI VOLTA che il chunk dopo ha un personaggio,
+    qualunque sia il cambio (posa/lato/punch). L'uscita animata scatta SOLO
+    quando deve chiaramente scomparire (chunk dopo senza personaggio, o fine
+    video): fade-out fluido dedicato (non legato al fade testo).
 
-    - Chunk dopo senza personaggio (o fine video) -> "with_text" (fade di
-      gruppo: sparizione chiara e intenzionale).
-    - Punch-in che si accende/spegne -> "hold" (il jump-cut non ha dissolvenze).
-    - Stessa identita' (posa+zona+punch) dopo -> "hold" (taglio invisibile).
-    - Cambio lato (split_left <-> split_right) -> "slide_down" (scende a piena
-      opacita', poi il chunk dopo rientra dal lato opposto).
-    - Altri cambi (es. centro <-> split, legacy) -> "hold" (resta fino allo
-      stacco, il chunk dopo entra con slide a piena opacita').
+    - Chunk dopo senza personaggio (o fine video) -> "with_text" (fade-out
+      fluido con durata character dedicata: sparizione chiara e intenzionale).
+    - Chunk dopo CON personaggio -> "hold" SEMPRE (niente slide_down: lo
+      slide_down storico svuotava lo schermo a fine chunk e creava il blink
+      nei gap; ora il morph in entrata del chunk dopo parte dalla vecchia
+      posizione con continuita' pixel, e la persistenza nei gap copre le pause).
     Accetta chunk grezzi o info gia' risolte; mai eccezioni.
     """
     try:
@@ -1202,44 +1710,38 @@ def decide_char_exit_mode(current: dict | None, nxt: dict | None) -> str:
     if cur is None:
         return _CHAR_EXIT_WITH_TEXT
     if after is None:
-        return _CHAR_EXIT_WITH_TEXT  # sparizione (o fine video): fade
-    if _punch_of(cur) != _punch_of(after):
-        return _CHAR_EXIT_HOLD  # jump-cut: niente transizioni morbide
-    if _character_identity(cur) == _character_identity(after):
-        return _CHAR_EXIT_HOLD  # stesso personaggio: taglio invisibile
-    if bool(cur.get("use_preset")) and bool(after.get("use_preset")):
-        try:
-            cur_side = preset_side(cur.get("layout"))
-            nxt_side = preset_side(after.get("layout"))
-        except Exception:
-            return _CHAR_EXIT_HOLD
-        if {cur_side, nxt_side} == {"left", "right"}:
-            return _CHAR_EXIT_SLIDE_DOWN
-    return _CHAR_EXIT_HOLD
+        return _CHAR_EXIT_WITH_TEXT  # sparizione (o fine video): fade fluido
+    return _CHAR_EXIT_HOLD  # continuita': resta fino allo stacco, morph dopo
 
 
 def decide_char_entry_jump(prev: dict | None, current: dict | None) -> bool:
-    """Vero se l'entrata del personaggio dev'essere un jump-cut istantaneo.
+    """Vero se l'entrata dev'essere istantanea (taglio invisibile).
 
-    Solo quando il punch-in cambia rispetto al chunk precedente (stacco di
-    camera televisivo: nessuna slide, scala nuova da subito) o il video inizia
-    gia' in punch-in. Accetta chunk grezzi o info risolte; mai eccezioni.
+    SOLO a identita' pixel-identica (stessa posa+zona+punch del chunk prima):
+    il frame e' identico, nessuna animazione da replayare (replay creerebbe
+    un blink a ogni stacco). In tutti gli altri casi (cambio posa/lato,
+    punch che si accende/spegne, zoom hook) l'entrata e' MORPH/zoom fluido,
+    MAI jump-cut secco (fix scatto hook). Accetta chunk grezzi o info risolte;
+    mai eccezioni.
     """
     try:
         cur = current if isinstance(current, dict) and "pose" in current and "use_preset" in current \
             else resolve_chunk_layout(current)
     except Exception:
         return False
-    if cur is None or not _punch_of(cur):
+    if cur is None:
         return False
     try:
         before = prev if isinstance(prev, dict) and "pose" in prev and "use_preset" in prev \
             else resolve_chunk_layout(prev)
     except Exception:
-        return True
+        return False
     if before is None:
-        return True
-    return _punch_of(before) != _punch_of(cur)
+        return False
+    try:
+        return _character_identity(cur) == _character_identity(before)
+    except Exception:
+        return False
 
 
 def _paste_character_frame(
@@ -1300,6 +1802,8 @@ def generate_animated_chunk_frames(
     char_entry_fade: bool = True,
     typography_niche: str | None = None,
     typography_preset: dict | None = None,
+    char_entry_from_xy: tuple[int, int] | None = None,
+    tail_hold_duration: float = 0.0,
 ) -> list[dict]:
     """Genera la sequenza di frame PNG per un chunk con animazione per-parola.
 
@@ -1310,7 +1814,9 @@ def generate_animated_chunk_frames(
             (vedi core/character_selector.py): il personaggio (mezzo busto,
             mai figura intera) viene disegnato sotto il testo (Z-index: sfondo
             ffmpeg < personaggio < sottotitoli, con pill ad alto contrasto per
-            il punch-in) con slide rapida da fuori campo (0.2s).
+            il punch-in) con slide&pop 0.20s +300px alla prima apparizione,
+            idle breathing/sway continuo, morph smart nei cambi e zoom fluido
+            0.6s per il punch hook (mai jump-cut secco).
             Con Semantic Typography Engine v1 puo' contenere anche
             "styled_words" (vedi core/text_tagger.py) + "typography_niche":
             in quel caso il rendering usa 3 font/colori/dimensioni per nicchia
@@ -1328,24 +1834,26 @@ def generate_animated_chunk_frames(
         safe_area: Text Safe Area esplicita (x_min, y_min, x_max, y_max);
             se assente si usa quella del preset del chunk, altrimenti il
             centro schermo storico. Il wrapping segue la larghezza del box.
-        char_exit_mode: "with_text" (segue il fade di gruppo), "slide_down"
-            (esce in basso a fine chunk, 0.2s) o "hold" (resta opaco fino al
-            taglio: jump-cut punch-in o stesso layout+posa). Di solito calcolato
-            con `decide_char_exit_mode` guardando il chunk successivo
+        char_exit_mode: "with_text" (fade-out fluido dedicato quando il
+            personaggio sparisce), "slide_down" (legacy, trattato come hold
+            per continuita') o "hold" (resta opaco fino allo stacco +
+            persistenza nel gap, mai blink). Di solito calcolato con
+            `decide_char_exit_mode` guardando il chunk successivo
             (vedi `render_all_chunks_animated`).
-        char_exit_duration: durata in secondi della finestra di uscita
-            per "slide_down" (default 0.20s).
+        char_exit_duration: durata fade-out personaggio (default da config).
         text_safe_area: alias di `safe_area` (nome da spec); se fornito,
             ha precedenza.
-        char_entry_jump: True per entrata jump-cut istantanea (punch_in che si
-            accende, o stesso identico personaggio del chunk precedente:
-            taglio invisibile). Di solito calcolato con `decide_char_entry_jump`
-            guardando il chunk precedente.
-        char_entry_fade: True per dissolvenza in entrata (prima apparizione:
-            il personaggio appare con stile); False quando il personaggio era
-            gia' visibile nel chunk precedente (slide a piena opacita', mai
-            sparizioni a meta' video). Di solito calcolato in
-            `render_all_chunks_animated` guardando il chunk precedente.
+        char_entry_jump: True SOLO a identita' pixel-identica (stesso
+            posa+zona+punch del chunk prima: taglio invisibile, nessuna
+            animazione). Di solito calcolato con `decide_char_entry_jump`.
+        char_entry_fade: True alla prima apparizione (fade+slide/zoom da fuori
+            campo); False nei morph di continuita' (slide dalla vecchia
+            posizione a piena opacita', niente flash di sfondo).
+        char_entry_from_xy: posizione base (x,y) del character nel chunk
+            precedente per il morph smart (None = prima apparizione).
+        tail_hold_duration: secondi extra oltre chunk.end in cui clonare
+            l'ultimo frame (persistenza nel gap quando il character continua:
+            fix blink sparizione/riapparizione). Solo con hold.
         typography_niche: nicchia esplicita (override di chunk["typography_niche"]).
         typography_preset: preset dict esplicito (da core/typography_presets.get_preset).
 
@@ -1353,8 +1861,8 @@ def generate_animated_chunk_frames(
         Lista di dict {"image_path": str, "start": float, "end": float}
         - uno per ogni frame generato, con la finestra temporale in cui
         quel frame specifico deve essere mostrato (frame N valido da
-        t_N a t_N+1/fps). Formato compatibile con la pipeline di
-        `core/video_builder.py` (micro-video per chunk via `build_chunk_clip`).
+        t_N a t_N+1/fps). Include gli eventuali tail di persistenza.
+        Formato compatibile con `core/video_builder.py` (micro-video per chunk).
     """
     if fps is None or fps <= 0:
         fps = VIDEO_FPS
@@ -1393,6 +1901,25 @@ def generate_animated_chunk_frames(
         font_scale = preset_font_scale(preset)
     else:
         area, needs_pill, font_scale = None, False, 1.0
+    # Real-time Layout Guard (core/layout_guard.py): override per-chunk
+    # (safe area + font shrink + pill) calcolato prima del render.
+    # Precedenza: explicit globale > guard > preset.
+    try:
+        if explicit_box is None and isinstance(chunk, dict):
+            _gsa = chunk.get("guard_safe_area")
+            if _gsa is not None:
+                _gbox = (int(_gsa[0]), int(_gsa[1]), int(_gsa[2]), int(_gsa[3]))
+                if _gbox[2] > _gbox[0] and _gbox[3] > _gbox[1]:
+                    area = _gbox
+            _gfs = chunk.get("guard_font_scale")
+            if _gfs is not None:
+                _gfs_f = float(_gfs)
+                if 0.5 <= _gfs_f <= 1.5:
+                    font_scale = _gfs_f
+            if chunk.get("guard_pill"):
+                needs_pill = True
+    except Exception:
+        pass
 
     # --- Semantic Typography: path multi-style o legacy single-font ---
     # Look pulito: stroke sempre 0 (nessun contorno nero), ombra solo se
@@ -1442,10 +1969,14 @@ def generate_animated_chunk_frames(
                 display = str(s.get("display", word_text.upper() if (style == "impact" and uppercase_impact) else word_text))
                 if style == "impact" and uppercase_impact:
                     display = display.upper()
+                _is_num_s = bool(s.get("is_number", False)) or _has_digit_fast(word_text)
+                _is_hero_s = bool(s.get("is_hero", False)) and style == "impact" and not _is_num_s
                 styled_words.append({
                     "word": word_text, "display": display, "style": style,
                     "start": st, "end": en,
                     "is_keyword": style == "impact",
+                    "is_hero": _is_hero_s,
+                    "is_number": _is_num_s,
                 })
         if not styled_words:
             # Deriva da words legacy: keyword -> impact, resto base.
@@ -1453,10 +1984,14 @@ def generate_animated_chunk_frames(
             for w in words:
                 style = "impact" if w.get("is_keyword") else "base"
                 disp = str(w["word"]).upper() if (style == "impact" and uppercase_impact) else str(w["word"])
+                _wn = str(w.get("word", ""))
+                _in = _has_digit_fast(_wn)
                 styled_words.append({
-                    "word": str(w["word"]), "display": disp, "style": style,
+                    "word": _wn, "display": disp, "style": style,
                     "start": float(w["start"]), "end": float(w["end"]),
                     "is_keyword": bool(w.get("is_keyword", False)),
+                    "is_hero": False,
+                    "is_number": _in,
                 })
         if not styled_words:
             use_typography = False
@@ -1513,10 +2048,14 @@ def generate_animated_chunk_frames(
         # Fills per parola per ruolo (la tipografia vince sulla palette keyword).
         fills = [typo_fills.get(layout[i].get("style", "base"), typo_fills["base"]) for i in range(len(layout))]
         word_starts = [float(s["start"]) for s in styled_words]
-        # Per il loop di rendering riusa `words` come alias di styled (is_keyword=impact).
+        # Per il loop di rendering riusa `words` come alias di styled
+        # (is_keyword <=> style==impact per unificazione moto; hero/number
+        # preservati per i tier T3).
         words = [
             {"word": s["display"], "start": s["start"], "end": s["end"],
-             "is_keyword": s["style"] == "impact", "style": s["style"]}
+             "is_keyword": s["style"] == "impact", "style": s["style"],
+             "is_hero": bool(s.get("is_hero", False)),
+             "is_number": bool(s.get("is_number", False))}
             for s in styled_words
         ]
     else:
@@ -1540,45 +2079,134 @@ def generate_animated_chunk_frames(
         ]
         word_starts = [float(w["start"]) for w in words]
 
-    entry_dur = max(0.01, float(TEXT_ANIMATION_ENTRY_DURATION))
-    exit_dur = max(0.0, float(TEXT_ANIMATION_EXIT_DURATION))
-    scale_from = float(KEYWORD_ENTRY_SCALE_FROM)
-    if not (0.1 <= scale_from <= 1.0):
-        scale_from = 0.7
-    # Override narrativi per atto (hook più scattante e pop marcato;
-    # chiavi assenti = default legacy, piena retrocompatibilità).
+    # Grassetto sintetico per il base statico (Poppins/Lato/...): se il peso
+    # variabile NON è stato applicato, le parole base usano stroke 1px dello
+    # stesso colore (inspessimento leggero, nessun contorno nero).
     try:
-        mult = float(chunk.get("anim_entry_mult", 1.0))
-        if 0.3 <= mult <= 1.5:
-            entry_dur = max(0.01, entry_dur * mult)
-    except (TypeError, ValueError, AttributeError):
-        pass
+        _base_synth = bool(use_typography and isinstance(typo_fonts, dict)
+                           and not typo_fonts.get("base_weight_applied", False))
+    except Exception:
+        _base_synth = False
+
+    # Tier T0-T3: entry/scala da config + preset nicchia + override hook.
+    # Priorita' scala: chunk anim_pop_from (hook) > preset anim.pop_from >
+    # globale. Hero e numeri hanno durate dedicate (vedi _resolve_motion_params).
     try:
-        pop = float(chunk.get("anim_pop_from", scale_from))
-        if 0.1 <= pop <= 1.0:
-            scale_from = pop
-    except (TypeError, ValueError, AttributeError):
-        pass
+        exit_dur = max(0.0, float(TEXT_ANIMATION_EXIT_DURATION))
+    except (TypeError, ValueError, NameError):
+        exit_dur = 0.15
+    try:
+        entry_dur, scale_from, accent_lift, hero_dur, hero_from, number_dur = (
+            _resolve_motion_params(typo_preset if use_typography else None, chunk)
+        )
+    except Exception:
+        entry_dur, scale_from = 0.18, 0.7
+        accent_lift, hero_dur, hero_from, number_dur = 10.0, 0.22, 0.6, 0.15
+    # Per-parola (fuori loop frame): tier + durata entry dedicata.
+    # Legacy (no tipografia): solo T0/T2 via is_keyword, mai accent/hero/number.
+    try:
+        if use_typography:
+            _tiers = [_word_tier(w) for w in words]
+            _entry_per_word = [
+                (hero_dur if _h else (number_dur if (_s == "impact" and _n) else entry_dur))
+                for (_s, _h, _n) in _tiers
+            ]
+            _scale_per_word = [
+                (hero_from if _h else scale_from) if _s == "impact" else 1.0
+                for (_s, _h, _n) in _tiers
+            ]
+        else:
+            _tiers = [("impact" if bool(w.get("is_keyword", False)) else "base", False, False)
+                      for w in words]
+            _entry_per_word = [entry_dur] * len(words)
+            _scale_per_word = [(scale_from if _s == "impact" else 1.0) for (_s, _, _) in _tiers]
+    except Exception:
+        _tiers = [("base", False, False)] * len(words)
+        _entry_per_word = [entry_dur] * len(words)
+        _scale_per_word = [1.0] * len(words)
 
     # --- Personaggio del chunk (layer UNA volta, riusato in ogni frame) ---
     # Z-index sui frame: 1. sfondo (ffmpeg) / 2. personaggio / 2.5 pill / 3. testo.
+    # Slide&pop 0.20s +300px alla prima apparizione; morph smart 0.40s in
+    # continuita' (piena opacita', niente flash); identita' pixel-identica:
+    # taglio invisibile (jump); punch: zoom 0.6s smart; idle continuo sopra.
     char_img, char_base_xy = _load_chunk_character_layer(char_info)
+    char_punch = bool(char_info is not None and char_info.get("punch_in", False)) if char_info is not None else False
+    char_base_img = None  # layer non-punch per zoom fluido (punch=true)
+    char_base_pos: tuple[int, int] | None = None
+    char_original = None  # sorgente full-res per resize zoom per-frame
     if char_img is not None and char_base_xy is not None and char_info is not None:
         char_transition = char_info.get("transition_in", "fade") or "fade"
         char_side = _character_side(char_info)
         char_full_travel = bool(use_preset)
-        char_entry_dur = max(0.01, _CHARACTER_ZONE_ENTRY_DURATION if use_preset else _CHARACTER_ENTRY_DURATION)
         char_entry_jump = bool(char_entry_jump)
         char_entry_fade = bool(char_entry_fade)
+        # Prima apparizione: slide&pop 0.20s +300px (spec, back+quad).
+        # Morph di continuita': 0.40s dalla vecchia posizione (smart animate).
+        if char_entry_fade:
+            char_entry_dur = max(0.01, _CHARACTER_ZONE_FIRST_DURATION if use_preset else _CHARACTER_ENTRY_DURATION)
+        else:
+            char_entry_dur = max(0.01, _CHARACTER_MORPH_DURATION if use_preset else _CHARACTER_ENTRY_DURATION)
+        # Morph: valida from_xy (deve essere on-screen e sensato).
+        char_morph_from: tuple[int, int] | None = None
+        if not char_entry_jump and not char_entry_fade and char_entry_from_xy is not None:
+            try:
+                _fx, _fy = int(char_entry_from_xy[0]), int(char_entry_from_xy[1])
+                if -VIDEO_WIDTH < _fx < VIDEO_WIDTH * 2 and -VIDEO_HEIGHT < _fy < VIDEO_HEIGHT * 2:
+                    if (_fx, _fy) != (int(char_base_xy[0]), int(char_base_xy[1])):
+                        char_morph_from = (_fx, _fy)
+            except (TypeError, ValueError, IndexError):
+                char_morph_from = None
+        else:
+            char_morph_from = None
+        # Punch zoom fluido: prepara base + sorgente per interpolazione scala.
+        char_punch_active = bool(char_punch and not char_entry_jump)
+        if char_punch_active:
+            try:
+                if bool(char_info.get("use_preset")):
+                    char_base_img, _bx, _by = get_character_layer(
+                        int(char_info["pose"]), char_info.get("layout"),
+                        False, VIDEO_WIDTH, VIDEO_HEIGHT)
+                    char_base_pos = (int(_bx), int(_by))
+                else:
+                    char_base_img, char_base_pos = char_img, tuple(char_base_xy)
+                try:
+                    from core.character_selector import load_character_original as _load_orig
+                    char_original = _load_orig(int(char_info["pose"]))
+                except Exception:
+                    char_original = None
+            except Exception:
+                char_base_img, char_base_pos, char_original = None, None, None
+            try:
+                char_punch_dur = max(0.20, float(_CHARACTER_PUNCH_DURATION))
+            except Exception:
+                char_punch_dur = 0.60
+        else:
+            char_punch_active = False
+            char_punch_dur = 0.0
     else:
         char_base_xy = None
+        char_morph_from = None
+        char_punch_active = False
+        char_punch_dur = 0.0
 
     try:
         char_exit_dur = max(0.0, float(char_exit_duration))
     except (TypeError, ValueError):
         char_exit_dur = _CHARACTER_ZONE_EXIT_DURATION
+    # Uscita slide-drop + fade (spec ~0.16s, +400px in_cubic) quando sparisce.
+    # slide_down legacy -> hold (continuita' morph).
     if char_exit_mode not in (_CHAR_EXIT_WITH_TEXT, _CHAR_EXIT_SLIDE_DOWN, _CHAR_EXIT_HOLD):
         char_exit_mode = _CHAR_EXIT_WITH_TEXT
+    if char_exit_mode == _CHAR_EXIT_SLIDE_DOWN:
+        char_exit_mode = _CHAR_EXIT_HOLD
+    try:
+        _tail_hold = max(0.0, float(tail_hold_duration))
+    except (TypeError, ValueError):
+        _tail_hold = 0.0
+    # Tail solo con hold + character presente (persistenza gap, fix blink).
+    if char_exit_mode != _CHAR_EXIT_HOLD or char_base_xy is None:
+        _tail_hold = 0.0
 
     num_frames = max(1, int(math.ceil(duration * fps)))
     frame_step = 1.0 / float(fps)
@@ -1604,11 +2232,13 @@ def generate_animated_chunk_frames(
     # Binding locali per loop caldo (evita lookup globali/attr per frame).
     _ease_out_back = ease_out_back
     _ease_out_cubic = ease_out_cubic
+    _ease_out_quad = ease_out_quad
     _ease_in_cubic = ease_in_cubic
     _clamp01 = clamp01
     _new_rgba = Image.new
     _canvas_size = (VIDEO_WIDTH, VIDEO_HEIGHT)
     _transparent = (0, 0, 0, 0)
+    _accent_lift_i = int(round(accent_lift))
     # Font per parola pre-risolti (evita dict.get + try per frame).
     if use_typography:
         try:
@@ -1636,36 +2266,164 @@ def generate_animated_chunk_frames(
 
         frame_img = _new_rgba("RGBA", _canvas_size, _transparent)
 
-        # Z-index 2: personaggio sotto il testo (entrata + eventuale uscita).
-        # Anti-glitch: la dissolvenza scatta SOLO in apparizione (entry_fade)
-        # o sparizione (with_text); nei cambi resta sempre visibile.
+        # Z-index 2: personaggio sotto il testo (idle + entrate/uscite fluidi).
+        # - idle breathing&sway continuo (bob sin + tilt cos, anchor basso);
+        # - jump (identico): opaco fermo, taglio invisibile;
+        # - punch: zoom smart 0.6s ease_out (mai scatto secco hook);
+        # - morph (continuita'): slide dalla vecchia posizione 0.40s in_out,
+        #   sempre opaco (niente flash di sfondo, niente sparizioni);
+        # - prima apparizione: slide&pop 0.20s +300px back/quad fluidi;
+        # - sparizione (with_text): slide-drop +400px in_cubic + fade 0.16s.
         if char_img is not None and char_base_xy is not None:
+            _char_scale = 1.0
+            _char_layer = char_img
             if char_entry_jump:
-                # Jump-cut istantaneo (punch-in o continuazione identica).
                 edx, edy, entry_opacity = 0, 0, 255
+            elif 'char_punch_active' in dir() and char_punch_active:
+                # Zoom smart: scala+posizione interpolate base->punch con ease.
+                try:
+                    _pp = clamp01((t - chunk_start) / max(0.01, char_punch_dur))
+                except Exception:
+                    _pp = 1.0
+                _pe = ease_out_cubic(_pp)
+                try:
+                    _bx, _by = (char_base_pos if char_base_pos is not None else char_base_xy)
+                    _ex, _ey = int(char_base_xy[0]), int(char_base_xy[1])
+                    # Start posizione: morph da vecchia se presente, else base.
+                    if 'char_morph_from' in dir() and char_morph_from is not None:
+                        _sx, _sy = int(char_morph_from[0]), int(char_morph_from[1])
+                    else:
+                        _sx, _sy = int(_bx), int(_by)
+                    # Fine zoom: posizione punch + fade solo se prima apparizione.
+                    _morph_e = ease_in_out_cubic(_pp)
+                    edx = int(round((_sx - _ex) * (1.0 - _morph_e)))
+                    edy = int(round((_sy - _ey) * (1.0 - _morph_e)))
+                    if char_entry_fade:
+                        entry_opacity = int(round(255 * ease_out_quad(_pp)))
+                    else:
+                        entry_opacity = 255
+                    # Scala: interpola dimensioni base->punch (resize da sorgente).
+                    try:
+                        _bw, _bh = (char_base_img.size if char_base_img is not None else char_img.size)
+                        _pw, _ph = char_img.size
+                        _iw = int(round(_bw + (_pw - _bw) * _pe))
+                        _ih = int(round(_bh + (_ph - _bh) * _pe))
+                        if _pp < 1.0 and _iw > 0 and _ih > 0 and char_original is not None:
+                            try:
+                                _rs = _fast_resample_for_scale(1.0 + (_pe * 0.35))
+                                _char_layer = char_original.resize((_iw, _ih), _rs)
+                                if _char_layer.mode != "RGBA":
+                                    _char_layer = _char_layer.convert("RGBA")
+                            except Exception:
+                                _char_layer = char_img
+                                edx, edy = int(round((_bx - _ex) * (1.0 - _pe))), int(round((_by - _ey) * (1.0 - _pe)))
+                        else:
+                            _char_layer = char_img
+                            edx, edy = (edx, edy) if _pp < 1.0 else (0, 0)
+                    except Exception:
+                        _char_layer = char_img
+                except Exception:
+                    edx, edy, entry_opacity = 0, 0, 255
+                    _char_layer = char_img
+            elif 'char_morph_from' in dir() and char_morph_from is not None:
+                # Morph smart tra posizioni (cambio posa/lato): slide fluida.
+                try:
+                    _mp = clamp01((t - chunk_start) / max(0.01, _CHARACTER_MORPH_DURATION))
+                except Exception:
+                    _mp = 1.0
+                edx, edy = _character_morph_offset(char_morph_from, tuple(char_base_xy), _mp)
+                entry_opacity = 255
             else:
                 entry_prog = clamp01((t - chunk_start) / char_entry_dur)
-                edx, edy, entry_opacity = _character_entry_offset_opacity(
+                edx, edy, entry_opacity, _char_scale = _character_entry_transform(
                     char_transition, char_side, entry_prog,
                     char_img.size[0], char_base_xy[0], char_base_xy[1],
                     full_travel=char_full_travel,
                     fade=char_entry_fade,
                 )
+                if abs(_char_scale - 1.0) >= 1e-3:
+                    # Zoom_in prima apparizione: scala tile 0.92->1.0 fluida.
+                    try:
+                        _zw, _zh = char_img.size
+                        _nw = max(1, int(round(_zw * _char_scale)))
+                        _nh = max(1, int(round(_zh * _char_scale)))
+                        _rs2 = _fast_resample_for_scale(_char_scale)
+                        _scaled = char_img.resize((_nw, _nh), _rs2)
+                        # Centro fisso: ricentra sullo stesso centro base.
+                        _cx = char_base_xy[0] + _zw / 2.0
+                        _cy = char_base_xy[1] + _zh / 2.0
+                        _px = int(round(_cx - _nw / 2.0)) + edx
+                        _py = int(round(_cy - _nh / 2.0)) + edy
+                        _char_layer = _scaled
+                        _zoom_xy = (_px, _py)
+                    except Exception:
+                        _char_layer = char_img
+                        _zoom_xy = None
+                else:
+                    _zoom_xy = None
             if char_exit_mode == _CHAR_EXIT_HOLD:
                 char_opacity, xdx, xdy = entry_opacity, 0, 0
-            elif char_exit_mode == _CHAR_EXIT_SLIDE_DOWN and char_exit_dur > 0 \
-                    and t >= chunk_end - char_exit_dur:
-                xprog = clamp01((t - (chunk_end - char_exit_dur)) / char_exit_dur)
-                xdx, xdy, exit_opacity = _character_exit_offset_opacity(
-                    _CHAR_EXIT_SLIDE_DOWN, xprog, char_base_xy[1], fade=False)
-                char_opacity = min(entry_opacity, exit_opacity)
             else:
-                char_opacity, xdx, xdy = int(round(entry_opacity * exit_factor)), 0, 0
-            _paste_character_frame(
-                frame_img, char_img,
-                char_base_xy[0] + edx + xdx, char_base_xy[1] + edy + xdy,
-                char_opacity,
-            )
+                # Uscita slide-drop (spec ~0.16s, ~5 frame): 0 -> +400px con
+                # ease_in_cubic (accelera verso il basso) + fade quad.
+                if char_exit_dur > 0 and t >= chunk_end - char_exit_dur:
+                    try:
+                        _xp = clamp01((t - (chunk_end - char_exit_dur)) / char_exit_dur)
+                    except Exception:
+                        _xp = 1.0
+                    _char_fade = 1.0 - ease_out_quad(_xp)
+                    char_opacity = int(round(entry_opacity * max(0.0, min(1.0, _char_fade))))
+                    try:
+                        xdy = int(round(_CHARACTER_EXIT_DROP_Y * ease_in_cubic(_xp)))
+                    except Exception:
+                        xdy = 0
+                    xdx = 0
+                else:
+                    char_opacity = entry_opacity
+                    xdx, xdy = 0, 0
+            # Idle breathing & sway (tempo assoluto video: fase continua tra
+            # chunk, niente salti ai tagli). Bob = offset Y, tilt = rotazione
+            # cachata attorno a (w/2, h). Durante zoom attivi (punch/scale)
+            # solo bob (niente tilt su tile temporanee: niente churn cache).
+            try:
+                _idle_dy, _idle_tilt = _idle_bob_tilt(t)
+            except Exception:
+                _idle_dy, _idle_tilt = 0, 0.0
+            try:
+                _scale_active = abs(float(_char_scale if '_char_scale' in dir() else 1.0) - 1.0) >= 1e-3
+            except Exception:
+                _scale_active = False
+            try:
+                _punch_zooming = bool(char_punch_active) and (
+                    (t - chunk_start) < max(0.01, char_punch_dur)) if 'char_punch_active' in dir() else False
+            except Exception:
+                _punch_zooming = False
+            _zooming = bool(_scale_active or _punch_zooming)
+            if _idle_tilt and not _zooming:
+                try:
+                    _char_layer = _get_tilted_char(_char_layer, _idle_tilt)
+                except Exception:
+                    pass
+            if _idle_dy:
+                edy += int(_idle_dy)
+            try:
+                if '_zoom_xy' in dir() and _zoom_xy is not None and '_char_scale' in dir() and abs(_char_scale - 1.0) >= 1e-3:
+                    _paste_character_frame(frame_img, _char_layer, _zoom_xy[0], _zoom_xy[1] + (int(_idle_dy) if _idle_dy else 0), char_opacity)
+                else:
+                    _paste_character_frame(
+                        frame_img, _char_layer,
+                        char_base_xy[0] + edx + xdx, char_base_xy[1] + edy + xdy,
+                        char_opacity,
+                    )
+            except Exception:
+                try:
+                    _paste_character_frame(
+                        frame_img, char_img,
+                        char_base_xy[0] + edx + xdx, char_base_xy[1] + edy + xdy,
+                        char_opacity,
+                    )
+                except Exception:
+                    pass
 
         # Z-index 2.5: pill pre-renderizzata (composite unico, no ricalcolo).
         if _pill_overlay is not None:
@@ -1679,22 +2437,40 @@ def generate_animated_chunk_frames(
         for wi, w in enumerate(words):
             if t < word_starts[wi]:
                 continue  # non ancora iniziata
-            local = _clamp01((t - word_starts[wi]) / entry_dur)
-            if w["is_keyword"]:
+            # Tier T0-T3 per-parola (durate dedicate pre-calcolate fuori loop).
+            try:
+                _cur_entry = _entry_per_word[wi]
+            except (IndexError, TypeError):
+                _cur_entry = entry_dur
+            if _cur_entry <= 0:
+                _cur_entry = 0.01
+            local = _clamp01((t - word_starts[wi]) / _cur_entry)
+            try:
+                _style_w, _hero_w, _num_w = _tiers[wi]
+            except (IndexError, TypeError, ValueError):
+                _style_w, _hero_w, _num_w = ("impact" if w.get("is_keyword") else "base", False, False)
+            try:
+                _sfrom_w = _scale_per_word[wi]
+            except (IndexError, TypeError):
+                _sfrom_w = scale_from
+            _dy = 0
+            if _style_w == "impact":
+                # T2 pop standard / T3 hero (durata+scala dedicate) / T3-num
+                # (pop corto per cifre, mai hero). Overshoot scala non clampato
+                # (effetto pop), opacita' sempre saturata a 255.
                 eased = _ease_out_back(local)
-                # Opacita': clamp 0-255 (l'overshoot >1 va saturato).
                 if eased >= 1.0:
                     opacity = 255
                 elif eased <= 0.0:
                     continue
                 else:
                     opacity = int(round(255 * eased))
-                scale = scale_from + (1.0 - scale_from) * eased
-                # Evita scale degeneri a inizio animazione.
+                scale = _sfrom_w + (1.0 - _sfrom_w) * eased
                 if scale < 0.05:
                     scale = 0.05
-            else:
-                # Fast-path: entrata completata -> opaco, scala 1 (disegno diretto).
+            elif _style_w == "accent" and use_typography:
+                # T1 rise-fade: opacita' cubic + risalita lift->0, MAI scala
+                # (handwritten non deformato). Completata -> draw diretto.
                 if local >= 1.0:
                     opacity, scale = 255, 1.0
                 elif local <= 0.0:
@@ -1703,23 +2479,51 @@ def generate_animated_chunk_frames(
                     eased = _ease_out_cubic(local)
                     opacity = int(round(255 * eased))
                     scale = 1.0
-            if exit_factor < 1.0:
-                opacity = int(round(opacity * exit_factor))
+                    if _accent_lift_i > 0:
+                        try:
+                            _dy = int(round(_accent_lift_i * (1.0 - _ease_out_quad(local))))
+                        except Exception:
+                            _dy = int(round(_accent_lift_i * (1.0 - eased)))
+            else:
+                # T0 base fade (fast-path a entrata completata).
+                if local >= 1.0:
+                    opacity, scale = 255, 1.0
+                elif local <= 0.0:
+                    continue
+                else:
+                    eased = _ease_out_cubic(local)
+                    opacity = int(round(255 * eased))
+                    scale = 1.0
+            # Uscita: gruppo per tutti, hero ritardato di ~2 frame (T3).
+            try:
+                if _hero_w and exit_factor < 1.0:
+                    _ef = _hero_exit_factor(t, chunk_end, exit_dur, exit_factor)
+                    opacity = int(round(opacity * _ef))
+                elif exit_factor < 1.0:
+                    opacity = int(round(opacity * exit_factor))
+            except Exception:
+                if exit_factor < 1.0:
+                    opacity = int(round(opacity * exit_factor))
             if opacity <= 0:
                 continue
             item = layout[wi]
+            _ry = item["y"] + _dy if _dy else item["y"]
             if use_typography:
                 wfont = _word_fonts[wi]
+                if _base_synth and _style_w == "base":
+                    _sw, _sc = _BASE_SYNTHETIC_STROKE_WIDTH, fills[wi]
+                else:
+                    _sw, _sc = typo_stroke_width, typo_stroke_color
                 _render_styled_scaled_word(
-                    frame_img, w["word"], item["x"], item["y"],
+                    frame_img, w["word"], item["x"], _ry,
                     item["width"], item["height"], wfont,
-                    fills[wi], typo_stroke_color, typo_stroke_width,
+                    fills[wi], _sc, _sw,
                     _shadow_off, _shadow_fill,
                     opacity=opacity, scale=scale,
                 )
             else:
                 _render_scaled_word(
-                    frame_img, w["word"], item["x"], item["y"],
+                    frame_img, w["word"], item["x"], _ry,
                     item["width"], item["height"], _word_fonts[wi],
                     fills[wi], SUBTITLE_STROKE_COLOR, SUBTITLE_STROKE_WIDTH,
                     opacity=opacity, scale=scale,
@@ -1731,6 +2535,35 @@ def generate_animated_chunk_frames(
         # (file temp piu' grandi, cancellati a fine job; nessun impatto visivo).
         frame_img.save(fpath, compress_level=1)
         frames.append({"image_path": fpath, "start": t, "end": frame_end})
+
+    # --- Persistenza nel gap (fix blink): clona ultimo frame oltre chunk.end.
+    # L'ultimo frame con hold ha character opaco + testo gia' svanito (exit
+    # fade completato): clonarlo copre la pausa TTS senza sparizioni.
+    # Per la CTA card intermedia l'ultimo frame ha card piena: clonarlo tiene
+    # la card persistente. Mai eccezioni (tail best-effort).
+    if _tail_hold > 0.001 and frames:
+        try:
+            import shutil as _shutil
+            _extra_n = max(1, int(round(_tail_hold * float(fps))))
+            # Cap di sicurezza: max 2s di tail (evita esplosione frame su gap anomali).
+            _extra_n = min(_extra_n, max(1, int(round(2.0 * float(fps)))))
+            _last = frames[-1]
+            _last_path = _last.get("image_path", "")
+            _tail_start = float(chunk_end)
+            _step = 1.0 / float(fps)
+            for _k in range(_extra_n):
+                _fi2 = num_frames + _k
+                _t2 = _tail_start + _k * _step
+                _e2 = _t2 + _step
+                _fname2 = f"chunk_{chunk_index:04d}_frame_{_fi2:05d}.png"
+                _fpath2 = os.path.join(output_dir, _fname2)
+                try:
+                    _shutil.copyfile(_last_path, _fpath2)
+                except Exception:
+                    break
+                frames.append({"image_path": _fpath2, "start": _t2, "end": _e2})
+        except Exception:
+            pass
 
     return frames
 
@@ -1797,7 +2630,7 @@ def generate_cta_card_frames(
     except Exception:
         uppercase_impact = True
 
-    section: list[dict] = []  # {word,display,style,start,end,is_keyword}
+    section: list[dict] = []  # {word,display,style,start,end,is_keyword,is_hero,is_number}
     if use_typography and typo_preset is not None:
         for ch in cta_chunks:
             for s in (ch.get("styled_words") or []):
@@ -1806,13 +2639,18 @@ def generate_cta_card_frames(
                 style = s.get("style", "base")
                 if style not in ("base", "impact", "accent"):
                     style = "base"
+                _wstr = str(s.get("word", ""))
+                _is_num = bool(s.get("is_number", False)) or _has_digit_fast(_wstr)
+                _is_hero = bool(s.get("is_hero", False)) and style == "impact" and not _is_num
                 section.append({
-                    "word": str(s.get("word", "")),
-                    "display": str(s.get("display") or s.get("word", "")),
+                    "word": _wstr,
+                    "display": str(s.get("display") or _wstr),
                     "style": style,
                     "start": float(s.get("start", 0.0)),
                     "end": float(s.get("end", 0.0)),
                     "is_keyword": style == "impact",
+                    "is_hero": _is_hero,
+                    "is_number": _is_num,
                 })
     else:
         use_typography = False
@@ -1826,6 +2664,8 @@ def generate_cta_card_frames(
                     "start": float(w.get("start", 0.0)),
                     "end": float(w.get("end", 0.0)),
                     "is_keyword": bool(w.get("is_keyword", False)),
+                    "is_hero": False,
+                    "is_number": _has_digit_fast(str(w.get("word", ""))),
                 })
     if not section:
         return [[] for _ in cta_chunks]
@@ -1851,6 +2691,21 @@ def generate_cta_card_frames(
             font_scale = 1.0
     else:
         area, font_scale = None, 1.0
+    # Guard real-time anche sulla CTA card (primo chunk della sezione).
+    try:
+        if explicit_box is None and isinstance(cta_chunks[0], dict):
+            _gsa0 = cta_chunks[0].get("guard_safe_area")
+            if _gsa0 is not None:
+                _gb0 = (int(_gsa0[0]), int(_gsa0[1]), int(_gsa0[2]), int(_gsa0[3]))
+                if _gb0[2] > _gb0[0] and _gb0[3] > _gb0[1]:
+                    area = _gb0
+            _gfs0 = cta_chunks[0].get("guard_font_scale")
+            if _gfs0 is not None:
+                _gf0 = float(_gfs0)
+                if 0.5 <= _gf0 <= 1.5:
+                    font_scale = _gf0
+    except Exception:
+        pass
     needs_pill = True  # la card è un badge intenzionale, sempre ancorato
     card_scale = 0.92  # la card contiene più parole: leggermente più compatta
 
@@ -1884,27 +2739,73 @@ def generate_cta_card_frames(
                  for s in section]
         typo_fonts = None
 
-    entry_dur = max(0.01, float(TEXT_ANIMATION_ENTRY_DURATION))
+    # Come nel path normale: base statico -> grassetto sintetico leggero.
+    try:
+        _cta_synth = bool(use_typography and isinstance(typo_fonts, dict)
+                          and not typo_fonts.get("base_weight_applied", False))
+    except Exception:
+        _cta_synth = False
+
+    # Tier T0-T3 anche sulla card (stessi default del path normale).
     try:
         last_exit = max(0.0, float(TEXT_ANIMATION_EXIT_DURATION))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, NameError):
         last_exit = 0.15
     try:
-        scale_from = float(KEYWORD_ENTRY_SCALE_FROM)
-        if not (0.1 <= scale_from <= 1.0):
-            scale_from = 0.7
-    except (TypeError, ValueError):
-        scale_from = 0.7
+        entry_dur, scale_from, accent_lift, hero_dur, hero_from, number_dur = (
+            _resolve_motion_params(typo_preset if use_typography else None, cta_chunks[0] if cta_chunks else None)
+        )
+    except Exception:
+        entry_dur, scale_from = 0.18, 0.7
+        accent_lift, hero_dur, hero_from, number_dur = 10.0, 0.22, 0.6, 0.15
+    # CTA card: nessun hook mult (card stabile); scala da preset nicchia.
+    # Se il primo chunk CTA porta anim_pop_from esplicito, _resolve lo ha gia'
+    # applicato: qui lo neutralizziamo solo se e' un hook residue (mai in CTA).
+    try:
+        _cta_tiers = [_word_tier(w) for w in section]
+        _cta_entry = [
+            (hero_dur if _h else (number_dur if (_s == "impact" and _n) else entry_dur))
+            for (_s, _h, _n) in _cta_tiers
+        ]
+        _cta_scale = [
+            (hero_from if _h else scale_from) if _s == "impact" else 1.0
+            for (_s, _h, _n) in _cta_tiers
+        ]
+    except Exception:
+        _cta_tiers = [("base", False, False)] * len(section)
+        _cta_entry = [entry_dur] * len(section)
+        _cta_scale = [1.0] * len(section)
+    try:
+        _cta_lift_i = int(round(accent_lift))
+    except Exception:
+        _cta_lift_i = 10
 
-    # --- Personaggio bloccato (layer unico per tutta la card) ---
+    # --- Personaggio bloccato (layer unico per tutta la card, entrata fluida) ---
     char_img, char_base_xy = _load_chunk_character_layer(first_info)
     if char_img is not None and char_base_xy is not None and first_info is not None:
         char_transition = first_info.get("transition_in", "fade") or "fade"
         char_side = _character_side(first_info)
         char_full_travel = bool(use_preset)
-        char_entry_dur = max(0.01, _CHARACTER_ZONE_ENTRY_DURATION if use_preset else _CHARACTER_ENTRY_DURATION)
+        try:
+            _cs0 = chunk_states[0] if chunk_states else {}
+            _first_fade = bool(_cs0.get("char_entry_fade", True))
+        except Exception:
+            _first_fade = True
+        if _first_fade:
+            char_entry_dur = max(0.01, _CHARACTER_ZONE_FIRST_DURATION if use_preset else _CHARACTER_ENTRY_DURATION)
+        else:
+            char_entry_dur = max(0.01, _CHARACTER_MORPH_DURATION if use_preset else _CHARACTER_ENTRY_DURATION)
+        try:
+            _cta_morph_from = (_cs0.get("char_entry_from_xy") if isinstance(_cs0, dict) else None)
+            if _cta_morph_from is not None:
+                _cta_morph_from = (int(_cta_morph_from[0]), int(_cta_morph_from[1]))
+                if _cta_morph_from == (int(char_base_xy[0]), int(char_base_xy[1])):
+                    _cta_morph_from = None
+        except (TypeError, ValueError, IndexError):
+            _cta_morph_from = None
     else:
         char_base_xy = None
+        _cta_morph_from = None
     try:
         char_exit_dur = max(0.0, float(_CHARACTER_ZONE_EXIT_DURATION))
     except (TypeError, ValueError):
@@ -1934,6 +2835,7 @@ def generate_cta_card_frames(
         _cta_fonts = [font if 'font' in dir() else typo_fonts.get("base")] * len(section)
     _cta_ease_back = ease_out_back
     _cta_ease_cubic = ease_out_cubic
+    _cta_ease_quad = ease_out_quad
     _cta_clamp = clamp01
     per_chunk_frames: list[list[dict]] = []
     for k, ch in enumerate(cta_chunks):
@@ -1970,26 +2872,72 @@ def generate_cta_card_frames(
                 exit_factor = 1.0
             frame_img = Image.new("RGBA", (VIDEO_WIDTH, VIDEO_HEIGHT), (0, 0, 0, 0))
             if char_img is not None and char_base_xy is not None:
+                _cta_scale = 1.0
+                _cta_layer = char_img
                 if entry_jump:
                     edx, edy, entry_opacity = 0, 0, 255
+                elif k == 0 and '_cta_morph_from' in dir() and _cta_morph_from is not None and not entry_fade:
+                    # Handoff fluido corpo->CTA: morph dalla vecchia posizione.
+                    try:
+                        _mp0 = clamp01((t - cs) / max(0.01, _CHARACTER_MORPH_DURATION))
+                    except Exception:
+                        _mp0 = 1.0
+                    edx, edy = _character_morph_offset(_cta_morph_from, tuple(char_base_xy), _mp0)
+                    entry_opacity = 255
                 else:
                     entry_prog = clamp01((t - cs) / char_entry_dur)
-                    edx, edy, entry_opacity = _character_entry_offset_opacity(
+                    edx, edy, entry_opacity, _cta_scale = _character_entry_transform(
                         char_transition, char_side, entry_prog,
                         char_img.size[0], char_base_xy[0], char_base_xy[1],
                         full_travel=char_full_travel, fade=entry_fade)
-                if exit_mode == _CHAR_EXIT_HOLD:
+                    if abs(_cta_scale - 1.0) >= 1e-3:
+                        try:
+                            _zw, _zh = char_img.size
+                            _nw = max(1, int(round(_zw * _cta_scale)))
+                            _nh = max(1, int(round(_zh * _cta_scale)))
+                            _cta_layer = char_img.resize((_nw, _nh), _fast_resample_for_scale(_cta_scale))
+                            _ccx = char_base_xy[0] + _zw / 2.0
+                            _ccy = char_base_xy[1] + _zh / 2.0
+                            edx = int(round(_ccx - _nw / 2.0)) - int(char_base_xy[0])
+                            edy = int(round(_ccy - _nh / 2.0)) - int(char_base_xy[1])
+                        except Exception:
+                            _cta_layer = char_img
+                if exit_mode == _CHAR_EXIT_HOLD or exit_mode == _CHAR_EXIT_SLIDE_DOWN:
                     cop, xdx, xdy = entry_opacity, 0, 0
-                elif exit_mode == _CHAR_EXIT_SLIDE_DOWN and char_exit_dur > 0 \
-                        and t >= ce - char_exit_dur:
-                    xp = clamp01((t - (ce - char_exit_dur)) / char_exit_dur)
-                    xdx, xdy, xop = _character_exit_offset_opacity(
-                        _CHAR_EXIT_SLIDE_DOWN, xp, char_base_xy[1], fade=False)
-                    cop = min(entry_opacity, xop)
                 else:
-                    cop, xdx, xdy = int(round(entry_opacity * exit_factor)), 0, 0
+                    # Uscita slide-drop CTA finale (~0.16s): +400px in_cubic + fade.
+                    if char_exit_dur > 0 and t >= ce - char_exit_dur:
+                        try:
+                            _xp = clamp01((t - (ce - char_exit_dur)) / char_exit_dur)
+                        except Exception:
+                            _xp = 1.0
+                        cop = int(round(entry_opacity * max(0.0, min(1.0, 1.0 - ease_out_quad(_xp)))))
+                        try:
+                            xdy = int(round(_CHARACTER_EXIT_DROP_Y * ease_in_cubic(_xp)))
+                        except Exception:
+                            xdy = 0
+                        xdx = 0
+                    else:
+                        cop = entry_opacity
+                        xdx, xdy = 0, 0
+                # Idle anche sulla card (stessa fase assoluta, continuita').
+                try:
+                    _c_dy, _c_tilt = _idle_bob_tilt(t)
+                except Exception:
+                    _c_dy, _c_tilt = 0, 0.0
+                try:
+                    _c_zooming = abs(float(_cta_scale) - 1.0) >= 1e-3
+                except Exception:
+                    _c_zooming = False
+                if _c_tilt and not _c_zooming:
+                    try:
+                        _cta_layer = _get_tilted_char(_cta_layer, _c_tilt)
+                    except Exception:
+                        pass
+                if _c_dy:
+                    edy += int(_c_dy)
                 _paste_character_frame(
-                    frame_img, char_img,
+                    frame_img, _cta_layer,
                     char_base_xy[0] + edx + xdx, char_base_xy[1] + edy + xdy, cop)
             if _cta_pill is not None:
                 try:
@@ -2001,16 +2949,47 @@ def generate_cta_card_frames(
             for wi, w in enumerate(section):
                 if t < w["start"]:
                     continue  # parola futura: nascosta (reveal karaoke)
-                local = _cta_clamp((t - w["start"]) / entry_dur)
-                if w["is_keyword"]:
+                try:
+                    _ced = _cta_entry[wi]
+                except (IndexError, TypeError):
+                    _ced = entry_dur
+                if _ced <= 0:
+                    _ced = 0.01
+                local = _cta_clamp((t - w["start"]) / _ced)
+                try:
+                    _cs, _ch, _cn = _cta_tiers[wi]
+                except (IndexError, TypeError, ValueError):
+                    _cs, _ch, _cn = ("impact" if w.get("is_keyword") else "base", bool(w.get("is_hero", False)), False)
+                try:
+                    _csf = _cta_scale[wi]
+                except (IndexError, TypeError):
+                    _csf = scale_from
+                _cdy = 0
+                if _cs == "impact":
                     if local >= 1.0:
+                        # Nota: eased>=1 qui significa entrata finita (scale 1);
+                        # l'overshoot >1 vive solo dentro local<1 (vedi sotto).
                         opacity, scale = 255, 1.0
                     elif local <= 0.0:
                         continue
                     else:
                         eased = _cta_ease_back(local)
                         opacity = int(round(255 * min(1.0, max(0.0, eased))))
-                        scale = max(0.05, scale_from + (1.0 - scale_from) * eased)
+                        scale = max(0.05, _csf + (1.0 - _csf) * eased)
+                elif _cs == "accent" and use_typography:
+                    if local >= 1.0:
+                        opacity, scale = 255, 1.0
+                    elif local <= 0.0:
+                        continue
+                    else:
+                        eased = _cta_ease_cubic(local)
+                        opacity = int(round(255 * eased))
+                        scale = 1.0
+                        if _cta_lift_i > 0:
+                            try:
+                                _cdy = int(round(_cta_lift_i * (1.0 - _cta_ease_quad(local))))
+                            except Exception:
+                                _cdy = int(round(_cta_lift_i * (1.0 - eased)))
                 else:
                     if local >= 1.0:
                         opacity, scale = 255, 1.0
@@ -2019,21 +2998,33 @@ def generate_cta_card_frames(
                     else:
                         opacity = int(round(255 * _cta_ease_cubic(local)))
                         scale = 1.0
-                if exit_factor < 1.0:
-                    opacity = int(round(opacity * exit_factor))
+                try:
+                    if _ch and exit_factor < 1.0:
+                        _ef = _hero_exit_factor(t, ce, exit_dur, exit_factor)
+                        opacity = int(round(opacity * _ef))
+                    elif exit_factor < 1.0:
+                        opacity = int(round(opacity * exit_factor))
+                except Exception:
+                    if exit_factor < 1.0:
+                        opacity = int(round(opacity * exit_factor))
                 if opacity <= 0:
                     continue
                 item = layout[wi]
+                _cy = item["y"] + _cdy if _cdy else item["y"]
                 if use_typography:
                     wfont = _cta_fonts[wi]
+                    if _cta_synth and _cs == "base":
+                        _csw, _csc = _BASE_SYNTHETIC_STROKE_WIDTH, fills[wi]
+                    else:
+                        _csw, _csc = stroke_width, stroke_color
                     _render_styled_scaled_word(
-                        frame_img, w["display"], item["x"], item["y"],
+                        frame_img, w["display"], item["x"], _cy,
                         item["width"], item["height"], wfont,
-                        fills[wi], stroke_color, stroke_width,
+                        fills[wi], _csc, _csw,
                         shadow_off, shadow_fill, opacity=opacity, scale=scale)
                 else:
                     _render_scaled_word(
-                        frame_img, w["word"], item["x"], item["y"],
+                        frame_img, w["word"], item["x"], _cy,
                         item["width"], item["height"], _cta_fonts[wi],
                         fills[wi], SUBTITLE_STROKE_COLOR, SUBTITLE_STROKE_WIDTH,
                         opacity=opacity, scale=scale)
@@ -2041,6 +3032,29 @@ def generate_cta_card_frames(
             fpath = os.path.join(output_dir, fname)
             frame_img.save(fpath, compress_level=1)
             frames.append({"image_path": fpath, "start": t, "end": frame_end})
+        # Tail persistenza gap anche per la card (intermedi: card piena).
+        try:
+            _st_k = chunk_states[k] if k < len(chunk_states) else {}
+            _tail_k = float((_st_k or {}).get("char_tail", 0.0) or 0.0)
+        except Exception:
+            _tail_k = 0.0
+        if _tail_k > 0.001 and frames and not (k == len(cta_chunks) - 1):
+            try:
+                import shutil as _sh2
+                _n2 = min(max(1, int(round(_tail_k * float(fps)))), max(1, int(round(2.0 * float(fps)))))
+                _lp = frames[-1].get("image_path", "")
+                for _kk in range(_n2):
+                    _fi2 = num_frames + _kk
+                    _t2 = ce + _kk * step
+                    _fn2 = f"chunk_{start_index + k:04d}_frame_{_fi2:05d}.png"
+                    _fp2 = os.path.join(output_dir, _fn2)
+                    try:
+                        _sh2.copyfile(_lp, _fp2)
+                    except Exception:
+                        break
+                    frames.append({"image_path": _fp2, "start": _t2, "end": _t2 + step})
+            except Exception:
+                pass
         per_chunk_frames.append(frames)
     return per_chunk_frames
 
@@ -2076,24 +3090,46 @@ def render_all_chunks_animated(
         typography_niche: nicchia esplicita (override per tutti i chunk senza niche propria).
         typography_preset: preset dict esplicito (da core/typography_presets.get_preset).
 
-    Il lookahead sul chunk successivo decide l'uscita del personaggio
-    (vedi `decide_char_exit_mode`): sparizione solo se il personaggio deve
-    chiaramente scomparire, altrimenti hold/slide_down a piena visibilita'.
-    Il lookbehind sul chunk precedente decide l'entrata: dissolvenza solo
-    alla prima apparizione, slide a piena opacita' nei cambi, jump-cut
-    istantaneo per punch-in e continuazioni identiche (taglio invisibile).
-    Risultato: il personaggio resta stabile finche' non deve scomparire.
+    Il lookahead sul chunk successivo decide l'uscita (hold quando il dopo ha
+    un character, slide-drop+fade 0.16s solo in sparizione); il lookbehind
+    decide l'entrata (slide&pop 0.20s +300px alla prima apparizione, morph
+    smart 0.40s dalla vecchia posizione nei cambi, jump solo a identita'
+    pixel-identica, zoom fluido 0.6s per il punch hook mai secco). Idle
+    breathing/sway continuo sopra ogni frame visibile. I gap TTS sono coperti
+    da tail di persistenza (hold) per fix blink. Ritmo coerente e dinamico.
 
     Returns:
         Lista di chunk arricchiti: {**chunk, "frames": [...], "frame_paths": [...],
-        "clip_start": start, "clip_end": end}.
+        "clip_start": start, "clip_end": end (+tail), "clip_tail": secondi}.
     """
     import os as _os
     _parallel_ok = _os.environ.get("RENDER_PARALLEL", "1").strip().lower() not in ("0", "false", "no", "off", "")
+    try:
+        _gap_hold_ok = str(_os.environ.get("CHARACTER_GAP_HOLD_ENABLED", "1")).strip().lower() not in ("0", "false", "no", "off", "")
+    except Exception:
+        _gap_hold_ok = True
+    try:
+        _gap_hold_max = max(0.0, float(CHARACTER_GAP_HOLD_MAX))
+    except Exception:
+        _gap_hold_max = 1.5
+    if not (_gap_hold_max > 0):
+        _gap_hold_max = 1.5
     enriched_all: list[dict] = []
     total = len(chunks)
+    # Pre-carica posizioni base character per morph (cached, veloce).
+    _base_xy_cache: dict[int, tuple[int, int] | None] = {}
+    for _ci in range(total):
+        try:
+            _inf = _character_info_from_chunk(chunks[_ci])
+            if _inf is None:
+                _base_xy_cache[_ci] = None
+            else:
+                _img, _xy = _load_chunk_character_layer(_inf)
+                _base_xy_cache[_ci] = (int(_xy[0]), int(_xy[1])) if _xy is not None else None
+        except Exception:
+            _base_xy_cache[_ci] = None
     # Stati personaggio per chunk (lookahead/lookbehind), calcolati una volta:
-    # servono sia al path normale sia alla CTA card (stessa stabilita').
+    # servono sia al path normale sia alla CTA card (stessa fluidita').
     states: list[dict] = []
     for i, chunk in enumerate(chunks):
         nxt = chunks[i + 1] if i + 1 < total else None
@@ -2105,22 +3141,62 @@ def render_all_chunks_animated(
         except Exception:
             cur_info, prev_info = None, None
         try:
-            # Stesso identico personaggio del chunk prima: taglio invisibile
-            # (niente replay dell'entrata: resterebbe un blink a ogni stacco).
-            same_as_prev = (
-                cur_info is not None and prev_info is not None
-                and _character_identity(cur_info) == _character_identity(prev_info)
-            )
-            entry_jump = bool(same_as_prev or decide_char_entry_jump(prev, chunk))
-            # Dissolvenza in entrata SOLO alla prima apparizione: se il
-            # personaggio era gia' visibile, entra a piena opacita'.
+            # Taglio invisibile SOLO a identita' pixel-identica (stessa
+            # posa+zona+punch): nessun replay (replay = blink a ogni stacco).
+            # Cambio posa/lato/punch -> morph/zoom fluido, MAI jump secco.
+            entry_jump = bool(decide_char_entry_jump(prev, chunk))
+            # Dissolvenza SOLO alla prima apparizione; morph opachi dopo.
             entry_fade = prev_info is None
         except Exception:
             entry_jump, entry_fade = False, True
+        # Macro-blocchi (Breath & Focus): l'evento guida entrata/uscita.
+        # ENTRY = slide-in pulito; SUSTAIN/EXIT (non-primi) = hold invisibile
+        # (stessa posa/lato ancorati nel blocco, nessun replay); NONE/hidden
+        # = nessun layer. Tra blocchi visibili diversi il morph parte dalla
+        # posizione precedente (switch diretto, mai fade out/in).
+        try:
+            _ev = _character_event_of(chunk)
+            if cur_info is None or _ev == "NONE":
+                entry_jump, entry_fade = True, False
+            elif _ev == "ENTRY":
+                # Riapparizione dopo gap -> slide-in con fade; se il chunk
+                # prima aveva gia' un character (blocchi visibili adiacenti),
+                # switch diretto senza fade (morph dalla vecchia posizione).
+                if prev_info is None:
+                    entry_jump, entry_fade = False, True
+                else:
+                    entry_jump, entry_fade = False, False
+            elif _ev in ("SUSTAIN", "EXIT"):
+                entry_jump, entry_fade = True, False
+        except Exception:
+            pass
+        # Morph smart: posizione precedente per slide continua (niente flash).
+        try:
+            from_xy = None
+            if not entry_jump and not entry_fade and cur_info is not None and prev_info is not None:
+                from_xy = _base_xy_cache.get(i - 1)
+        except Exception:
+            from_xy = None
+        # Tail persistenza gap: hold -> copre la pausa fino al chunk dopo.
+        try:
+            tail = 0.0
+            if _gap_hold_ok and exit_mode == _CHAR_EXIT_HOLD and cur_info is not None and nxt is not None:
+                try:
+                    _end = float(chunk.get("end", 0.0))
+                    _nxt_start = float(nxt.get("start", _end))
+                except (TypeError, ValueError):
+                    _end, _nxt_start = 0.0, 0.0
+                _gap = _nxt_start - _end
+                if _gap > 1.0 / max(1, int(fps or VIDEO_FPS)) + 1e-6:
+                    tail = min(max(0.0, _gap), _gap_hold_max)
+        except Exception:
+            tail = 0.0
         states.append({
             "char_exit_mode": exit_mode,
             "char_entry_jump": entry_jump,
             "char_entry_fade": entry_fade,
+            "char_entry_from_xy": from_xy,
+            "char_tail": float(tail or 0.0),
         })
     # Separa run CTA (sequenziali, condividono layout) da chunk normali (paralleli).
     cta_runs: list[list[int]] = []
@@ -2194,6 +3270,8 @@ def render_all_chunks_animated(
                     text_safe_area=text_safe_area, char_entry_jump=st["char_entry_jump"],
                     char_entry_fade=st["char_entry_fade"],
                     typography_niche=typography_niche, typography_preset=typography_preset,
+                    char_entry_from_xy=st.get("char_entry_from_xy"),
+                    tail_hold_duration=float(st.get("char_tail", 0.0) or 0.0),
                 )
             with _fut.ThreadPoolExecutor(max_workers=_workers) as _ex:
                 _future_map = {_ex.submit(_render_one, k): k for k in normal_idx}
@@ -2215,6 +3293,8 @@ def render_all_chunks_animated(
                     text_safe_area=text_safe_area, char_entry_jump=st["char_entry_jump"],
                     char_entry_fade=st["char_entry_fade"],
                     typography_niche=typography_niche, typography_preset=typography_preset,
+                    char_entry_from_xy=st.get("char_entry_from_xy"),
+                    tail_hold_duration=float(st.get("char_tail", 0.0) or 0.0),
                 )
                 if on_chunk is not None:
                     try:
@@ -2223,12 +3303,21 @@ def render_all_chunks_animated(
                         pass
     for k in range(total):
         frames = cta_results.get(k, normal_results.get(k, []))
+        try:
+            _tail_k = float((states[k] or {}).get("char_tail", 0.0) or 0.0)
+        except Exception:
+            _tail_k = 0.0
+        try:
+            _end_k = float(chunks[k].get("end", chunks[k].get("start", 0.0)))
+        except (TypeError, ValueError):
+            _end_k = 0.0
         enriched_all.append({
             **chunks[k],
             "frames": frames,
             "frame_paths": [f["image_path"] for f in frames],
             "clip_start": chunks[k].get("start"),
-            "clip_end": chunks[k].get("end"),
+            "clip_end": (_end_k + _tail_k) if _tail_k > 0 else chunks[k].get("end"),
+            "clip_tail": _tail_k,
         })
     # Ordina callback finale per GUI coerente (i paralleli arrivano fuori ordine).
     return enriched_all

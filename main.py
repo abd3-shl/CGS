@@ -521,6 +521,20 @@ class VideoGeneratorApp:
             except Exception:
                 pass
 
+        self._log(f"{tag}[6.8/8] Layout guard real-time (anti-overlap personaggio/testo)...")
+        try:
+            from core.layout_guard import build_realtime_plan, apply_realtime_plans
+            _plans, _summary = build_realtime_plan(chunks)
+            chunks = apply_realtime_plans(chunks, _plans)
+            self._log(
+                f"      Guard: {_summary.get('guaranteed', 0)}/{_summary.get('total', 0)} garantiti, "
+                f"{_summary.get('fixed', 0)} corretti, "
+                f"{_summary.get('hidden', 0)} senza personaggio, "
+                f"{_summary.get('intentional', 0)} punch-in intenzionali."
+            )
+        except Exception as e_guard:
+            self._log(f"      ⚠️ Layout guard saltato ({e_guard}), rendering senza correzioni.")
+
         self._log(f"{tag}[7/8] Rendering sottotitoli animati per-parola (Pillow+easing)...")
         if TEXT_ANIMATION_ENABLED:
             try:

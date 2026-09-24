@@ -487,8 +487,9 @@ def _resolve_safe_area(
 ) -> tuple[tuple[int, int, int, int] | None, bool, float]:
     """Safe area effettiva + flag pill + scala font per il testo.
 
-    Precedenza: `text_safe_area` > `safe_area` > preset del character >
-    None (centro schermo storico). Ritorna (area_o_None, needs_pill, font_scale).
+    Precedenza: `text_safe_area` > `safe_area` > guard per-chunk >
+    preset del character > None (centro schermo storico).
+    Ritorna (area_o_None, needs_pill, font_scale).
     """
     for explicit in (text_safe_area, safe_area):
         if explicit is not None:
@@ -506,9 +507,26 @@ def _resolve_safe_area(
             info = None
         if info is not None and info["use_preset"]:
             preset = info["layout"]
-            return (preset_safe_area(preset, VIDEO_WIDTH, VIDEO_HEIGHT),
-                    preset_needs_text_background(preset),
-                    preset_font_scale(preset))
+            area = preset_safe_area(preset, VIDEO_WIDTH, VIDEO_HEIGHT)
+            pill = preset_needs_text_background(preset)
+            fscale = preset_font_scale(preset)
+            # Guard real-time (core/layout_guard.py): override per-chunk.
+            try:
+                _gsa = character.get("guard_safe_area")
+                if _gsa is not None:
+                    _gb = (int(_gsa[0]), int(_gsa[1]), int(_gsa[2]), int(_gsa[3]))
+                    if _gb[2] > _gb[0] and _gb[3] > _gb[1]:
+                        area = _gb
+                _gfs = character.get("guard_font_scale")
+                if _gfs is not None:
+                    _gf = float(_gfs)
+                    if 0.5 <= _gf <= 1.5:
+                        fscale = _gf
+                if character.get("guard_pill"):
+                    pill = True
+            except Exception:
+                pass
+            return area, pill, fscale
     return None, False, 1.0
 
 
@@ -531,6 +549,13 @@ def _character_info_from_chunk(chunk: dict) -> dict | None:
         info["punch_in"] = chunk.get("punch_in")
     if chunk.get("transition_in") is not None:
         info["transition_in"] = chunk.get("transition_in")
+    # Guard real-time (core/layout_guard.py): propagati al render.
+    if chunk.get("guard_safe_area") is not None:
+        info["guard_safe_area"] = chunk.get("guard_safe_area")
+    if chunk.get("guard_font_scale") is not None:
+        info["guard_font_scale"] = chunk.get("guard_font_scale")
+    if chunk.get("guard_pill") is not None:
+        info["guard_pill"] = chunk.get("guard_pill")
     return info
 
 

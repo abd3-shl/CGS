@@ -13,6 +13,13 @@ Leggibilità garantita da contrasto tema + pill sul punch-in (vedi config.py).
 Uso:
     from core.typography_presets import get_preset, VALID_NICHES, FALLBACK_NICHE
     preset = get_preset("tech_ai")
+
+Animazioni (Tier T0-T3, vedi core/text_animator.py):
+  ogni preset espone "anim": {"pop_from": float} = scala iniziale del pop
+  impact T2 (0.6 aggressivo .. 0.8 soft). L'hook override narrativo
+  (anim_pop_from sul chunk) vince sempre sul preset; il preset vince sul
+  default globale KEYWORD_ENTRY_SCALE_FROM. Accent T1 non scala mai
+  (rise senza deformare handwritten), hero T3 usa HERO_SCALE_FROM da config.
 """
 
 # Nicchia di fallback quando il rilevamento LLM è incerto o fallisce.
@@ -58,6 +65,7 @@ TYPOGRAPHY_PRESETS: dict[str, dict] = {
         "stroke_width": 0,  # nessun contorno: look pulito
         "shadow": {"offset": (0, 0), "fill": (0, 0, 0, 0)},
         "impact_uppercase": True,
+        "anim": {"pop_from": 0.70},  # standard leggibile (dati/finanza)
     },
     "tech_ai": {
         "fonts": {
@@ -79,6 +87,7 @@ TYPOGRAPHY_PRESETS: dict[str, dict] = {
         "stroke_width": 0,
         "shadow": {"offset": (0, 0), "fill": (0, 0, 0, 0)},
         "impact_uppercase": True,
+        "anim": {"pop_from": 0.70},  # standard leggibile (dati/tech)
     },
     "fitness_sport": {
         "fonts": {
@@ -100,6 +109,7 @@ TYPOGRAPHY_PRESETS: dict[str, dict] = {
         "stroke_width": 0,
         "shadow": {"offset": (0, 0), "fill": (0, 0, 0, 0)},
         "impact_uppercase": True,
+        "anim": {"pop_from": 0.60},  # aggressivo (heavy + tono urlo)
     },
     "lifestyle_vlog": {
         "fonts": {
@@ -121,6 +131,7 @@ TYPOGRAPHY_PRESETS: dict[str, dict] = {
         "stroke_width": 0,
         "shadow": {"offset": (0, 0), "fill": (0, 0, 0, 0)},
         "impact_uppercase": True,
+        "anim": {"pop_from": 0.80},  # soft (rosa/handwritten, pop forte stona)
     },
     "educational": {
         "fonts": {
@@ -142,6 +153,7 @@ TYPOGRAPHY_PRESETS: dict[str, dict] = {
         "stroke_width": 0,
         "shadow": {"offset": (0, 0), "fill": (0, 0, 0, 0)},
         "impact_uppercase": True,
+        "anim": {"pop_from": 0.70},  # standard leggibile (spiegazioni)
     },
     "dark_motivational": {
         "fonts": {
@@ -168,6 +180,7 @@ TYPOGRAPHY_PRESETS: dict[str, dict] = {
         "stroke_width": 0,
         "shadow": {"offset": (0, 0), "fill": (0, 0, 0, 0)},
         "impact_uppercase": True,
+        "anim": {"pop_from": 0.60},  # aggressivo cinematico (max impatto)
     },
 }
 
@@ -204,11 +217,19 @@ def normalize_niche(name) -> str:
 def get_preset(niche: str | None) -> dict:
     """Ritorna il preset per la nicchia (fallback automatico se ignota/None).
 
-    Ritorna SEMPRE un dict valido con chiavi fonts/colors/sizes/stroke_width/shadow.
+    Ritorna SEMPRE un dict valido con chiavi
+    fonts/colors/sizes/stroke_width/shadow/impact_uppercase/anim.
     Il dict è una copia superficiale sicura da modificare (liste copiate).
+    "anim" = {"pop_from": float 0.1-1.0} per il pop impact T2 (default 0.7).
     """
     key = normalize_niche(niche) if niche else FALLBACK_NICHE
     src = TYPOGRAPHY_PRESETS.get(key, TYPOGRAPHY_PRESETS[FALLBACK_NICHE])
+    try:
+        _anim_src = dict(src.get("anim", {}) or {})
+        _pop = float(_anim_src.get("pop_from", 0.7))
+        _pop = min(1.0, max(0.1, _pop))
+    except (TypeError, ValueError, AttributeError):
+        _pop = 0.7
     return {
         "niche": key,
         "fonts": {
@@ -224,6 +245,7 @@ def get_preset(niche: str | None) -> dict:
             "fill": tuple(src.get("shadow", {}).get("fill", (0, 0, 0, 0))),
         },
         "impact_uppercase": bool(src.get("impact_uppercase", True)),
+        "anim": {"pop_from": _pop},
     }
 
 

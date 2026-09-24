@@ -259,24 +259,47 @@ def build_video(
 
     animated = any(_is_animated_chunk(c) for c in subtitle_chunks)
 
+    def _chunk_window(c: dict, nxt: dict | None):
+        """Finestra display (start, end): clip estesa se presente, else start/end.
+
+        Per lo statico le finestre sono rese contigue (end -> next_start):
+        caption+character restano visibili durante le pause TTS invece di
+        blinkare (fix sparizione/riapparizione anche nel fallback PNG).
+        """
+        try:
+            s = float(c.get("clip_start", c.get("start", 0.0)))
+        except (TypeError, ValueError):
+            s = 0.0
+        try:
+            e = float(c.get("clip_end", c.get("end", s)))
+        except (TypeError, ValueError):
+            e = s
+        if e <= s:
+            e = s + 0.1
+        if nxt is not None:
+            try:
+                ns = float(nxt.get("clip_start", nxt.get("start", e)))
+            except (TypeError, ValueError):
+                ns = e
+            # Finestra contigua: tiene la caption fino al chunk dopo (hold
+            # naturale durante le pause, niente sfondo vuoto = niente blink).
+            if ns > s and ns > e:
+                e = ns
+        return (s, e)
+
     if not animated:
-        # --- Percorso statico legacy (invariato) ---
-        # 2. Aggiungiamo ogni immagine di sottotitolo come input separato,
-        #    ognuna verrà mostrata solo nella sua finestra temporale.
+        # --- Percorso statico legacy (finestre contigue anti-blink) ---
         for chunk in subtitle_chunks:
             inputs.extend(["-i", chunk["image_path"]])
 
-        # 3. Costruiamo il filtro di overlay: ogni sottotitolo viene sovrapposto
-        #    al layer precedente, ma "enable" ne limita la visibilità alla
-        #    finestra temporale [start, end] tramite un'espressione ffmpeg.
         filter_parts = []
-        last_label = "0:v"  # lo sfondo (input 0) è il layer di base
+        last_label = "0:v"
 
         for idx, chunk in enumerate(subtitle_chunks):
-            input_index = idx + 2  # 0 = sfondo, 1 = audio, 2..N = sottotitoli
+            input_index = idx + 2
             out_label = f"v{idx}"
-            start = chunk["start"]
-            end = chunk["end"]
+            nxt_c = subtitle_chunks[idx + 1] if idx + 1 < len(subtitle_chunks) else None
+            start, end = _chunk_window(chunk, nxt_c)
             filter_parts.append(
                 f"[{last_label}][{input_index}:v]overlay=0:0:enable='between(t,{start},{end})'[{out_label}]"
             )
@@ -291,18 +314,43 @@ def build_video(
         clip_infos: list[tuple[str, float, float, bool] | None] = [None] * len(subtitle_chunks)
         _jobs: list[tuple[int, list[str], str]] = []
         for idx, chunk in enumerate(subtitle_chunks):
-            start = float(chunk["start"])
-            end = float(chunk["end"])
+            # Finestra display: preferisce clip_start/clip_end (includono il
+            # tail di persistenza gap quando il character continua: fix blink).
+            # Con hold il clip copre [start, next_start): overlay contigui,
+            # niente sfondo vuoto tra chunk con stesso/differente character.
+            try:
+                start = float(chunk.get("clip_start", chunk.get("start", 0.0)))
+            except (TypeError, ValueError):
+                start = 0.0
+            try:
+                end = float(chunk.get("clip_end", chunk.get("end", start)))
+            except (TypeError, ValueError):
+                end = start
+            if end <= start:
+                try:
+                    end = float(chunk.get("end", start + 0.1))
+                except (TypeError, ValueError):
+                    end = start + 0.1
+                if end <= start:
+                    end = start + 0.1
             if _is_animated_chunk(chunk):
                 frame_paths = _chunk_frames(chunk)
                 if not frame_paths:
                     raise VideoBuildError(f"Chunk animato {idx} senza frame.")
                 clip_path = os.path.join(TEMP_DIR, f"chunk_{idx:04d}.mov")
-                # Riuso: se clip gia' esistente e piu' recente dei frame, salta encode.
+                # Riuso: clip valida solo se piu' recente di primo E ultimo
+                # frame (l'ultimo include l'eventuale tail di persistenza gap).
                 try:
-                    if os.path.isfile(clip_path) and os.path.getmtime(clip_path) >= os.path.getmtime(frame_paths[0]):
-                        clip_infos[idx] = (clip_path, start, end, True)
-                        continue
+                    if os.path.isfile(clip_path):
+                        _cmt = os.path.getmtime(clip_path)
+                        _f0 = os.path.getmtime(frame_paths[0])
+                        try:
+                            _f1 = os.path.getmtime(frame_paths[-1])
+                        except (IndexError, OSError):
+                            _f1 = _f0
+                        if _cmt >= _f0 and _cmt >= _f1:
+                            clip_infos[idx] = (clip_path, start, end, True)
+                            continue
                 except OSError:
                     pass
                 _jobs.append((idx, frame_paths, clip_path))
@@ -369,6 +417,10 @@ def build_video(
     _preset = (_os2.environ.get("FFMPEG_PRESET", "veryfast") or "veryfast").strip() or "veryfast"
     if _preset not in ("ultrafast", "superfast", "veryfast", "faster", "fast", "medium"):
         _preset = "veryfast"
+    # Keyframe ottimizzati per short verticali: GOP 60 (2s a 30fps) invece del
+    # default 250 (8s): seeking/scrub precisi sulle caption, overhead minimo
+    # su video brevi. I chunk restano sincronizzati via setpts (frame 0 =
+    # chunk.start) con overlay contigui (hold nei gap, niente blink).
     cmd = ["ffmpeg", "-y", "-threads", "auto"] + inputs + [
         "-filter_complex", filter_complex,
         "-map", f"[{last_label}]",
@@ -376,6 +428,8 @@ def build_video(
         "-c:v", "libx264",
         "-preset", _preset,
         "-crf", "20",
+        "-g", "60",
+        "-keyint_min", "30",
         "-pix_fmt", "yuv420p",
         "-movflags", "+faststart",
         "-filter_threads", "auto",

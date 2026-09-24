@@ -500,12 +500,16 @@ def tag_chunk_words(
     user = (
         "Per OGNI chunk, suddividi il testo in segmenti consecutivi e assegna a "
         "ciascuno UN tipo. NON alterare le parole (stesse parole, stesso ordine).\n"
-        "TIPI:\n"
-        '- \"base\": parlato standard, congiunzioni, articoli, testo generico.\n'
-        '- \"impact\": keyword ad alto valore, numeri/dati, concetti chiave, '
-        "parole enfatiche da urlare (es. SMETTI, RISULTATI, STRATEGIA, GRATIS).\n"
-        '- \"accent\": domande retoriche, citazioni, parole tra virgolette, '
-        "espressioni d'effetto.\n"
+        "TIPI (il moto e' deciso dal codice da questi tipi, sii selettivo):\n"
+        '- "base": parlato standard, congiunzioni, articoli, testo generico.\n'
+        '- "impact": SOLO keyword ad alto valore, numeri/dati, concetti chiave, '
+        "parole enfatiche da urlare (es. SMETTI, RISULTATI, STRATEGIA, GRATIS). "
+        "Max 1-2 per chunk.\n"
+        '- "accent": SOLO vere domande retoriche, citazioni o parole tra '
+        "virgolette ed espressioni d'effetto (max 1 per chunk). NON usare accent "
+        "per enfasi generica (quella e' impact) ne' per parlato neutro (base).\n"
+        "NON esiste un tipo hero: l'unica parola hero del video e' scelta dal "
+        "codice (verbo CTA o climax hook), non taggarla a parte.\n"
         "ESEMPIO: chunk \"Smetti di SPRECARE TEMPO con metodi inutili\" -> "
         '[{"text": \"Smetti di \", \"type\": \"base\"}, '
         '{"text": \"SPRECARE TEMPO\", \"type\": \"impact\"}, '
@@ -593,9 +597,13 @@ def enrich_chunks_with_typography(
     Returns:
         (niche, enriched): enriched è la lista chunk con in più
         "typography_niche" e "styled_words" =
-        [{"word","start","end","style","display"}] dove display è il testo
-        da disegnare (impact -> UPPERCASE se il preset lo richiede).
-        Non solleva mai per errori LLM (fallback euristici).
+        [{"word","start","end","style","display","is_number","is_hero"}]
+        dove display è il testo da disegnare (impact -> UPPERCASE se il
+        preset lo richiede), is_number = contiene cifre (pop corto T3-num,
+        mai hero), is_hero = unica parola T3 del video (hero-pop).
+        Il moto (T0 base fade / T1 accent rise / T2 impact pop / T3 hero)
+        e' deciso dal renderer da (style, is_hero, is_number); il colore da
+        tema + palette keyword. Non solleva mai per errori LLM (fallback).
     """
     if not chunks:
         resolved = normalize_niche(niche) if niche else detect_niche(script_text or "", on_attempt)
@@ -653,7 +661,30 @@ def enrich_chunks_with_typography(
                 )
         except Exception:
             pass
+        # Flag moto T0-T3 (robusti anche senza boost): is_number via cifre,
+        # is_hero=False qui (l'unico hero video-wide e' assegnato dopo).
+        for s in styled:
+            try:
+                if not isinstance(s, dict):
+                    continue
+                s.setdefault("is_hero", False)
+                if "is_number" not in s:
+                    s["is_number"] = bool(re.search(r"\d", str(s.get("word", ""))))
+                if s.get("is_number"):
+                    s["is_hero"] = False
+                if s.get("style") not in ("base", "impact", "accent"):
+                    s["style"] = "base"
+                if "display" not in s:
+                    s["display"] = str(s.get("word", ""))
+            except Exception:
+                continue
         base["typography_niche"] = resolved
         base["styled_words"] = styled
         enriched.append(base)
+    # Hero video-wide: 1 sola parola T3 (CTA verb > hook climax), mai numeri.
+    try:
+        from core.narrative_structure import assign_hero_flags
+        enriched = assign_hero_flags(enriched) or enriched
+    except Exception:
+        pass
     return resolved, enriched

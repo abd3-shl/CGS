@@ -200,6 +200,14 @@ def _function_word(word_norm: str) -> bool:
     return word_norm in weak or word_norm in extra
 
 
+def _has_digit(text: str) -> bool:
+    """Vero se il testo contiene una cifra (numeri/dati, mai hero)."""
+    try:
+        return bool(re.search(r"\d", str(text or "")))
+    except Exception:
+        return False
+
+
 def boost_typography_styles(
     styled: list[dict],
     role: str | None,
@@ -213,6 +221,11 @@ def boost_typography_styles(
     - cta: verbi d'azione → impact; garantisce ≥1 impact per chunk CTA.
     - body/altro: invariato (il tagger generico resta sovrano nel corpo).
     Aggiorna anche "display" (impact → UPPER se il preset lo richiede).
+    Inizializza sempre "is_hero"=False e "is_number" (digit check): la scelta
+    dell'unico hero del video avviene dopo in `assign_hero_flags` (video-wide),
+    mai qui per-chunk (evita N hero). Il moto resta deciso dal renderer da
+    (style, is_hero, is_number): keywords.py resta fonte colore, il tagger
+    resta fonte moto (unificazione keyword==impact per l'animazione).
     """
     try:
         if role not in ("hook", "cta") or not styled:
@@ -254,9 +267,94 @@ def boost_typography_styles(
                         s["display"] = str(s.get("word", "")).upper()
                 except Exception:
                     continue
+        # Flag moto: default stabili (hero scelto video-wide dopo).
+        for s in styled:
+            try:
+                if not isinstance(s, dict):
+                    continue
+                s.setdefault("is_hero", False)
+                _w = str(s.get("word", ""))
+                s["is_number"] = _has_digit(_w)
+                # I numeri non sono mai hero (pop corto dedicato T3-num).
+                if s.get("is_number"):
+                    s["is_hero"] = False
+            except Exception:
+                continue
         return styled
     except Exception:
         return styled
+
+
+def assign_hero_flags(chunks: list[dict]) -> list[dict]:
+    """Marca l'UNICA parola hero del video (T3 hero-pop, mai eccezioni).
+
+    Gerarchia deterministica (nessun LLM, nessun costo):
+      1. primo verbo d'azione CTA in chunk CTA con style impact e senza cifre;
+      2. altrimenti parola contenuto piu' lunga del primo hook con impact e
+         senza cifre (stessa regola di `boost_typography_styles`);
+      3. altrimenti nessuna hero (video piatto, nessun cambio visivo).
+
+    Inizializza `is_hero=False` su tutte le styled_words e `True` su una sola
+    parola in tutto il video. I numeri (`is_number`) non sono mai hero.
+    Da chiamare dopo `enrich_chunks_with_typography` (o fine tagging): il
+    renderer legge `(style, is_hero, is_number)` per scegliere T0-T3.
+    Ritorna gli stessi dict (mutati in place per compatibilita').
+    """
+    try:
+        if not chunks:
+            return chunks
+        # Reset stabile: al massimo 1 hero per video.
+        for _ch in chunks:
+            try:
+                for _s in ((_ch or {}).get("styled_words") or []):
+                    if isinstance(_s, dict):
+                        _s["is_hero"] = False
+                        if "is_number" not in _s:
+                            _s["is_number"] = _has_digit(str(_s.get("word", "")))
+            except Exception:
+                continue
+        # 1. CTA: primo verbo d'azione impact senza cifre.
+        for _ch in chunks:
+            try:
+                if not isinstance(_ch, dict) or _ch.get("narrative_role") != CTA:
+                    continue
+                for _s in (_ch.get("styled_words") or []):
+                    if not isinstance(_s, dict):
+                        continue
+                    _norm = _norm_word(str(_s.get("word", "")))
+                    if (_s.get("style") == "impact" and _norm in _CTA_ACTION_VERBS
+                            and not _has_digit(str(_s.get("word", "")))):
+                        _s["is_hero"] = True
+                        return chunks
+            except Exception:
+                continue
+        # 2. Hook: contenuto piu' lungo tra gli impact senza cifre (primo hook).
+        _best = None  # (chunk_idx, word_idx, length)
+        for _ci, _ch in enumerate(chunks):
+            try:
+                if not isinstance(_ch, dict) or _ch.get("narrative_role") != HOOK:
+                    continue
+                for _wi, _s in enumerate(_ch.get("styled_words") or []):
+                    if not isinstance(_s, dict) or _s.get("style") != "impact":
+                        continue
+                    if _has_digit(str(_s.get("word", ""))):
+                        continue
+                    _norm = _norm_word(str(_s.get("word", "")))
+                    if not _norm or _function_word(_norm):
+                        continue
+                    _cand = (_ci, _wi, len(_norm))
+                    if _best is None or _cand[2] > _best[2]:
+                        _best = _cand
+            except Exception:
+                continue
+        if _best is not None:
+            try:
+                chunks[_best[0]]["styled_words"][_best[1]]["is_hero"] = True
+            except Exception:
+                pass
+        return chunks
+    except Exception:
+        return chunks
 
 
 def _cta_words_count(cta_idx: list[int], chunks: list[dict]) -> int:

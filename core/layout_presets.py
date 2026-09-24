@@ -15,7 +15,10 @@ Preset (canvas 1080x1920, asset di riferimento 768x1376 figura intera):
 - `layout_split_left`: 130% larghezza, spalla sinistra fuori campo
   (overhang negativo). Testo a destra (X 640-1000, banda centrale).
 - `layout_split_right`: speculare (testo a sinistra, X 80-420).
-  Con la posa 4 ("indicare") il personaggio indica verso il testo.
+  Posa 4 ("indicare" verso la sua sinistra = verso destra dello spettatore):
+  SEMPRE in `layout_split_left` (a sinistra, indica verso il testo a destra);
+  mai a destra (indicherebbe fuori campo). Vincolo configurabile in
+  `config.CHARACTER_POSE_SIDE_MAP` (es. "4:left") per futuri asset.
 
 Punch-in: flag per-chunk (jump-cut con ingrandimento improvviso per enfasi,
 max 2 per video). Su un preset normale applica PUNCH_IN_FACTOR alle
@@ -47,12 +50,16 @@ DEPRECATED_PRESET_ALIASES: dict[str, str] = {
 }
 
 # Transizioni di ingresso valide (nuovo sistema a zone).
+# "zoom_in": scala dolce 0.92 -> 1.0 + fade (alternativa a slide_up per i center,
+# ritmo coerente senza movimenti laterali continui). "none" solo per continuita'
+# pixel-identica (stessa identita': taglio invisibile, nessuna animazione).
 VALID_TRANSITION_IN: list[str] = [
     "slide_from_left",
     "slide_from_right",
     "slide_up",
     "slide_from_bottom",
     "fade",
+    "zoom_in",
     "none",
 ]
 
@@ -125,11 +132,21 @@ PRESET_SIDE: dict[str, str] = {
 }
 
 # Transizione di ingresso di default per preset.
+# I center alternano slide_up / zoom_in per varieta' ritmica (vedi
+# character_selector._enforce_rhythm_variety); gli split restano direzionali.
 PRESET_DEFAULT_TRANSITION_IN: dict[str, str] = {
     "layout_center_standard": "slide_up",
     "layout_center_punch_in": "fade",
     "layout_split_left": "slide_from_left",
     "layout_split_right": "slide_from_right",
+}
+
+# Alternativa dolce per i center (stessa famiglia, nessun movimento laterale).
+PRESET_ALTERNATE_TRANSITION_IN: dict[str, str] = {
+    "layout_center_standard": "zoom_in",
+    "layout_center_punch_in": "fade",
+    "layout_split_left": "fade",
+    "layout_split_right": "fade",
 }
 
 # Preset che richiedono la pill ad alto contrasto dietro il testo.
@@ -244,6 +261,8 @@ def normalize_transition_in(value, preset_name: str = "layout_center_standard") 
     preset = normalize_preset(preset_name)
     if isinstance(value, str):
         v = value.strip().lower()
+        if v in ("zoom", "zoom_in", "scale_in", "scale-in"):
+            return "zoom_in"
         if v in VALID_TRANSITION_IN:
             return "slide_up" if v == "slide_from_bottom" else v
         if v in LEGACY_TRANSITION_MAP:
@@ -256,6 +275,14 @@ def normalize_transition_in(value, preset_name: str = "layout_center_standard") 
     return preset_default_transition(preset)
 
 
+def preset_alternate_transition(name: str) -> str:
+    """Transizione alternativa dolce per il preset (varieta' ritmica)."""
+    try:
+        return PRESET_ALTERNATE_TRANSITION_IN.get(normalize_preset(name), "fade")
+    except Exception:
+        return "fade"
+
+
 def legacy_transition(transition_in: str) -> str:
     """Compatibilita' v1: transition_in canonica -> transizione legacy."""
     mapping = {
@@ -264,6 +291,7 @@ def legacy_transition(transition_in: str) -> str:
         "slide_up": "slide_up",
         "slide_from_bottom": "slide_up",
         "fade": "fade",
+        "zoom_in": "fade",
         "none": "none",
     }
     return mapping.get(transition_in, "fade")

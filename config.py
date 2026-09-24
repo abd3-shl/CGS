@@ -208,11 +208,23 @@ SUBTITLE_STROKE_WIDTH = _get_int("SUBTITLE_STROKE_WIDTH", 0)  # 0 = nessun conto
 SUBTITLE_MAX_CHARS = _get_int("SUBTITLE_MAX_CHARS", 38)   # lunghezza massima approx per chunk di sottotitolo
 SUBTITLE_MAX_WORDS = _get_int("SUBTITLE_MAX_WORDS", 7)    # numero massimo di parole per chunk
 
-# ---- Animazioni testo per-parola (Fase 3) ----
+# ---- Animazioni testo per-parola (Fase 3 + Tier T0-T3) ----
+# T0 base fade / T1 accent rise-fade / T2 impact pop / T3 hero-pop (1 per video).
+# Fonte moto = style LLM (base/impact/accent) + flag deterministico is_hero;
+# fonte colore = tema + palette keyword (vedi core/text_animator._styled_fills).
+# Path legacy (senza tipografia) usa solo T0/T2 per stabilita'.
 TEXT_ANIMATION_ENABLED = os.environ.get("TEXT_ANIMATION_ENABLED", "1").strip().lower() not in ("0", "false", "no", "off", "")
 TEXT_ANIMATION_ENTRY_DURATION = _get_float("TEXT_ANIMATION_ENTRY_DURATION", 0.18)  # secondi, durata entrata singola parola
 TEXT_ANIMATION_EXIT_DURATION = _get_float("TEXT_ANIMATION_EXIT_DURATION", 0.15)  # secondi, durata fade-out di gruppo
 KEYWORD_ENTRY_SCALE_FROM = _get_float("KEYWORD_ENTRY_SCALE_FROM", 0.7)  # scala iniziale entrata keyword (0.7 -> 1.0)
+# T1 accent: risalita verticale senza scala (non deforma handwritten), solo in entry.
+TEXT_ANIMATION_ACCENT_LIFT_PX = _get_float("TEXT_ANIMATION_ACCENT_LIFT_PX", 10.0)  # px, rise 10 -> 0
+# T3 hero: 1 parola per video (climax hook o verbo CTA), pop marcato + hold.
+TEXT_ANIMATION_HERO_SCALE_FROM = _get_float("TEXT_ANIMATION_HERO_SCALE_FROM", 0.6)  # scala iniziale hero (0.6 -> 1.0)
+TEXT_ANIMATION_HERO_ENTRY_DURATION = _get_float("TEXT_ANIMATION_HERO_ENTRY_DURATION", 0.22)  # s, overshoot leggibile (>=5 frame)
+TEXT_ANIMATION_HERO_EXIT_DELAY = _get_float("TEXT_ANIMATION_HERO_EXIT_DELAY", 0.06)  # s, ~2 frame @30fps oltre il gruppo
+# Numeri/dati (impact con cifre): pop piu' corto e secco, mai hero.
+TEXT_ANIMATION_NUMBER_ENTRY_DURATION = _get_float("TEXT_ANIMATION_NUMBER_ENTRY_DURATION", 0.15)  # s
 
 # ---- Personaggi 2D "Character-Driven Overlay" ----
 # 1 = personaggi sovrapposti tra sfondo e sottotitoli, 0 = video senza personaggi.
@@ -229,6 +241,111 @@ CHARACTER_SCALE_MAX = _get_float("CHARACTER_SCALE_MAX", 0.90)
 # Alias storici (retrocompatibilita').
 CHARACTER_POSITIONS = CHARACTER_VALID_POSITIONS
 CHARACTER_TRANSITIONS = CHARACTER_VALID_TRANSITIONS
+# ---- Ritmo visivo personaggi (stabile, mai statico) ----
+# Max chunk consecutivi con STESSA posa / STESSO lato prima di forzare un cambio.
+# 2 = ritmo calmo (mai 3 uguali di fila). Le apparizioni (macro-blocchi) usano
+# una posa/lato unici per blocco; tra blocchi adiacenti si evita la ripetizione
+# (posa diversa e, quando possibile, lato diverso). Applica a corpo e fallback;
+# hook primo chunk e CTA card restano bloccati per stabilita' intenzionale.
+CHARACTER_MAX_SAME_POSE = _get_int("CHARACTER_MAX_SAME_POSE", 2)
+CHARACTER_MAX_SAME_SIDE = _get_int("CHARACTER_MAX_SAME_SIDE", 2)
+# ---- Idle breathing leggero ma visibile (personaggio vivo, video mai statico) ----
+# Solo bob verticale dolce, NESSUNA rotazione laterale (tilt=0: il dondolio
+# destra-sinistra rendeva il video instabile). 1 = ON, 0 = OFF.
+CHARACTER_IDLE_ENABLED = _get_int("CHARACTER_IDLE_ENABLED", 1)  # 1 = ON, 0 = OFF
+CHARACTER_IDLE_AMP_Y = _get_float("CHARACTER_IDLE_AMP_Y", 4.0)  # px, respiro percettibile ma delicato
+CHARACTER_IDLE_FREQ = _get_float("CHARACTER_IDLE_FREQ", 0.4)  # Hz, ritmo calmo (~2.5s per ciclo)
+CHARACTER_IDLE_TILT_DEG = _get_float("CHARACTER_IDLE_TILT_DEG", 0.0)  # gradi, 0 = nessuna rotazione laterale
+# ---- Animazioni character (entrate/uscite per-frame fluidi + morph coerente) ----
+# Entrata slide&pop ~0.20s (~6 frame @30fps) da offset Y +300px con ease_out_back;
+# uscita slide-drop ~0.16s (~5 frame @30fps) verso +400px con ease_in_cubic.
+# Morph di continuita' (0.40) e zoom punch smart (0.60) restano piu' morbidi per
+# ritmo coerente (mai frenetico): l'entrata/uscita rapida riguarda solo
+# apparizione/sparizione, non i cambi posa/lato (morph fluido anti-blink).
+CHARACTER_ENTRY_DURATION = _get_float("CHARACTER_ENTRY_DURATION", 0.20)
+CHARACTER_FIRST_ENTRY_DURATION = _get_float("CHARACTER_FIRST_ENTRY_DURATION", 0.20)
+CHARACTER_EXIT_DURATION = _get_float("CHARACTER_EXIT_DURATION", 0.16)
+CHARACTER_PUNCH_ZOOM_DURATION = _get_float("CHARACTER_PUNCH_ZOOM_DURATION", 0.60)
+CHARACTER_MORPH_DURATION = _get_float("CHARACTER_MORPH_DURATION", 0.40)
+# Persistenza nei gap inter-chunk: 1 = il character resta visibile durante le
+# pause quando continua nel chunk dopo (fix blink sparizione/riapparizione).
+CHARACTER_GAP_HOLD_ENABLED = os.environ.get("CHARACTER_GAP_HOLD_ENABLED", "1").strip().lower() not in ("0", "false", "no", "off", "")
+CHARACTER_GAP_HOLD_MAX = _get_float("CHARACTER_GAP_HOLD_MAX", 1.5)  # cap secondi per gap
+# ---- Stabilita' macro-blocchi + presenza discontinua ("Breath & Focus") ----
+# Il personaggio NON cambia posa/lato dentro lo stesso macro-blocco narrativo:
+# ogni apparizione dura almeno CHARACTER_MIN_BLOCK_DURATION secondi.
+# Con DISCONTINUOUS_MODE=1 il personaggio appare in Hook e CTA e scompare
+# nei beat intermedi (Body) per lasciare spazio al testo (anti-flicker).
+CHARACTER_MIN_BLOCK_DURATION = _get_float("CHARACTER_MIN_BLOCK_DURATION", 2.5)  # durata min apparizione in sec
+CHARACTER_DISCONTINUOUS_MODE = _get_int("CHARACTER_DISCONTINUOUS_MODE", 1)  # 1 = ON (scompare nei beat), 0 = sempre visibile
+CHARACTER_HOOK_VISIBLE = _get_int("CHARACTER_HOOK_VISIBLE", 1)  # 1 = sempre visibile in Hook
+CHARACTER_CTA_VISIBLE = _get_int("CHARACTER_CTA_VISIBLE", 1)  # 1 = sempre visibile in CTA
+CHARACTER_BODY_VISIBLE_RATIO = _get_float("CHARACTER_BODY_VISIBLE_RATIO", 0.3)  # frazione beat Body visibili (~30%)
+
+def _get_pose_side_map(key: str, default: str) -> dict[int, str]:
+    """Mappa posa -> vincolo lato (any|center|left|right|split).
+
+    Formato env: '1:any,2:center,3:center,4:left,5:split'.
+    Pensata per adattarsi a futuri asset senza toccare il codice: se una
+    nuova posa indica verso sinistra (come l'attuale posa 4 che punta verso
+    destra dello spettatore), basta impostarla a 'left' (personaggio a
+    sinistra, testo a destra); se punta verso destra, a 'right'.
+    """
+    raw = os.environ.get(key, default)
+    if raw is None:
+        raw = default
+    try:
+        text = str(raw or default)
+    except Exception:
+        text = default
+    allowed = {"any", "center", "left", "right", "split"}
+    out: dict[int, str] = {}
+    try:
+        for part in text.replace("\n", ",").replace(";", ",").split(","):
+            part = part.strip()
+            if not part or ":" not in part:
+                continue
+            left, _, right = part.partition(":")
+            try:
+                pose = int(left.strip())
+            except (TypeError, ValueError):
+                continue
+            side = right.strip().lower()
+            if side in allowed:
+                out[pose] = side
+    except Exception:
+        pass
+    return out
+
+
+# ---- Direzione pose 2D (adattabile a futuri asset senza codice) ----
+# Significato vincoli:
+#   any    = nessun vincolo (segue il lato richiesto dal ritmo/narrazione)
+#   center = solo layout_center_standard (pose larghe come la 2 a braccia aperte)
+#   left   = solo layout_split_left (personaggio a SINISTRA, testo a DESTRA)
+#   right  = solo layout_split_right (personaggio a DESTRA, testo a SINISTRA)
+#   split  = solo split (alternati left/right, es. posa 5 riflessiva)
+# Posa 4 (indica verso la SUA sinistra = verso DESTRA dello spettatore):
+# deve stare SEMPRE a sinistra (split_left) cosi' indica verso il testo a destra.
+# Metterla a destra la farebbe indicare fuori campo (lontano dal testo).
+CHARACTER_POSE_SIDE_MAP: dict[int, str] = _get_pose_side_map(
+    "CHARACTER_POSE_SIDES", "1:any,2:center,3:center,4:left,5:split"
+)
+# Riempie eventuali pose mancanti (1..POSE_COUNT) con default coerenti.
+try:
+    _POSE_SIDE_DEFAULTS: dict[int, str] = {1: "any", 2: "center", 3: "center", 4: "left", 5: "split"}
+    for _p in range(1, max(1, int(CHARACTER_POSE_COUNT)) + 1):
+        CHARACTER_POSE_SIDE_MAP.setdefault(_p, _POSE_SIDE_DEFAULTS.get(_p, "any"))
+except Exception:
+    pass
+
+
+def get_pose_side_constraint(pose: int) -> str:
+    """Vincolo lato per posa ('any' se ignota, mai eccezioni)."""
+    try:
+        return CHARACTER_POSE_SIDE_MAP.get(int(pose), "any")
+    except Exception:
+        return "any"
 
 # ---- Semantic Typography Engine v1 ----
 # 1 = font/colori/dimensioni per nicchia + tagging LLM (base/impact/accent),
@@ -240,6 +357,13 @@ TYPOGRAPHY_ENGINE_ENABLED = os.environ.get("TYPOGRAPHY_ENGINE_ENABLED", "1").str
 TYPOGRAPHY_BASE_FONT_SIZE = _get_int("TYPOGRAPHY_BASE_FONT_SIZE", 60)  # px, prima di font_scale del preset
 TYPOGRAPHY_IMPACT_SCALE = _get_float("TYPOGRAPHY_IMPACT_SCALE", 1.4)  # 1.3x-1.5x da spec
 TYPOGRAPHY_ACCENT_SCALE = _get_float("TYPOGRAPHY_ACCENT_SCALE", 1.1)
+# Peso del font BASE (testo chiaro e leggibile): 600 = SemiBold, leggermente
+# più in grassetto del Regular (400) ma non troppo (niente ExtraBold/Black).
+# Applicato all'asse Weight dei font variabili (Inter/Roboto/Montserrat/...);
+# per i font statici (Poppins/Lato/...) si usa un grassetto sintetico leggero
+# (stroke 1px stesso colore, nessun contorno nero). Solo il base: impact e
+# accent restano invariati per stile.
+TYPOGRAPHY_BASE_WEIGHT = _get_int("TYPOGRAPHY_BASE_WEIGHT", 600)
 TYPOGRAPHY_STROKE_WIDTH = _get_int("TYPOGRAPHY_STROKE_WIDTH", 0)  # 0 = nessun contorno (look pulito)
 TYPOGRAPHY_SHADOW_ENABLED = os.environ.get("TYPOGRAPHY_SHADOW_ENABLED", "0").strip().lower() not in ("0", "false", "no", "off", "")
 TYPOGRAPHY_SHADOW_OFFSET = _get_tuple("TYPOGRAPHY_SHADOW_OFFSET", (3, 3))
