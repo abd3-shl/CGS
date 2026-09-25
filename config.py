@@ -392,6 +392,71 @@ RENDER_PARALLEL = os.environ.get("RENDER_PARALLEL", "1").strip().lower() not in 
 # FFMPEG_PRESET: veryfast default (qualita' invariata); ultrafast per bozze.
 FFMPEG_PRESET = (os.environ.get("FFMPEG_PRESET", "veryfast") or "veryfast").strip() or "veryfast"
 
+# ---- Full Engine Upgrade: cinetica avanzata / background dinamici / SFX ----
+# Flag master: 1 = Tier T0-T3 avanzati (stroke T0/T1, brand accent T2, badge T3),
+# glyph-cache e curve di interpolazione dedicate. 0 = path legacy stabile.
+ENABLE_ADVANCED_KINETICS = os.environ.get("ENABLE_ADVANCED_KINETICS", "1").strip().lower() not in ("0", "false", "no", "off", "")
+# Background dinamici con Ken Burns impercettibile (zoompan ffmpeg). 0 = tinta unita tema.
+ENABLE_DYNAMIC_BACKGROUNDS = os.environ.get("ENABLE_DYNAMIC_BACKGROUNDS", "1").strip().lower() not in ("0", "false", "no", "off", "")
+# SFX automatici su parole T3 / cambi posa (mix a SFX_VOLUME_DB). 0 = nessun SFX.
+ENABLE_AUTO_SFX = os.environ.get("ENABLE_AUTO_SFX", "1").strip().lower() not in ("0", "false", "no", "off", "")
+SFX_VOLUME_DB = _get_float("SFX_VOLUME_DB", -15.0)  # mix SFX whoosh/pop/click
+BG_MUSIC_DUCKING_DB = _get_float("BG_MUSIC_DUCKING_DB", -12.0)  # ducking musica sotto voce
+# Font dedicati per cinetica avanzata (fallback automatico via FontManager se assenti).
+HERO_WORD_FONT_PATH = (os.environ.get("HERO_WORD_FONT_PATH", "assets/fonts/Montserrat-Black.ttf") or "assets/fonts/Montserrat-Black.ttf").strip()
+BASE_WORD_FONT_PATH = (os.environ.get("BASE_WORD_FONT_PATH", "assets/fonts/Inter-Bold.ttf") or "assets/fonts/Inter-Bold.ttf").strip()
+
+
+def _get_hex_color(key: str, default: str) -> str:
+    """Colore hex #RRGGBB o #RRGGBBAA con fallback sicuro (mai eccezioni)."""
+    raw = (os.environ.get(key, default) or default).strip()
+    if len(raw) in (7, 9) and raw.startswith("#"):
+        try:
+            int(raw[1:], 16)
+            return raw.upper() if len(raw) == 7 else raw[:7].upper() + raw[7:]
+        except ValueError:
+            pass
+    return default
+
+
+COLOR_BRAND_ACCENT = _get_hex_color("COLOR_BRAND_ACCENT", "#FF3366")  # Tier T2 keyword
+COLOR_HERO_BG = _get_hex_color("COLOR_HERO_BG", "#000000A6")  # Tier T3 pill/badge semi-trasparente
+
+# ---- Z-Index Composite Stack (invariante: bg < character < dimmer < subtitles < debug) ----
+Z_BACKGROUND: int = 0
+Z_CHARACTER: int = 10
+Z_DIMMER: int = 20
+Z_SUBTITLES: int = 30
+Z_DEBUG: int = 99
+
+# ---- Costanti easing / interpolazione cinetica (nomi funzione in core/easing.py) ----
+EASING_CURVES: dict[str, str] = {
+    "t0_fade": "ease_out_cubic",
+    "t1_rise": "ease_out_quad",
+    "t2_pop": "ease_out_back",
+    "t3_hero": "ease_out_back",
+    "t3_num": "ease_out_back",
+    "char_entry": "ease_out_back",
+    "char_exit": "ease_in_cubic",
+    "char_morph": "ease_in_out_cubic",
+    "hero_shake": "ease_out_elastic",
+}
+# Matrici di interpolazione per scala/opacita'/rotazione (start, end, overshoot).
+KINETIC_T2_SCALE_PEAK = _get_float("KINETIC_T2_SCALE_PEAK", 1.10)  # picco 110% sui primi 3-4 frame
+KINETIC_T2_PEAK_FRAMES = _get_int("KINETIC_T2_PEAK_FRAMES", 4)
+KINETIC_T3_SHAKE_PX = _get_float("KINETIC_T3_SHAKE_PX", 4.0)  # micro-shake badge hero
+KINETIC_T0_STROKE_PX = _get_int("KINETIC_T0_STROKE_PX", 3)  # bordo T0/T1 in modalita' avanzata
+# Ken Burns background dinamico (zoom impercettibile).
+DYNAMIC_BG_ZOOM_MAX = _get_float("DYNAMIC_BG_ZOOM_MAX", 1.08)
+DYNAMIC_BG_ZOOM_STEP = _get_float("DYNAMIC_BG_ZOOM_STEP", 0.0015)
+DYNAMIC_BG_DURATION = _get_int("DYNAMIC_BG_DURATION", 125)
+# Micro-transizioni character (cross-fade 3-4 frame o micro-scala 2%).
+CHARACTER_MICRO_XFADE_FRAMES = _get_int("CHARACTER_MICRO_XFADE_FRAMES", 4)
+CHARACTER_MICRO_SCALE_PCT = _get_float("CHARACTER_MICRO_SCALE_PCT", 0.02)
+# Safe-zone dinamiche: auto-scaling font se riga >80% larghezza, minimo 40px.
+LAYOUT_MAX_WIDTH_RATIO = _get_float("LAYOUT_MAX_WIDTH_RATIO", 0.80)
+LAYOUT_MIN_FONT_PX = _get_int("LAYOUT_MIN_FONT_PX", 40)
+
 # ---- Percorsi progetto ----
 OUTPUT_DIR = os.environ.get("OUTPUT_DIR", os.path.join(BASE_DIR, "outputs"))
 TEMP_DIR = os.environ.get("TEMP_DIR", os.path.join(BASE_DIR, "temp"))

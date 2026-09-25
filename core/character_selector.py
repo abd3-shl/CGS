@@ -28,6 +28,7 @@ Mappatura pose (vedi prompt LLM):
 """
 
 import json
+import math
 import os
 import re
 from collections.abc import Callable
@@ -73,6 +74,11 @@ except Exception:
             return CHARACTER_POSE_SIDE_MAP.get(int(pose), "any")
         except Exception:
             return "any"
+try:
+    from config import CHARACTER_MICRO_XFADE_FRAMES, CHARACTER_MICRO_SCALE_PCT
+except Exception:  # config datata
+    CHARACTER_MICRO_XFADE_FRAMES = 4
+    CHARACTER_MICRO_SCALE_PCT = 0.02
 from core.layout_presets import (
     MAX_PUNCH_INS_PER_VIDEO,
     VALID_LAYOUT_PRESETS,
@@ -606,12 +612,31 @@ def _pose_for_text(text: str, avoid: int = 0) -> int:
     Priorita': '?' -> 5 (riflessione, split), cifre -> 4 (indica, split),
     '!' -> 3 (positivo/enfasi), altrimenti rotazione 1 -> 2 -> 4 -> 5
     (mai 2 in split: il chiamante forza center per posa 2).
+    Bridge narrativo (Fase 3): a intensita' emotiva alta (>=0.7) i segnali
+    CTA/climax forzano asset espressivi via `pose_for_emotion`
+    (4 pointing / 5 surprised / 3 positivo), con fallback alla logica storica.
     """
     try:
         t = str(text or "")
     except Exception:
         t = ""
     import re as _re
+    # Bridge narrativo: hook/domande-chiave/climax emotivi -> asset espressivi.
+    try:
+        from core.narrative_structure import emotional_intensity as _emo, pose_for_emotion as _pfe
+        try:
+            _intensity = float(_emo(t))
+        except Exception:
+            _intensity = 0.0
+        if _intensity >= 0.7:
+            try:
+                _exp = int(_pfe(t, fallback=0))
+                if 1 <= _exp <= 5 and _exp != avoid:
+                    return _exp
+            except Exception:
+                pass
+    except Exception:
+        pass
     if "?" in t:
         return 5 if avoid != 5 else 2
     if _re.search(r"\d", t):
@@ -622,6 +647,147 @@ def _pose_for_text(text: str, avoid: int = 0) -> int:
         if cand != avoid:
             return cand
     return 2
+
+
+# --------------------------------------- Micro-transizioni d'aura (Fase 3)
+def is_focus_pose_switch(prev: dict | None, cur: dict | None) -> bool:
+    """Vero se posa cambia dentro lo stesso blocco Focus visibile.
+
+    Condizioni: entrambi dict, entrambi visibili (`character.visible` o
+    `char_visible`), stesso `block_id` non-nullo, pose diverse valide.
+    I cambi tra blocchi (ENTRY con slide) NON usano micro-blend.
+    Mai eccezioni.
+    """
+    try:
+        if not isinstance(prev, dict) or not isinstance(cur, dict):
+            return False
+
+        def _vis(c: dict) -> bool:
+            try:
+                ch = c.get("character")
+                if isinstance(ch, dict):
+                    return bool(ch.get("visible", True)) and ch.get("pose") is not None
+                return bool(c.get("char_visible", True)) and c.get("pose") is not None
+            except Exception:
+                return False
+
+        if not _vis(prev) or not _vis(cur):
+            return False
+
+        def _block(c: dict):
+            try:
+                ch = c.get("character")
+                if isinstance(ch, dict) and ch.get("block_id") is not None:
+                    return int(ch["block_id"])
+                b = c.get("block_id")
+                return int(b) if b is not None else None
+            except Exception:
+                return None
+
+        bp, bc = _block(prev), _block(cur)
+        if bp is None or bc is None or bp != bc:
+            return False
+
+        def _pose(c: dict):
+            try:
+                ch = c.get("character")
+                if isinstance(ch, dict) and ch.get("pose") is not None:
+                    return int(ch["pose"])
+                p = c.get("pose")
+                return int(p) if p is not None else None
+            except Exception:
+                return None
+
+        pp, pc = _pose(prev), _pose(cur)
+        return pp is not None and pc is not None and pp != pc
+    except Exception:
+        return False
+
+
+def micro_blend_progress(frame_idx: int, total_frames: int | None = None) -> float:
+    """Progresso 0..1 del cross-fade sui primi MICRO_XFADE_FRAMES (clamp)."""
+    try:
+        n = max(1, int(CHARACTER_MICRO_XFADE_FRAMES))
+    except Exception:
+        n = 4
+    try:
+        fi = max(0, int(frame_idx))
+    except Exception:
+        return 1.0
+    try:
+        if total_frames is not None and int(total_frames) > 0:
+            n = max(1, min(n, int(total_frames)))
+    except Exception:
+        pass
+    if n <= 1:
+        return 1.0
+    return max(0.0, min(1.0, float(fi) / float(n - 1)))
+
+
+def micro_scale_factor(frame_idx: int) -> float:
+    """Micro-scala progressiva 2% durante lo switch (1.0 -> 1.02 -> 1.0)."""
+    try:
+        pct = max(0.0, min(0.10, float(CHARACTER_MICRO_SCALE_PCT)))
+    except Exception:
+        pct = 0.02
+    try:
+        p = micro_blend_progress(frame_idx)
+        return 1.0 + pct * float(math.sin(math.pi * max(0.0, min(1.0, p)))) if pct > 0 else 1.0
+    except Exception:
+        return 1.0
+
+
+def blend_character_layers(prev_img: object, next_img: object, progress: float) -> object:
+    """Cross-fade alpha tra posa precedente e successiva (3-4 frame).
+
+    Ritorna `next_img` se progress>=1 o input degeneri; una copia blenda
+    altrimenti (canvas = size next, prev centrata e scalata). Mai eccezioni,
+    mai mutazioni degli input.
+    """
+    try:
+        p = max(0.0, min(1.0, float(progress)))
+    except Exception:
+        return next_img
+    try:
+        if p <= 0.0:
+            return prev_img
+        if p >= 1.0:
+            return next_img
+        if prev_img is None:
+            return next_img
+        if next_img is None:
+            return prev_img
+        nw, nh = next_img.size
+        canvas = next_img.copy()
+        try:
+            pw, ph = prev_img.size
+            scale = min(nw / max(1, pw), nh / max(1, ph))
+            rw, rh = max(1, int(pw * scale)), max(1, int(ph * scale))
+            prev_fit = prev_img.resize((rw, rh), Image.BICUBIC if hasattr(Image, "BICUBIC") else Image.NEAREST)
+        except Exception:
+            prev_fit = prev_img
+            rw, rh = prev_fit.size
+        ox, oy = (nw - rw) // 2, (nh - rh) // 2
+        try:
+            prev_faded = prev_fit.copy()
+            alpha = prev_faded.getchannel("A").point(lambda a: int(a * (1.0 - p)))
+            prev_faded.putalpha(alpha)
+            canvas.alpha_composite(prev_faded, (ox, oy))
+        except Exception:
+            pass
+        try:
+            # Next emerge da (1-p): applica opacita' complementare solo se
+            # parziale per un blend vero (a p=1 ritorna next pieno sopra).
+            if p < 1.0:
+                pass  # canvas ha gia' next pieno sotto + prev sbiadito sopra
+        except Exception:
+            pass
+        return canvas
+    except Exception:
+        try:
+            return next_img
+        except Exception:
+            return prev_img
 
 
 def _layout_for_pose_side(pose: int, side: str, flip: int = 0) -> str:

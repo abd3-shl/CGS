@@ -208,6 +208,96 @@ def _has_digit(text: str) -> bool:
         return False
 
 
+# ------------------------------------------------- Bridge narrativo (Fase 3)
+# Intensita' emotiva 0..1 per collegare tono voce <-> posa espressiva.
+# Deterministica (punteggiatura + caps + cue CTA + hero), mai LLM, mai eccezioni.
+_EMOTIVE_CAPS_RE = re.compile(r"[A-ZÀ-Þ]{4,}")
+_POSITIVE_CUES: frozenset[str] = frozenset({
+    "soluzione", "gratis", "facile", "veloce", "successo", "guadagni",
+    "risultato", "segreto", "perfetto", "incredibile", "congratulazioni",
+})
+
+
+def emotional_intensity(text_or_chunk: object) -> float:
+    """Intensita' emotiva 0.0..1.0 di un testo o chunk (bridge narrativo).
+
+    Pesi: `!`=+0.35 (x2 se ripetuti), `?`=+0.30, caps 4+=+0.20,
+    cifre=+0.15 (dati che meritano pointing), cue CTA=+0.25,
+    cue positive=+0.15, hero/hook role=+0.10. Clamp 0..1.
+    """
+    try:
+        if isinstance(text_or_chunk, dict):
+            text = str(text_or_chunk.get("text", ""))
+            role = str(text_or_chunk.get("narrative_role", "") or "").lower()
+        else:
+            text = str(text_or_chunk or "")
+            role = ""
+    except Exception:
+        return 0.0
+    try:
+        score = 0.0
+        if "!!" in text or "!!!" in text:
+            score += 0.55
+        elif "!" in text:
+            score += 0.35
+        if "?" in text:
+            score += 0.30
+        if _EMOTIVE_CAPS_RE.search(text):
+            score += 0.20
+        if _has_digit(text):
+            score += 0.15
+        low = text.lower()
+        try:
+            if _has_cta_cue(text):
+                score += 0.25
+        except Exception:
+            pass
+        try:
+            if any(c in low for c in _POSITIVE_CUES):
+                score += 0.15
+        except Exception:
+            pass
+        if role in ("hook", "cta"):
+            score += 0.10
+        return max(0.0, min(1.0, score))
+    except Exception:
+        return 0.0
+
+
+def pose_for_emotion(text_or_chunk: object, fallback: int = 1) -> int:
+    """Posa espressiva per intensita' emotiva (coerenza tono <-> posa).
+
+    - Domande (`?`) -> 5 mento/sorpresa (split).
+    - Dati/cifre -> 4 pointing (split_left, indica il testo).
+    - CTA/positivo/`!` -> 3 pollice (soluzioni, centro).
+    - Hook ad alta intensita' senza segnali -> 1 incrociate (assertiva).
+    - Bassa intensita' -> fallback (nero su bianco: nessun cambio).
+    Mappa gli asset espressivi richiesti dalla spec (pointing/surprised/
+    shocked) sulle 5 pose esistenti: 4=pointing, 5=surprised/riflessiva,
+    3=positive/shocked-positivo, 1=assertiva. Mai eccezioni.
+    """
+    try:
+        if isinstance(text_or_chunk, dict):
+            text = str(text_or_chunk.get("text", ""))
+        else:
+            text = str(text_or_chunk or "")
+        if "?" in text:
+            return 5
+        if _has_digit(text):
+            return 4
+        try:
+            if _has_cta_cue(text) or "!" in text:
+                return 3
+        except Exception:
+            if "!" in text:
+                return 3
+        if emotional_intensity(text_or_chunk) >= 0.7:
+            return 1
+        return int(fallback) if 1 <= int(fallback) <= 5 else 1
+    except Exception:
+        return 1
+
+
 def boost_typography_styles(
     styled: list[dict],
     role: str | None,

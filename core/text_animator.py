@@ -106,6 +106,34 @@ from core.easing import (
     ease_in_out_cubic,
     ease_in_cubic,
 )
+try:
+    from config import (
+        ENABLE_ADVANCED_KINETICS as _ADV_KINETICS,
+        COLOR_BRAND_ACCENT as _BRAND_ACCENT,
+        BASE_WORD_FONT_PATH as _BASE_FONT_PATH,
+        HERO_WORD_FONT_PATH as _HERO_FONT_PATH,
+    )
+except Exception:  # config datata
+    _ADV_KINETICS = False
+    _BRAND_ACCENT = "#FF3366"
+    _BASE_FONT_PATH = "assets/fonts/Inter-Bold.ttf"
+    _HERO_FONT_PATH = "assets/fonts/Montserrat-Black.ttf"
+try:
+    from core.advanced_kinetics import (
+        advanced_entry_duration as _adv_entry_dur,
+        advanced_stroke_for as _adv_stroke_for,
+        brand_accent_rgba as _brand_rgba,
+        draw_hero_badge as _draw_hero_badge,
+        hero_shake_offset as _hero_shake,
+        t2_peak_scale as _t2_peak,
+    )
+except Exception:  # modulo opzionale: path legacy invariato
+    _adv_entry_dur = None
+    _adv_stroke_for = None
+    _brand_rgba = None
+    _draw_hero_badge = None
+    _hero_shake = None
+    _t2_peak = None
 from core.keywords import normalize_word
 from core.renderer import (
     load_font,
@@ -1804,6 +1832,8 @@ def generate_animated_chunk_frames(
     typography_preset: dict | None = None,
     char_entry_from_xy: tuple[int, int] | None = None,
     tail_hold_duration: float = 0.0,
+    char_prev_layer=None,
+    char_micro_blend: bool = False,
 ) -> list[dict]:
     """Genera la sequenza di frame PNG per un chunk con animazione per-parola.
 
@@ -2125,6 +2155,38 @@ def generate_animated_chunk_frames(
         _entry_per_word = [entry_dur] * len(words)
         _scale_per_word = [1.0] * len(words)
 
+    # --- Full Engine Upgrade Fase 2: cinetica avanzata (opt-in, mai regressioni) ---
+    # T0/T1 fade-in 2 frame, T2 brand accent con picco 110%, T3 badge+shake.
+    # Timestamp start/end MAI toccati: solo durate di entrata e resa visiva.
+    _adv_enabled = False
+    try:
+        _adv_enabled = bool(_ADV_KINETICS) and (_adv_entry_dur is not None)
+    except Exception:
+        _adv_enabled = False
+    if _adv_enabled:
+        try:
+            _fps_adv = int(fps) if int(fps) > 0 else 30
+        except Exception:
+            _fps_adv = 30
+        try:
+            for _ai, (_s, _h, _n) in enumerate(list(_tiers)):
+                if _s in ("base", "accent") and _adv_entry_dur is not None:
+                    try:
+                        _entry_per_word[_ai] = float(_adv_entry_dur(_s, float(_entry_per_word[_ai]), _fps_adv))
+                    except Exception:
+                        pass
+            # T2 -> brand accent (coerenza marchio); T3 tiene highlight + badge.
+            if _brand_rgba is not None:
+                try:
+                    _brand_fill = _brand_rgba()
+                    for _ai, (_s, _h, _n) in enumerate(list(_tiers)):
+                        if _s == "impact" and not _h and not _n and _ai < len(fills):
+                            fills[_ai] = _brand_fill
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
     # --- Personaggio del chunk (layer UNA volta, riusato in ogni frame) ---
     # Z-index sui frame: 1. sfondo (ffmpeg) / 2. personaggio / 2.5 pill / 3. testo.
     # Slide&pop 0.20s +300px alla prima apparizione; morph smart 0.40s in
@@ -2406,6 +2468,44 @@ def generate_animated_chunk_frames(
                     pass
             if _idle_dy:
                 edy += int(_idle_dy)
+            # --- Fase 3: micro cross-fade d'aura dentro il blocco Focus ---
+            # Se posa cambia a stesso block_id (niente tagli netti): blend alpha
+            # 3-4 frame + micro-scala 2% sui primi frame. Solo quando il
+            # chiamante passa char_prev_layer (default None = legacy invariato).
+            if char_micro_blend and char_prev_layer is not None and '_char_layer' in dir():
+                try:
+                    from core.character_selector import (
+                        blend_character_layers as _blend_layers,
+                        micro_blend_progress as _blend_prog,
+                        micro_scale_factor as _micro_scale,
+                    )
+                    try:
+                        _micro_n = 4
+                        try:
+                            from config import CHARACTER_MICRO_XFADE_FRAMES as _mn
+                            _micro_n = max(1, int(_mn))
+                        except Exception:
+                            pass
+                        if int(fi) < int(_micro_n) and _char_layer is not None:
+                            _bp = _blend_prog(int(fi))
+                            _blended = _blend_layers(char_prev_layer, _char_layer, _bp)
+                            try:
+                                _ms = float(_micro_scale(int(fi)))
+                            except Exception:
+                                _ms = 1.0
+                            if abs(_ms - 1.0) >= 1e-4 and _blended is not None:
+                                try:
+                                    _bw2, _bh2 = _blended.size
+                                    _nw2, _nh2 = max(1, int(round(_bw2 * _ms))), max(1, int(round(_bh2 * _ms)))
+                                    _blended = _blended.resize((_nw2, _nh2), _fast_resample_for_scale(_ms))
+                                except Exception:
+                                    pass
+                            if _blended is not None:
+                                _char_layer = _blended
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
             try:
                 if '_zoom_xy' in dir() and _zoom_xy is not None and '_char_scale' in dir() and abs(_char_scale - 1.0) >= 1e-3:
                     _paste_character_frame(frame_img, _char_layer, _zoom_xy[0], _zoom_xy[1] + (int(_idle_dy) if _idle_dy else 0), char_opacity)
@@ -2508,24 +2608,66 @@ def generate_animated_chunk_frames(
                 continue
             item = layout[wi]
             _ry = item["y"] + _dy if _dy else item["y"]
+            _rx = item["x"]
+            # --- Fase 2 avanzata: picco T2, badge+shake T3, stroke T0/T1 ---
+            _adv_draw = False
+            try:
+                _adv_draw = bool(_adv_enabled)
+            except Exception:
+                _adv_draw = False
+            if _adv_draw:
+                try:
+                    if _style_w == "impact" and not _hero_w and _t2_peak is not None:
+                        try:
+                            _frame_rel = int(round((t - float(word_starts[wi])) * float(fps)))
+                            scale = float(_t2_peak(_frame_rel, float(scale)))
+                        except Exception:
+                            pass
+                    if _hero_w and _hero_shake is not None and _draw_hero_badge is not None:
+                        try:
+                            _sx, _sy = _hero_shake(int(fi), int(fps))
+                            _rx = int(_rx) + int(_sx)
+                            _ry = int(_ry) + int(_sy)
+                            _draw_hero_badge(frame_img, (int(item["x"]), int(item["y"]),
+                                                         int(item["x"]) + int(item["width"]),
+                                                         int(item["y"]) + int(item["height"])))
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
             if use_typography:
                 wfont = _word_fonts[wi]
                 if _base_synth and _style_w == "base":
                     _sw, _sc = _BASE_SYNTHETIC_STROKE_WIDTH, fills[wi]
                 else:
                     _sw, _sc = typo_stroke_width, typo_stroke_color
+                if _adv_draw and _adv_stroke_for is not None:
+                    try:
+                        _sw = int(_adv_stroke_for(_style_w, int(_sw)))
+                        if int(_sw) > 0 and _sc == (0, 0, 0, 0):
+                            _sc = (0, 0, 0, 255)
+                    except Exception:
+                        pass
                 _render_styled_scaled_word(
-                    frame_img, w["word"], item["x"], _ry,
+                    frame_img, w["word"], _rx, _ry,
                     item["width"], item["height"], wfont,
                     fills[wi], _sc, _sw,
                     _shadow_off, _shadow_fill,
                     opacity=opacity, scale=scale,
                 )
             else:
+                _sw_legacy, _sc_legacy = SUBTITLE_STROKE_WIDTH, SUBTITLE_STROKE_COLOR
+                if _adv_draw and _adv_stroke_for is not None:
+                    try:
+                        _sw_legacy = int(_adv_stroke_for("base", int(_sw_legacy)))
+                        if int(_sw_legacy) > 0 and _sc_legacy == (0, 0, 0, 0):
+                            _sc_legacy = (0, 0, 0, 255)
+                    except Exception:
+                        pass
                 _render_scaled_word(
-                    frame_img, w["word"], item["x"], _ry,
+                    frame_img, w["word"], _rx, _ry,
                     item["width"], item["height"], _word_fonts[wi],
-                    fills[wi], SUBTITLE_STROKE_COLOR, SUBTITLE_STROKE_WIDTH,
+                    fills[wi], _sc_legacy, _sw_legacy,
                     opacity=opacity, scale=scale,
                 )
 
@@ -3191,12 +3333,32 @@ def render_all_chunks_animated(
                     tail = min(max(0.0, _gap), _gap_hold_max)
         except Exception:
             tail = 0.0
+        # --- Fase 3: micro cross-fade dentro il blocco Focus (no tagli netti) ---
+        _micro = False
+        _prev_layer = None
+        try:
+            from core.character_selector import is_focus_pose_switch as _is_focus_sw
+            _prev_chunk = chunks[i - 1] if i - 1 >= 0 else None
+            if _prev_chunk is not None and bool(_is_focus_sw(_prev_chunk, chunk)):
+                try:
+                    _pi = _character_info_from_chunk(_prev_chunk)
+                    if _pi is not None:
+                        _pl, _px = _load_chunk_character_layer(_pi)
+                        if _pl is not None:
+                            _prev_layer = _pl
+                            _micro = True
+                except Exception:
+                    _prev_layer, _micro = None, False
+        except Exception:
+            _prev_layer, _micro = None, False
         states.append({
             "char_exit_mode": exit_mode,
             "char_entry_jump": entry_jump,
             "char_entry_fade": entry_fade,
             "char_entry_from_xy": from_xy,
             "char_tail": float(tail or 0.0),
+            "char_micro_blend": bool(_micro),
+            "char_prev_layer": _prev_layer,
         })
     # Separa run CTA (sequenziali, condividono layout) da chunk normali (paralleli).
     cta_runs: list[list[int]] = []
@@ -3272,6 +3434,8 @@ def render_all_chunks_animated(
                     typography_niche=typography_niche, typography_preset=typography_preset,
                     char_entry_from_xy=st.get("char_entry_from_xy"),
                     tail_hold_duration=float(st.get("char_tail", 0.0) or 0.0),
+                    char_prev_layer=st.get("char_prev_layer"),
+                    char_micro_blend=bool(st.get("char_micro_blend", False)),
                 )
             with _fut.ThreadPoolExecutor(max_workers=_workers) as _ex:
                 _future_map = {_ex.submit(_render_one, k): k for k in normal_idx}
@@ -3295,6 +3459,8 @@ def render_all_chunks_animated(
                     typography_niche=typography_niche, typography_preset=typography_preset,
                     char_entry_from_xy=st.get("char_entry_from_xy"),
                     tail_hold_duration=float(st.get("char_tail", 0.0) or 0.0),
+                    char_prev_layer=st.get("char_prev_layer"),
+                    char_micro_blend=bool(st.get("char_micro_blend", False)),
                 )
                 if on_chunk is not None:
                     try:

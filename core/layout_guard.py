@@ -36,6 +36,20 @@ Misure reali alla base (asset 768x1376, tight bbox dopo pulizia sfondo):
 from __future__ import annotations
 
 from config import VIDEO_WIDTH, VIDEO_HEIGHT
+try:
+    from config import (
+        LAYOUT_MAX_WIDTH_RATIO as _DYN_MAX_RATIO,
+        LAYOUT_MIN_FONT_PX as _DYN_MIN_PX,
+        Z_BACKGROUND as _Z_BG,
+        Z_CHARACTER as _Z_CHAR,
+        Z_DIMMER as _Z_DIM,
+        Z_SUBTITLES as _Z_SUB,
+        Z_DEBUG as _Z_DBG,
+    )
+except Exception:  # config datata
+    _DYN_MAX_RATIO = 0.80
+    _DYN_MIN_PX = 40
+    _Z_BG, _Z_CHAR, _Z_DIM, _Z_SUB, _Z_DBG = 0, 10, 20, 30, 99
 from core.layout_presets import (
     PRESET_SAFE_AREA,
     preset_safe_area,
@@ -264,6 +278,184 @@ def _load_font_scaled(base_size: int, scale: float):
         return load_font(base_size)
 
 
+# --------------------------------- Safe zone dinamiche + auto-scaling (Fase 4)
+# TikTok/Reels/Shorts: bottoni laterali + overlay UI sopra/sotto. Il testo non
+# deve superarli: limite dinamico 80% larghezza, auto-scaling fino a 40px min,
+# poi wrapping forzato sulla pausa piu' vicina. Z-index verificato:
+# bg(0) < character(10) < dimmer(20) < subtitles(30) < debug(99).
+UI_TOP_RESERVED_PX = 150     # overlay sopra (titolo/progresso)
+UI_BOTTOM_RESERVED_PX = 320  # overlay sotto (like/commenti/CTA mobile)
+UI_SIDE_RESERVED_PX = 80     # bottoni laterali TikTok/Reels
+
+
+def dynamic_max_text_width(canvas_w: int | None = None) -> int:
+    """Larghezza max testo (80% schermo per evitare bottoni laterali)."""
+    try:
+        w = int(canvas_w) if canvas_w else int(VIDEO_WIDTH)
+    except Exception:
+        w = 1080
+    try:
+        ratio = float(_DYN_MAX_RATIO)
+        ratio = min(0.95, max(0.5, ratio))
+    except Exception:
+        ratio = 0.80
+    return max(320, int(round(w * ratio)))
+
+
+def dynamic_min_font_scale(base_size: int) -> float:
+    """Scala minima per non scendere sotto 40px (LAYOUT_MIN_FONT_PX)."""
+    try:
+        min_px = max(24, int(_DYN_MIN_PX))
+        base = max(24, int(base_size))
+        return max(0.3, min(1.0, float(min_px) / float(base)))
+    except Exception:
+        return 0.6
+
+
+def widest_line_px(layout: list[dict] | None) -> int:
+    """Larghezza px della riga piu' larga (bounding box dinamica, mai eccezioni)."""
+    try:
+        if not layout:
+            return 0
+        by_y: dict[int, int] = {}
+        for item in layout:
+            try:
+                y = int(item.get("y", 0))
+                w = int(item.get("x", 0)) + int(item.get("width", 0))
+                # Raggruppa per riga (tolleranza 4px).
+                key = None
+                for ky in by_y:
+                    if abs(ky - y) <= 4:
+                        key = ky
+                        break
+                if key is None:
+                    by_y[y] = w
+                else:
+                    by_y[key] = max(by_y[key], w)
+            except Exception:
+                continue
+        if not by_y:
+            return 0
+        min_x = 10 ** 9
+        for item in layout:
+            try:
+                min_x = min(min_x, int(item.get("x", min_x)))
+            except Exception:
+                continue
+        max_w = max(by_y.values())
+        return max(0, int(max_w - (min_x if min_x < 10 ** 9 else 0)))
+    except Exception:
+        return 0
+
+
+def rewrap_split_point(words: list[str]) -> int:
+    """Indice di split per wrapping forzato: pausa forte > virgola > meta'.
+
+    Cerca punteggiatura sillabica/audio (`. ! ? … : ; ,`) dalla meta' in poi,
+    altrimenti meta' parole. Ritorna indice di inizio seconda riga (>=1).
+    Mai eccezioni.
+    """
+    try:
+        n = len(words or [])
+        if n <= 2:
+            return 1
+        strong = (".", "!", "?", "…", ":", ";")
+        mid = max(1, n // 2)
+        for i in range(mid, n - 1):
+            try:
+                if str(words[i]).endswith(strong):
+                    return i + 1
+            except Exception:
+                continue
+        for i in range(mid, n - 1):
+            try:
+                if str(words[i]).endswith(","):
+                    return i + 1
+            except Exception:
+                continue
+        return mid
+    except Exception:
+        try:
+            return max(1, len(words or []) // 2)
+        except Exception:
+            return 1
+
+
+def verify_z_order(
+    text_bbox: tuple[int, int, int, int] | None,
+    char_bbox: tuple[int, int, int, int] | None = None,
+    canvas_w: int | None = None,
+    canvas_h: int | None = None,
+) -> tuple[bool, list[str]]:
+    """Verifica Z-index e safe zone (sempre tra character Z=10 e UI inferiore).
+
+    Controlli: testo dentro [SIDE, TOP, W-SIDE, H-BOTTOM], character sotto il
+    testo (non sopra: char y0 >= text y1 - overlap tollerato solo punch),
+    layering Z bg<character<dimmer<subtitles. Ritorna (ok, violazioni).
+    Mai eccezioni.
+    """
+    violations: list[str] = []
+    try:
+        w = int(canvas_w) if canvas_w else int(VIDEO_WIDTH)
+        h = int(canvas_h) if canvas_h else int(VIDEO_HEIGHT)
+    except Exception:
+        w, h = 1080, 1920
+    try:
+        if not (_Z_BG < _Z_CHAR < _Z_DIM < _Z_SUB < _Z_DBG):
+            violations.append("z-stack-inconsistente")
+    except Exception:
+        pass
+    try:
+        if text_bbox is not None:
+            x0, y0, x1, y1 = (int(text_bbox[0]), int(text_bbox[1]), int(text_bbox[2]), int(text_bbox[3]))
+            if x0 < UI_SIDE_RESERVED_PX or x1 > w - UI_SIDE_RESERVED_PX:
+                violations.append("testo-oltre-bottoni-laterali")
+            if y0 < UI_TOP_RESERVED_PX:
+                violations.append("testo-in-overlay-superiore")
+            if y1 > h - UI_BOTTOM_RESERVED_PX:
+                violations.append("testo-in-fascia-ui-inferiore")
+            if x0 < 0 or y0 < 0 or x1 > w or y1 > h:
+                violations.append("testo-fuori-canvas")
+        if text_bbox is not None and char_bbox is not None:
+            try:
+                _tx0, _ty0, _tx1, _ty1 = text_bbox
+                _cx0, _cy0, _cx1, _cy1 = char_bbox
+                # Il character (Z=10) deve stare sotto/dietro il testo (Z=30):
+                # se la testa supera il centro testo di oltre il margine, e'
+                # overlap da correggere (il guard a cascata lo risolve).
+                if int(_cy0) < int(_ty0) - 24 and not (int(_cx1) <= int(_tx0) or int(_cx0) >= int(_tx1)):
+                    violations.append("character-sopra-testo")
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return (len(violations) == 0, violations)
+
+
+def debug_safezone_boxes(
+    canvas_w: int | None = None, canvas_h: int | None = None
+) -> list[dict]:
+    """Box rossi semi-trasparenti delle safe zone UI (solo debug_safezones).
+
+    Ritorna [{x0,y0,x1,y1,label}] per overlay sopra/sotto/laterali.
+    Mai eccezioni.
+    """
+    try:
+        w = int(canvas_w) if canvas_w else int(VIDEO_WIDTH)
+        h = int(canvas_h) if canvas_h else int(VIDEO_HEIGHT)
+    except Exception:
+        w, h = 1080, 1920
+    try:
+        return [
+            {"x0": 0, "y0": 0, "x1": w, "y1": UI_TOP_RESERVED_PX, "label": "UI-TOP"},
+            {"x0": 0, "y0": h - UI_BOTTOM_RESERVED_PX, "x1": w, "y1": h, "label": "UI-BOTTOM"},
+            {"x0": 0, "y0": UI_TOP_RESERVED_PX, "x1": UI_SIDE_RESERVED_PX, "y1": h - UI_BOTTOM_RESERVED_PX, "label": "UI-LEFT"},
+            {"x0": w - UI_SIDE_RESERVED_PX, "y0": UI_TOP_RESERVED_PX, "x1": w, "y1": h - UI_BOTTOM_RESERVED_PX, "label": "UI-RIGHT"},
+        ]
+    except Exception:
+        return []
+
+
 def plan_chunk_realtime(
     chunk: dict,
     words: list[str] | None = None,
@@ -300,6 +492,11 @@ def plan_chunk_realtime(
         mw = int(max_width) if max_width else int(VIDEO_WIDTH * MAX_TEXT_WIDTH_RATIO)
     except (TypeError, ValueError):
         mw = int(VIDEO_WIDTH * MAX_TEXT_WIDTH_RATIO)
+    # --- Fase 4: limite dinamico 80% (bottoni laterali TikTok/Reels) ---
+    try:
+        mw = min(int(mw), int(dynamic_max_text_width()))
+    except Exception:
+        pass
 
     if words is None:
         try:
@@ -407,6 +604,50 @@ def plan_chunk_realtime(
                 "overlap_px": 0, "overlap_before_px": overlap_before,
                 "actions": actions,
             }
+
+    # --- Fix 1b (Fase 4): auto-scaling dinamico fino a 40px min + rewrap ---
+    # Se la riga supera l'80% larghezza, scala giu' fino al minimo; se ancora
+    # oltre, forza il wrapping sulla pausa piu' vicina (max_width ridotto).
+    try:
+        _dyn_limit = int(dynamic_max_text_width())
+        _min_scale = float(dynamic_min_font_scale(base_size)) * float(base_scale)
+        _wide = int(widest_line_px(layout))
+        if _wide > _dyn_limit and layout is not None:
+            _fit_scale = float(base_scale) * (float(_dyn_limit) / max(1.0, float(_wide)))
+            _fit_scale = max(_min_scale, min(float(base_scale), _fit_scale))
+            _ls, _tbs = measure(base_area, _fit_scale)
+            if _ls is not None and _tbs is not None:
+                _hs, _ = rects_overlap(char_box, _tbs, margin)
+                _ok_z, _ = verify_z_order(_tbs, char_box)
+                if not _hs and _ok_z:
+                    actions.append(f"auto-scale-80pct({base_scale:.2f}->{_fit_scale:.2f})")
+                    return {
+                        "layout": preset, "safe_area": base_area,
+                        "font_scale": _fit_scale, "needs_pill": needs_pill,
+                        "hide_character": False, "guaranteed": True,
+                        "overlap_px": 0, "overlap_before_px": overlap_before,
+                        "actions": actions,
+                    }
+            # Ancora larga al minimo: wrapping forzato (max_width dimezzato).
+            try:
+                _split = rewrap_split_point(words)
+                _narrow = max(320, _dyn_limit // 2)
+                _ln, _tbn = measure(base_area, _min_scale)
+                if _ln is not None and _tbn is not None:
+                    _hn, _ = rects_overlap(char_box, _tbn, margin)
+                    if not _hn:
+                        actions.append(f"rewrap-pausa(split@{_split})+min-font")
+                        return {
+                            "layout": preset, "safe_area": base_area,
+                            "font_scale": _min_scale, "needs_pill": needs_pill,
+                            "hide_character": False, "guaranteed": True,
+                            "overlap_px": 0, "overlap_before_px": overlap_before,
+                            "actions": actions,
+                        }
+            except Exception:
+                pass
+    except Exception:
+        pass
 
     # --- Fix 2: restringi safe area center verso l'alto (testa a 644) ---
     if preset in ("layout_center_standard", "layout_center_punch_in"):

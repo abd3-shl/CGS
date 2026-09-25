@@ -47,6 +47,34 @@ from core.video_builder import build_video, cleanup_temp_files, VideoBuildError
 from config import TEMP_DIR, OUTPUT_DIR, VIDEO_FPS, TEXT_ANIMATION_ENABLED, CHARACTER_ENABLED, TYPOGRAPHY_ENGINE_ENABLED, NARRATIVE_ENABLED
 
 
+def _render_mode() -> str:
+    """Render-mode attivo: CLI --render-mode > env RENDER_MODE > 'full'.
+
+    - full: rendering completo ffmpeg.
+    - text_only: solo grafica testo (<5s, nessun ffmpeg pesante).
+    - debug_safezones: box rossi UI Z=99 sopra il video.
+    Mai eccezioni (fallback 'full').
+    """
+    try:
+        import sys as _sys
+        for i, a in enumerate(_sys.argv):
+            if a.startswith("--render-mode="):
+                v = a.split("=", 1)[1].strip().lower()
+                if v in ("full", "text_only", "debug_safezones"):
+                    return v
+            elif a == "--render-mode" and i + 1 < len(_sys.argv):
+                v = _sys.argv[i + 1].strip().lower()
+                if v in ("full", "text_only", "debug_safezones"):
+                    return v
+    except Exception:
+        pass
+    try:
+        v = (os.environ.get("RENDER_MODE", "full") or "full").strip().lower()
+        return v if v in ("full", "text_only", "debug_safezones") else "full"
+    except Exception:
+        return "full"
+
+
 class VideoGeneratorApp:
     def __init__(self, root: tk.Tk):
         self.root = root
@@ -385,6 +413,25 @@ class VideoGeneratorApp:
         except AlignmentError as e:
             self._log(f"      ⚠️ Allineamento saltato ({e}), uso la trascrizione così com'è.")
 
+        # --- Fase 1: arricchimento timestamp (tier/vfx/sfx, start/end invariati) ---
+        try:
+            _words_before = [dict(w) for w in words]
+        except Exception:
+            _words_before = []
+        try:
+            from core.timestamp_enricher import enrich_whisper_timestamps as _enrich_ts
+            _enr = _enrich_ts(words)
+            # Merge solo chiavi additive (timestamp originali mai sovrascritti).
+            for _i, (_o, _e) in enumerate(zip(words, _enr)):
+                try:
+                    for _k in ("tier", "vfx_type", "sfx_trigger"):
+                        if _k in _e:
+                            _o[_k] = _e[_k]
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
         self._log(f"{tag}[5/8] Raggruppamento per enfasi (2-3 parole)...")
         chunks = group_words_by_emphasis(words, on_attempt=self._log_attempt)
         self._log(f"      Creati {len(chunks)} blocchi di sottotitoli.")
@@ -562,21 +609,162 @@ class VideoGeneratorApp:
             enriched_chunks = render_all_subtitles(chunks, keyword_colors, text_rgba)
             self._log("      Immagini statiche generate (animazioni disabilitate).")
 
-        self._log(f"{tag}[8/8] Composizione video finale con ffmpeg (micro-video + overlay)...")
-        output_path = build_video(
-            audio_path, enriched_chunks,
-            output_filename=output_filename,
-            background_color=theme["background_color"],
-        )
+        self._log(f"{tag}[8/8] Composizione video finale (Ken Burns + SFX + mux atomico)...")
+        try:
+            _mode = _render_mode()
+        except Exception:
+            _mode = "full"
+        # --- text_only: bypass ffmpeg pesante (debug grafica testo <5s) ---
+        if _mode == "text_only":
+            try:
+                _first = None
+                for _c in (enriched_chunks or []):
+                    try:
+                        _fps_c = (_c.get("frame_paths") or [])
+                        if _fps_c:
+                            _first = _fps_c[0]
+                            break
+                    except Exception:
+                        continue
+                self._log(f"      text_only: {sum(len(c.get('frames', [])) for c in enriched_chunks)} frame, primo={_first}")
+                try:
+                    from core.invariant_checks import check_temp_containment, check_timestamps_preserved
+                    _ok_t, _msg_t = check_temp_containment()
+                    self._log(f"      invariant temp: {_msg_t}")
+                    try:
+                        _flat_after = [w for _c in chunks for w in (_c.get("words") or [])]
+                        _ok_ts, _msg_ts = check_timestamps_preserved(
+                            [w for w in _words_before], _flat_after) if _words_before and _flat_after else (True, "skip")
+                        self._log(f"      invariant timestamps: {_msg_ts}")
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+                _preview = os.path.join(OUTPUT_DIR, output_filename.replace(".mp4", "_textonly.txt"))
+                try:
+                    with open(_preview, "w", encoding="utf-8") as _f:
+                        _f.write(f"text_only preview: {len(enriched_chunks)} chunk\n")
+                        if _first:
+                            _f.write(f"primo frame: {_first}\n")
+                except Exception:
+                    pass
+                return _preview
+            except Exception as _e_to:
+                self._log(f"      ⚠️ text_only fallito ({_e_to}), proseguo full.")
+        # --- SFX mix best-effort (voce+SFX, mai bloccante) ---
+        _mix_audio = audio_path
+        try:
+            from core.audio_mixer import mix_sfx as _mix_sfx
+            _mix_audio = _mix_sfx(audio_path, enriched_chunks) or audio_path
+            if _mix_audio != audio_path:
+                self._log(f"      Audio mix con SFX: {_mix_audio}")
+        except Exception as _e_sfx:
+            self._log(f"      ⚠️ SFX saltati ({_e_sfx}), uso voce originale.")
+            _mix_audio = audio_path
+        # --- Compose video (Ken Burns + dimmer + overlay, mux atomico) ---
+        try:
+            from core.video_composer import build_composed_video as _compose
+            output_path = _compose(
+                _mix_audio, enriched_chunks,
+                output_filename=output_filename,
+                background_color=theme["background_color"],
+                debug_safezones=(_mode == "debug_safezones"),
+            )
+        except Exception:
+            output_path = build_video(
+                _mix_audio, enriched_chunks,
+                output_filename=output_filename,
+                background_color=theme["background_color"],
+            )
         self._log(f"      Video completato: {output_path}")
+        # --- Test di invariante post-build (assertion automatiche, non fatali) ---
+        try:
+            from core.invariant_checks import run_post_build_checks
+            _flat_after = []
+            try:
+                for _c in chunks:
+                    _flat_after.extend(_c.get("words") or [])
+            except Exception:
+                pass
+            _ok, _det = run_post_build_checks(
+                output_path, _mix_audio, enriched_chunks,
+                _words_before or None, _flat_after or None, strict=False)
+            for _k, (_o, _m) in _det.items():
+                self._log(f"      invariant {_k}: {'OK' if _o else 'FAIL'} ({_m})")
+            if not _ok:
+                self._log("      ⚠️ Invarianti non tutti OK (video comunque valido, vedi sopra).")
+        except Exception as _e_inv:
+            self._log(f"      ⚠️ Invariant checks saltati ({_e_inv}).")
         return output_path
 
 
 def main():
+    import sys as _sys
+    # CLI: --render-mode=full|text_only|debug_safezones (default full, GUI).
+    # Headless opzionale: --script path [--bulk] per batch senza Tk.
+    _script = None
+    _bulk = False
+    try:
+        for i, _a in enumerate(_sys.argv[1:], start=1):
+            if _a.startswith("--script="):
+                _script = _a.split("=", 1)[1]
+            elif _a == "--script" and i < len(_sys.argv) - 1:
+                _script = _sys.argv[i + 1]
+            elif _a == "--bulk":
+                _bulk = True
+    except Exception:
+        pass
+    if _script:
+        # Headless: un file, N video, log su stdout (CI/test rapidi).
+        import traceback as _tb
+        from core.script_loader import parse_scripts, load_scripts_from_file
+        try:
+            with open(_script, "r", encoding="utf-8") as _f:
+                _text = _f.read()
+            _scripts = parse_scripts(_text, bulk_mode=_bulk)
+            if not _bulk:
+                _scripts = _scripts[:1]
+            print(f"CGS headless: {_scripts.__len__()} script (mode={_render_mode()})")
+            # Riutilizza la pipeline senza GUI (log minimi).
+            import types as _types
+            _root = _types.SimpleNamespace(after=lambda ms, fn, *a: fn(*a))
+            app = VideoGeneratorApp.__new__(VideoGeneratorApp)
+            app.root = _root
+            app.bulk_mode = _types.SimpleNamespace(get=lambda: _bulk)
+            app._refresh_job = None
+            app._log = print
+            app._log_attempt = lambda i, t, ok, d: print(f"   {'OK' if ok else '..'} chiave {i}/{t}: {d[:120]}")
+            app._set_ui_busy = lambda b: None
+            from core.script_loader import preview_of as _pv
+            _ok = 0
+            for _idx, _s in enumerate(_scripts, start=1):
+                try:
+                    _p = app._process_one_script(_s, _idx, len(_scripts))
+                    print(f"OK [{_idx}] {_p}")
+                    _ok += 1
+                except Exception as _e:
+                    print(f"FAIL [{_idx}] {_e}")
+                    _tb.print_exc()
+                try:
+                    cleanup_temp_files()
+                except Exception:
+                    pass
+            print(f"Completati {_ok}/{len(_scripts)}")
+            _sys.exit(0 if _ok else 1)
+        except Exception as _e:
+            print(f"Headless errore: {_e}")
+            _tb.print_exc()
+            _sys.exit(2)
+        return
     root = tk.Tk()
     app = VideoGeneratorApp(root)
     root.mainloop()
 
 
 if __name__ == "__main__":
+    import sys as _sys2
+    if any(a in ("-h", "--help") for a in _sys2.argv[1:]):
+        print("Uso: python main.py [--render-mode=full|text_only|debug_safezones] [--script file.txt [--bulk]]")
+        print("  GUI default; --script esegue headless senza Tk.")
+        raise SystemExit(0)
     main()
