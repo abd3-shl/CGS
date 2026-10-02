@@ -553,4 +553,32 @@ Z-Index strict: bg Z=0 < character Z=10 < dimmer Z=20 < subtitles Z=30 < debug Z
 
 ---
 
+## 17. Background music (02/10/2026)
+
+Architettura: `core/music_selector.py` (I/O: scansione `assets/music/<nicchia>`, analisi
+ffprobe/loudnorm/silencedetect con cache portabile `assets/music/_analysis.json`, scelta
+deterministica md5-script + history bulk anti-repeat, fallback `dark_motivational`, manifest
+`assets/audio_licenses.json` se presente) → `core/music_plan.py` (logica pura: keyframe
+`gain_db(t) = voice_lufs + offset_sezione − track_lufs` + boost pause +4 dB / dip hero −4 dB,
+fade qsin, clamp, max 40 keyframe, espressione `volume:eval=frame` in LINEARE) →
+`core/audio_mixer.py::mix_audio_with_music` (catena unica: uniform 44.1k stereo, `asplit` voce
+per sidechain, loop `-stream_loop` + trim lead-silence ≥0.4 s, EQ presenza −3 dB, sidechain
+residua 0.04/2.5/15/450, `alimiter`, loudnorm 2-pass verso −14 LUFS/TP −1.5, intermedi WAV,
+validazione durata ±0.06 s con fallback voce+SFX). Integrazione `main.py` step 8/8
+(`_select_music` + sidecar `outputs/<video>.audio.json` + history bulk), CLI `--no-music /
+--music-track / --music-category / --audio-debug`, GUI checkbox + menu categoria,
+`text_only` invariato (musica saltata). Config: `ENABLE_BG_MUSIC` + 20 `MUSIC_*` /
+`FINAL_*` in `config.py`/`.env.example`; `BG_MUSIC_DUCKING_DB` alias deprecato.
+Bug mixer preesistenti corretti: etichette riusate in `sidechaincompress`+`amix` (ora
+`asplit`), indice input musica `[2:a]` → reale, sidechain ratio 8 → 2.5, catena lossy
+tripla → WAV, espressione volume dB → lineare (i dB negativi clippavano). Misure libreria
+(12 tracce, LUFS −6.2…−17.6, 5 con TP > −1, testa 6.3 s su `blissfully…`): dettaglio in
+`docs/music_analysis_report.md`. Verifica: 20 test `unittest` OK, e2e sintetico 15 s
+−14.02 LUFS / TP −11.3 / AV 0.000 s / boost pause +3 dB / hero dip −6.6 dB / fade ≤ −60 dB,
+`tools/audio_report.py` per i report. Nota: `build_composed_video` + soli chunk statici
+deriva di ~+1 s (preesistente, input-indipendente, fuori scope; i video reali con micro-clip
+restano OK).
+
+---
+
 *Fine report — generato da analisi esaustiva di tutti i 20 file .py + asset + config + git log al 25/09/2026. Per dubbi, rileggere §10 prima di ogni modifica.*
