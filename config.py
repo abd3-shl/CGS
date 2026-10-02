@@ -522,12 +522,7 @@ os.makedirs(TEMP_DIR, exist_ok=True)
 # con tutti i flag a 0 il risultato equivale al comportamento precedente.
 # ============================================================
 
-def _get_bool(key: str, default: bool) -> bool:
-    raw = os.environ.get(key)
-    if raw is None:
-        return default
-    return raw.strip().lower() not in ("0", "false", "no", "off", "")
-
+# (_get_bool unico in alto, con fallback empty->default: vedi helper.)
 
 # ---- Audio master (WS-A) ----
 FINAL_LOUDNESS_LUFS = _get_float("FINAL_LOUDNESS_LUFS", -14.0)

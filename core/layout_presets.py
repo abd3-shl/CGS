@@ -216,16 +216,41 @@ def preset_safe_area(
 
     Le aree sono disegnate per 1080x1920; su canvas diversi vengono scalate
     proporzionalmente (i default di canvas coincidono con le costanti sopra).
+
+    P0 WS-C: quando le safe zone sono attive (SAFE_ZONES_ENABLED=1, default),
+    il box è l'intersezione fra la zona del preset e il safe_rect del profilo
+    piattaforma (universal di default): il testo non finisce mai sotto la UI.
+    Se l'intersezione è degenere, ritorna il box del preset invariato.
     """
     box = PRESET_SAFE_AREA.get(
         normalize_preset(name), PRESET_SAFE_AREA["layout_center_standard"])
     if canvas_w == VIDEO_WIDTH and canvas_h == VIDEO_HEIGHT:
-        return box
-    sx, sy = canvas_w / VIDEO_WIDTH, canvas_h / VIDEO_HEIGHT
-    return (
-        int(round(box[0] * sx)), int(round(box[1] * sy)),
-        int(round(box[2] * sx)), int(round(box[3] * sy)),
-    )
+        scaled = box
+    else:
+        sx, sy = canvas_w / VIDEO_WIDTH, canvas_h / VIDEO_HEIGHT
+        scaled = (
+            int(round(box[0] * sx)), int(round(box[1] * sy)),
+            int(round(box[2] * sx)), int(round(box[3] * sy)),
+        )
+    try:
+        from core.safe_zones import should_use_safe_zones, text_allowed_rect
+        if should_use_safe_zones():
+            inter = text_allowed_rect(scaled, None, canvas_w, canvas_h)
+            # text_allowed_rect ritorna il safe_rect se l'intersezione è
+            # degenere: accettala solo se contenuta nel box del preset
+            # (altrimenti tieni il preset: il guard gestisce il resto).
+            if inter[0] >= scaled[0] - 1 and inter[1] >= scaled[1] - 1 and \
+               inter[2] <= scaled[2] + 1 and inter[3] <= scaled[3] + 1:
+                return inter
+            # Intersezione parziale valida: usala comunque (più restrittiva).
+            if inter[2] > inter[0] and inter[3] > inter[1]:
+                clamped = (max(scaled[0], inter[0]), max(scaled[1], inter[1]),
+                           min(scaled[2], inter[2]), min(scaled[3], inter[3]))
+                if clamped[2] > clamped[0] and clamped[3] > clamped[1]:
+                    return clamped
+    except Exception:
+        pass
+    return scaled
 
 
 def preset_font_scale(name: str) -> float:

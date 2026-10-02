@@ -53,6 +53,7 @@ from core.video_builder import (
     VideoBuildError,
     _check_ffmpeg,
     _chunk_frames,
+    _export_tail_and_filter,
     _ffmpeg_color,
     _get_audio_duration,
     _is_animated_chunk,
@@ -95,6 +96,7 @@ def build_composed_video(
     output_filename: str = "output_video.mp4",
     background_color: str | None = None,
     debug_safezones: bool = False,
+    quality: str | None = None,
 ) -> str:
     """Compone il video finale con background dinamico + dimmer + overlay.
 
@@ -198,7 +200,7 @@ def build_composed_video(
                 _fu.result()
     clip_infos = [c for c in clip_infos if c is not None]
 
-    # --- Filter graph: bg Ken Burns + dimmer, poi overlay chunk, poi debug ---
+    # --- Filter graph: bg Ken Burns + dimmer + grain, poi overlay chunk, poi debug ---
     inputs = [
         "-f", "lavfi",
         "-i", f"color=c={bg}:s={big_w}x{big_h}:r={VIDEO_FPS}:d={duration}",
@@ -209,8 +211,23 @@ def build_composed_video(
 
     parts: list[str] = []
     # Z=0 -> Z=20: background dinamico + dimmer/vignette (solo sfondo).
-    parts.append(f"[0:v]{kenburns_filter(duration)}[bgzoom]")
-    parts.append("[bgzoom]" + dimmer_filter() + "[base]")
+    # P0 WS-E2: grain leggero DOPO Ken Burns/eq/vignette e PRIMA dell'overlay
+    # (solo fondo, mai su testo/personaggio; mai in debug_safezones).
+    _grain = ""
+    if not debug_safezones:
+        try:
+            from core.export_profile import grain_filter as _gf, should_use_export_profile as _use
+            if _use():
+                _grain = _gf()
+        except Exception:
+            _grain = ""
+    _dimmer = dimmer_filter()
+    if _grain:
+        parts.append(f"[0:v]{kenburns_filter(duration)}[bgzoom]")
+        parts.append(f"[bgzoom]{_dimmer},{_grain}[base]")
+    else:
+        parts.append(f"[0:v]{kenburns_filter(duration)}[bgzoom]")
+        parts.append("[bgzoom]" + _dimmer + "[base]")
     last = "base"
     for idx, (_clip_path, start, end, is_video) in enumerate(clip_infos):
         in_idx = idx + 2
@@ -244,26 +261,18 @@ def build_composed_video(
     filter_complex = ";".join(parts)
     output_path = os.path.join(OUTPUT_DIR, output_filename)
 
-    preset = (os.environ.get("FFMPEG_PRESET", FFMPEG_PRESET) or "veryfast").strip() or "veryfast"
-    if preset not in ("ultrafast", "superfast", "veryfast", "faster", "fast", "medium"):
-        preset = "veryfast"
+    # P0 WS-E1: encode centralizzato (stessi args del builder) + BT.709 finale.
+    parts, last, _encode_args = _export_tail_and_filter(
+        parts, last, quality, debug_mode=bool(debug_safezones))
+    filter_complex = ";".join(parts)
     # Passaggio 1: video track (filter pesanti isolati) + mux atomico finale.
     cmd = ["ffmpeg", "-y", "-threads", "auto"] + inputs + [
         "-filter_complex", filter_complex,
         "-map", f"[{last}]",
         "-map", "1:a",
-        "-c:v", "libx264",
-        "-preset", preset,
-        "-crf", "20",
-        "-g", "60",
-        "-keyint_min", "30",
-        "-pix_fmt", "yuv420p",
-        "-movflags", "+faststart",
+    ] + _encode_args + [
         "-filter_threads", "auto",
         "-threads", "auto",
-        "-c:a", "aac",
-        "-b:a", "192k",
-        "-shortest",
         output_path,
     ]
     res = subprocess.run(cmd, capture_output=True, text=True)

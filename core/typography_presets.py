@@ -58,7 +58,7 @@ TYPOGRAPHY_PRESETS: dict[str, dict] = {
             "stroke": "#000000",
         },
         "sizes": {
-            "base": 60,
+            "base": 84,
             "impact_scale": 1.4,   # 84px
             "accent_scale": 1.1,   # 66px
         },
@@ -80,7 +80,7 @@ TYPOGRAPHY_PRESETS: dict[str, dict] = {
             "stroke": "#000000",
         },
         "sizes": {
-            "base": 60,
+            "base": 84,
             "impact_scale": 1.4,
             "accent_scale": 1.1,
         },
@@ -102,7 +102,7 @@ TYPOGRAPHY_PRESETS: dict[str, dict] = {
             "stroke": "#000000",
         },
         "sizes": {
-            "base": 60,
+            "base": 84,
             "impact_scale": 1.45,  # più aggressivo
             "accent_scale": 1.1,
         },
@@ -124,7 +124,7 @@ TYPOGRAPHY_PRESETS: dict[str, dict] = {
             "stroke": "#000000",
         },
         "sizes": {
-            "base": 60,
+            "base": 84,
             "impact_scale": 1.3,
             "accent_scale": 1.1,
         },
@@ -146,7 +146,7 @@ TYPOGRAPHY_PRESETS: dict[str, dict] = {
             "stroke": "#000000",
         },
         "sizes": {
-            "base": 60,
+            "base": 84,
             "impact_scale": 1.35,
             "accent_scale": 1.1,
         },
@@ -173,7 +173,7 @@ TYPOGRAPHY_PRESETS: dict[str, dict] = {
             "stroke": "#000000",
         },
         "sizes": {
-            "base": 62,
+            "base": 84,
             "impact_scale": 1.45,  # 90px, massimo impatto cinematico
             "accent_scale": 1.1,
         },

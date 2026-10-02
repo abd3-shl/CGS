@@ -430,9 +430,10 @@ Prodotto da Whisper → riallineato (parole script) → arricchito con keyword/t
 
 ## 10. Invarianti critici per futuri LLM (leggere prima di modificare)
 
-1. **Timestamp immutabili dopo alignment:** LLM (emphasis/character/tagging/keyword/theme) non devono mai alterare `start/end`; solo indici/tag/colori/layout. `text_animator` assume `layout==words` per conteggio. Il tail gap-hold clona `t_N`, non sposta `end` semantico (solo `clip_end`).
+1. **Timestamp: immutabili DOPO il Pause Engine (P0, modifica controllata):** LLM (emphasis/character/tagging/keyword/theme) non devono mai alterare `start/end`; il Pause Engine (`core/pause_planner.py` + `core/pause_editor.py`) applica UNA volta un time-warp deterministico conservando `orig_start`/`orig_end` come chiavi additive — dopo quello stadio `start/end` sono autoritativi per l'audio editato. `text_animator` assume `layout==words` per conteggio. `invariant_checks.check_timestamps_preserved` verifica la coerenza via mappa di retime (non fatale). Il tail gap-hold clona `t_N`, non sposta `end` semantico (solo `clip_end`).
 2. **Single source layout:** testo e personaggio risolvono entrambi da `resolve_chunk_layout` + `layout_presets` + `layout_guard`. Non duplicare geometria. L'ancoraggio macro-blocco (`block-anchor`) vince sullo switch singolo.
 3. **Z-index:** ffmpeg bg < personaggio < pill < testo. Non invertire.
+3b. **Look pulito condizionato (P0, modifica controllata dell'ex "stroke 0"):** stroke 0 / nessuna ombra SOLO quando lo sfondo è piatto e il contrasto è alto (livello 0 di `core/legibility.py`, che azzera anche il bordo 3px della cinetica avanzata T0/T1). Su sfondi complessi o contrasto insufficiente si attivano stroke/ombra/scrim adattivi (livelli 1-3). Il margine di sicurezza 24px del guard assorbe l'espansione degli effetti (≤19px).
 4. **Punch-in raro:** max 2/video (o hook1+corpo1, CTA 0 via `_cap_punch_ins_narrative`). Non aumentare senza aggiornare cap + guard.
 5. **Contrasto:** ogni colore testo/keyword deve superare `THEME_MIN_LUMINANCE_DIFF` sullo sfondo. Validare come `theme.py`/`_styled_fills` (incluso highlight/accent preset + flip base).
 6. **Keyword verbatim:** devono esistere `normalize_word` nello script, altrimenti scartate. Non fare fuzzy senza aggiornare renderer match.
@@ -582,3 +583,25 @@ restano OK).
 ---
 
 *Fine report — generato da analisi esaustiva di tutti i 20 file .py + asset + config + git log al 25/09/2026. Per dubbi, rileggere §10 prima di ogni modifica.*
+
+---
+
+## 14. P0 — Pacchetto qualità (02/10/2026)
+
+### 14.1 Audio master (`core/audio_master.py`)
+Catena: TTS mp3 → decode WAV (`*_raw.wav`) → Pause Engine (`*_edit.wav`) → voice polish (`*_polish.wav`, highpass+compressore lievi, `VOICE_POLISH=1`) → mix voce+SFX(+musica) → `master_audio()` (`*_master.wav`, alimiter + loudnorm 2-pass `linear=true` verso −14 LUFS/TP −1.5) → mux AAC 192k (**unico encode lossy**). Il mixer musicale chiama `master_audio()` come stadio finale condiviso (stessi nomi config). Post-encode check sull'mp4: se TP > −1.0 dBTP, un solo re-master con TP ridotto + re-mux. Misura reale (sintetico 3.4s): master −13.98 LUFS, finale mp4 −14.0 LUFS / TP −8.69. `--audio-debug` conserva WAV + `audio_debug_NNN.json`; `cleanup_temp_files(keep_audio_debug=True)` li preserva.
+
+### 14.2 TTS + Pause Engine (`core/tts.py`, `core/pause_planner.py`, `core/pause_editor.py`)
+`voice_settings` da config + profili nicchia (euristica `_heuristic_niche` PRIMA del TTS, riusata per tipografia) con clamp speed [1.0,1.15] e style ≤0.45; mappa capacità per modello + downgrade a 400/422 (mai TTSError per parametri). Pause Engine dopo align: planner puro (confini sentence/clause/none, pace tight/balanced/breathing, drammatiche deterministiche max 1/3s, head 0.06s/tail 0.35s, budget 12%, floor 5s) + editor stdlib (tagli solo su silenzio <−45dBFS, crossfade equal-power 12ms, bed di rumore campionato, mappa esatta al campione). Log: `[Pause] profilo … | N accorciate (−s) | …`. `PAUSE_VERIFY_WITH_WHISPER=0` per verifica opzionale.
+
+### 14.3 Safe zone (`core/safe_zones.py`)
+Profili tiktok/reels/shorts/universal(default: top 150, bottom 420, laterali 120, rail 220 in y 700–1600) + cover-safe 285px; override via JSON. `preset_safe_area()` = intersezione preset∩profilo (CTA card/logout sopra il bottom automaticamente); guard/verify/debug derivano dal profilo; summary con `ui_violations`. DEROGA documentata: box split 296–360px < 520px ideali (geometria personaggi invariata; il guard riduce il font fino a 56px).
+
+### 14.4 Leggibilità (`core/legibility.py`, `core/background_probe.py`)
+Base 60→84px (preset nicchia allineati), minimo 40→56px. Livelli WCAG 0–3 (stroke 0–8px, ombra blur, scrim 0.40, pill); livello 0 = look identico a oggi (misura: +2.2% tempo render, budget +25%). Pop ridisegnato a scala quantizzata (2%, cache varianti font) invece del resize bitmap; ombra segue alpha/fade. Probe flat oggi (livello 0), frame-probe pronta per B-roll via `background_source`.
+
+### 14.5 Export (`core/export_profile.py`, WS-E2)
+Profili draft/standard/final (default final: slow/CRF17, `high`, level 4.2, maxrate 16M, GOP 60, faststart, AAC 192k/44.1k); `FFMPEG_PRESET` esplicito ha precedenza; builder+composer usano gli stessi args. BT.709 con CONVERSIONE esplicita (`scale=…out_color_matrix=bt709…`) + tag (inclusi `-x264-params colorprim/transfer/colormatrix`, senza i quali questa build ffmpeg lascia transfer/primaries `unknown` — verificato). Fedeltà colore #FF3366: ΔRGB (1,2,3) ≤3. Grain `noise=alls=5` solo fondo (A/B: var 1.82 vs 0.31). Intermedi già lossless (PNG in .mov) → nessuna azione oltre il refactor. `tools/export_report.py` per QA misurabile; invariant_checks estesi (loudness, colore, safe zone profilo, retime) sempre non fatali.
+
+### 14.6 Test
+`tests/test_pause_planner.py`, `test_pause_editor.py` (WAV sintetico), `test_safe_zones.py`, `test_legibility.py` (gradienti/rumore/scacchiera), `test_tts_settings.py` (mock 400→downgrade), `test_export_profile.py`. Suite: 68 test OK (`python -m unittest discover -s tests`).

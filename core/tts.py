@@ -40,6 +40,191 @@ class TTSError(Exception):
 _RETRYABLE_STATUS = {401, 402, 403, 429, 500, 502, 503, 504}
 
 
+def _cfg_float(key: str, default: float) -> float:
+    try:
+        import config as _c
+        return float(getattr(_c, key, default))
+    except (TypeError, ValueError):
+        return default
+
+
+def _cfg_bool(key: str, default: bool) -> bool:
+    try:
+        import config as _c
+        val = getattr(_c, key, default)
+        if isinstance(val, bool):
+            return val
+        return str(val).strip().lower() not in ("0", "false", "no", "off", "")
+    except Exception:
+        return default
+
+
+# Profili voce per nicchia (default da spec P0; override via TTS_PROFILES_JSON).
+# Nessuna chiamata LLM: la nicchia arriva da detect_niche euristico prima del TTS.
+TTS_PROFILES: dict[str, dict] = {
+    "fitness_sport": {"stability": 0.40, "style": 0.40, "speed": 1.10},
+    "dark_motivational": {"stability": 0.45, "style": 0.35, "speed": 1.06},
+    "tech_ai": {"stability": 0.50, "style": 0.25, "speed": 1.08},
+    "lifestyle_vlog": {"stability": 0.45, "style": 0.30, "speed": 1.08},
+    "business_finance": {"stability": 0.55, "style": 0.20, "speed": 1.06},
+    "educational": {"stability": 0.60, "style": 0.15, "speed": 1.04},
+}
+
+# Capacità voice_settings per modello: alcuni modelli (es. v3/Flash) non
+# accettano `style` / `use_speaker_boost`. Override via
+# ELEVENLABS_MODEL_CAPABILITIES_JSON: {"model_id": ["stability", ...]}.
+_MODEL_CAPABILITIES: dict[str, set[str]] = {
+    "eleven_multilingual_v2": {"stability", "similarity_boost", "style", "speed", "use_speaker_boost"},
+    "eleven_multilingual_v1": {"stability", "similarity_boost", "style", "use_speaker_boost"},
+    "eleven_monolingual_v1": {"stability", "similarity_boost"},
+    "eleven_turbo_v2": {"stability", "similarity_boost", "speed"},
+    "eleven_turbo_v2_5": {"stability", "similarity_boost", "speed"},
+    "eleven_flash_v2": {"stability", "similarity_boost", "speed"},
+    "eleven_flash_v2_5": {"stability", "similarity_boost", "speed"},
+}
+
+_FULL_SETTINGS = ("stability", "similarity_boost", "style", "speed", "use_speaker_boost")
+
+
+def _custom_profiles() -> dict:
+    """Override JSON dei profili da .env (TTS_PROFILES_JSON). Mai eccezioni."""
+    try:
+        import config as _c
+        raw = str(getattr(_c, "TTS_PROFILES_JSON", "") or "").strip()
+    except Exception:
+        return {}
+    if not raw:
+        return {}
+    try:
+        import json as _json
+        data = _json.loads(raw)
+        if isinstance(data, dict):
+            return data
+    except Exception:
+        pass
+    return {}
+
+
+def model_capabilities(model_id: str | None) -> set[str]:
+    """Chiavi voice_settings accettate dal modello (mai eccezioni)."""
+    try:
+        mid = str(model_id or "").strip()
+    except Exception:
+        mid = ""
+    # Override esplicito da env.
+    try:
+        import config as _c
+        raw = str(getattr(_c, "ELEVENLABS_MODEL_CAPABILITIES_JSON", "") or "").strip()
+        if raw:
+            import json as _json
+            data = _json.loads(raw)
+            if isinstance(data, dict) and mid in data and isinstance(data[mid], list):
+                return {str(k) for k in data[mid]}
+    except Exception:
+        pass
+    if mid in _MODEL_CAPABILITIES:
+        return set(_MODEL_CAPABILITIES[mid])
+    # Modello ignoto: prudente (solo i due universali).
+    if not mid:
+        return set(_FULL_SETTINGS)
+    return {"stability", "similarity_boost"}
+
+
+def build_voice_settings(
+    niche: str | None = None,
+    model_id: str | None = None,
+) -> dict:
+    """Costruisce le voice_settings (puro, testabile).
+
+    - Base da config (TTS_STABILITY/SIMILARITY/STYLE/SPEED/SPEAKER_BOOST).
+    - Override per nicchia (TTS_PROFILES + TTS_PROFILES_JSON).
+    - Clamp: speed in [TTS_SPEED_MIN, TTS_SPEED_MAX], style in [0, 0.45].
+    - Filtra per capacità del modello (style/speaker_boost non universali).
+    """
+    try:
+        stability = _cfg_float("TTS_STABILITY", 0.5)
+        similarity = _cfg_float("TTS_SIMILARITY", 0.75)
+        style = _cfg_float("TTS_STYLE", 0.25)
+        speed = _cfg_float("TTS_SPEED", 1.08)
+        boost = _cfg_bool("TTS_USE_SPEAKER_BOOST", True)
+    except Exception:
+        stability, similarity, style, speed, boost = 0.5, 0.75, 0.25, 1.08, True
+    # Profili per nicchia (custom JSON vince sui default).
+    try:
+        key = str(niche or "").strip().lower().replace("-", "_").replace(" ", "_")
+        merged = dict(TTS_PROFILES)
+        for k, v in _custom_profiles().items():
+            if isinstance(v, dict):
+                merged[str(k)] = v
+        prof = merged.get(key)
+        if isinstance(prof, dict):
+            if "stability" in prof:
+                stability = float(prof["stability"])
+            if "style" in prof:
+                style = float(prof["style"])
+            if "speed" in prof:
+                speed = float(prof["speed"])
+            if "similarity_boost" in prof:
+                similarity = float(prof["similarity_boost"])
+            if "use_speaker_boost" in prof:
+                boost = bool(prof["use_speaker_boost"])
+    except (TypeError, ValueError):
+        pass
+    except Exception:
+        pass
+    # Clamp di sicurezza (speed valido 0.7-1.2; default [1.0, 1.15]).
+    try:
+        smin = _cfg_float("TTS_SPEED_MIN", 1.0)
+        smax = _cfg_float("TTS_SPEED_MAX", 1.15)
+        lo, hi = (min(smin, smax), max(smin, smax))
+    except Exception:
+        lo, hi = 1.0, 1.15
+    try:
+        speed = min(hi, max(lo, float(speed)))
+    except (TypeError, ValueError):
+        speed = 1.08
+    try:
+        style = min(0.45, max(0.0, float(style)))
+    except (TypeError, ValueError):
+        style = 0.25
+    try:
+        stability = min(1.0, max(0.0, float(stability)))
+        similarity = min(1.0, max(0.0, float(similarity)))
+    except (TypeError, ValueError):
+        pass
+    full = {
+        "stability": stability,
+        "similarity_boost": similarity,
+        "style": style,
+        "speed": speed,
+        "use_speaker_boost": bool(boost),
+    }
+    try:
+        caps = model_capabilities(model_id if model_id is not None else ELEVENLABS_MODEL_ID)
+        return {k: v for k, v in full.items() if k in caps}
+    except Exception:
+        return {"stability": stability, "similarity_boost": similarity}
+
+
+def downgrade_voice_settings(settings: dict) -> dict | None:
+    """Livello inferiore di voice_settings dopo un 400/422 (puro).
+
+    full (5 chiavi) → senza style/speaker_boost (3 chiavi) → solo i primi due.
+    Ritorna None se già al minimo (il chiamante solleva TTSError).
+    """
+    try:
+        keys = set(settings or {})
+    except Exception:
+        return None
+    if "style" in keys or "use_speaker_boost" in keys:
+        return {k: v for k, v in settings.items()
+                if k in ("stability", "similarity_boost", "speed")}
+    if "speed" in keys:
+        return {k: v for k, v in settings.items()
+                if k in ("stability", "similarity_boost")}
+    return None
+
+
 def _mask_key(key: str) -> str:
     """Maschera una chiave per i log (mostra solo inizio/fine)."""
     if len(key) <= 8:
@@ -51,6 +236,7 @@ def generate_audio(
     script_text: str,
     output_filename: str = "narration.mp3",
     on_attempt: Callable[[int, int, bool, str], None] | None = None,
+    niche: str | None = None,
 ) -> str:
     """
     Genera un file audio a partire dal testo dello script, usando ElevenLabs.
@@ -103,10 +289,7 @@ def generate_audio(
     payload = {
         "text": script_text,
         "model_id": ELEVENLABS_MODEL_ID,
-        "voice_settings": {
-            "stability": 0.5,
-            "similarity_boost": 0.75,
-        },
+        "voice_settings": build_voice_settings(niche, ELEVENLABS_MODEL_ID),
     }
     params = {"output_format": ELEVENLABS_OUTPUT_FORMAT}
 
@@ -152,6 +335,73 @@ def generate_audio(
             if on_attempt is not None:
                 on_attempt(index, total, False, note)
             continue
+
+        # 400/422 con riferimento a voice_settings: il modello potrebbe non
+        # accettare style/speed/speaker_boost → downgrade e UN solo retry con
+        # la stessa chiave (mai fatale per questo motivo).
+        if response.status_code in (400, 422):
+            try:
+                body_low = (response.text or "").lower()
+            except Exception:
+                body_low = ""
+            if "voice_settings" in body_low or "voice setting" in body_low:
+                lowered = downgrade_voice_settings(payload.get("voice_settings") or {})
+                if lowered is not None:
+                    try:
+                        if on_attempt is not None:
+                            on_attempt(index, total, False,
+                                       f"chiave {index}/{total}: downgrade voice_settings "
+                                       f"({sorted((payload.get('voice_settings') or {}).keys())} -> "
+                                       f"{sorted(lowered.keys())})")
+                    except Exception:
+                        pass
+                    payload = dict(payload)
+                    payload["voice_settings"] = lowered
+                    try:
+                        response2 = requests.post(url, json=payload, params=params,
+                                                  headers=headers, timeout=120)
+                    except requests.RequestException as e2:
+                        note = (f"chiave {index}/{total} ({_mask_key(api_key)}): "
+                                f"errore di rete al retry: {e2}")
+                        failures.append(note)
+                        if on_attempt is not None:
+                            on_attempt(index, total, False, note)
+                        continue
+                    if response2.status_code == 200:
+                        if on_attempt is not None:
+                            on_attempt(index, total, True,
+                                       f"chiave {index}/{total}: audio generato (downgrade)")
+                        output_path = os.path.join(TEMP_DIR, output_filename)
+                        with open(output_path, "wb") as f:
+                            f.write(response2.content)
+                        return output_path
+                    # Secondo livello di downgrade (solo stability+similarity).
+                    lowered2 = downgrade_voice_settings(lowered)
+                    if lowered2 is not None and response2.status_code in (400, 422):
+                        payload["voice_settings"] = lowered2
+                        try:
+                            response3 = requests.post(url, json=payload, params=params,
+                                                      headers=headers, timeout=120)
+                        except requests.RequestException:
+                            response3 = None
+                        if response3 is not None and response3.status_code == 200:
+                            if on_attempt is not None:
+                                on_attempt(index, total, True,
+                                           f"chiave {index}/{total}: audio generato (downgrade 2)")
+                            output_path = os.path.join(TEMP_DIR, output_filename)
+                            with open(output_path, "wb") as f:
+                                f.write(response3.content)
+                            return output_path
+                        if response3 is not None:
+                            detail = (
+                                f"Errore ElevenLabs ({response3.status_code}) "
+                                f"[voce {voice_id}]: {response3.text[:300]}"
+                            )
+                    else:
+                        detail = (
+                            f"Errore ElevenLabs ({response2.status_code}) "
+                            f"[voce {voice_id}]: {response2.text[:300]}"
+                        )
 
         # 400/404(voce unica)/422 (richiesta o configurazione non valida):
         # un'altra chiave non risolverebbe, fallimento immediato.

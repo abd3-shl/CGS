@@ -76,10 +76,38 @@ def check_temp_containment(temp_dir: str | None = None) -> tuple[bool, str]:
 
 
 def check_timestamps_preserved(before: list[dict], after: list[dict]) -> tuple[bool, str]:
-    """I campi start/end non devono mai essere alterati (confronto 1:1)."""
+    """I campi start/end: preservati OPPURE retimati coerentemente (P0 WS-B).
+
+    Invariante #1 (modifica controllata): fino al Pause Engine start/end sono
+    quelli di Whisper+align; dopo, il Pause Engine applica un time-warp
+    deterministico UNA volta conservando `orig_start`/`orig_end` come chiavi
+    additive. Questo check verifica la coerenza tramite la mappa di retime:
+      - se `after` ha orig_start/orig_end → before.start deve coincidere con
+        after.orig_start (stesso conteggio, stessi originali) e after.start/end
+        devono essere monotoni;
+      - altrimenti (nessun retime) → confronto 1:1 come prima.
+    Sempre non fatale (il chiamante logga).
+    """
     try:
         if len(before) != len(after):
             return (False, f"conteggio diverso {len(before)} vs {len(after)}")
+        retimed = any(isinstance(a, dict) and ("orig_start" in a or "orig_end" in a)
+                      for a in (after or []))
+        if retimed:
+            prev = -1e9
+            for i, (b, a) in enumerate(zip(before, after)):
+                try:
+                    if abs(float(b.get("start", -1)) - float(a.get("orig_start", -2))) > 1e-6:
+                        return (False, f"orig_start incoerente idx {i} (retime non tracciato)")
+                    if abs(float(b.get("end", -1)) - float(a.get("orig_end", -2))) > 1e-6:
+                        return (False, f"orig_end incoerente idx {i} (retime non tracciato)")
+                    s, e = float(a.get("start", 0.0)), float(a.get("end", 0.0))
+                    if not (e > s and s >= prev - 1e-6):
+                        return (False, f"timeline retimata non monotona idx {i}")
+                    prev = e
+                except Exception:
+                    return (False, f"timestamp non numerici idx {i}")
+            return (True, f"{len(before)} timestamp retimati coerenti (mappa orig_*)")
         for i, (b, a) in enumerate(zip(before, after)):
             try:
                 if abs(float(b.get("start", -1)) - float(a.get("start", -2))) > 1e-6:
@@ -94,12 +122,18 @@ def check_timestamps_preserved(before: list[dict], after: list[dict]) -> tuple[b
 
 
 def check_z_order_safe(chunks: list[dict] | None) -> tuple[bool, str]:
-    """Nessuna violazione critica safe-zone (testo fuori canvas = fail)."""
+    """Nessuna violazione critica safe-zone (P0: anche profilo piattaforma).
+
+    Controlli: testo fuori canvas = fail; testo fuori safe zone del profilo
+    (top/bottom/laterali/rail) = violazioni loggate ma NON fatali in questa
+    fase (il guard dovrebbe già averle azzerate: ui_violations=0 atteso).
+    """
     try:
         from core.layout_guard import verify_z_order, text_bbox_of_layout
 
         bad = 0
         notes: list[str] = []
+        ui_bad = 0
         for ch in (chunks or []):
             try:
                 layout = ch.get("layout_items") or ch.get("layout")
@@ -112,13 +146,75 @@ def check_z_order_safe(chunks: list[dict] | None) -> tuple[bool, str]:
                     if critical:
                         bad += 1
                         notes.extend(critical)
+                    else:
+                        ui_bad += 1
+                        notes.extend([v for v in viol if v != "testo-fuori-canvas"])
             except Exception:
                 continue
         if bad:
             return (False, f"{bad} chunk fuori canvas: {sorted(set(notes))[:3]}")
-        return (True, "safe-zone ok (nessun fuori-canvas)")
+        if ui_bad:
+            return (True, f"safe-zone: {ui_bad} chunk con violazioni profilo {sorted(set(notes))[:4]} (non fatale)")
+        return (True, "safe-zone ok (canvas + profilo)")
     except Exception as e:
         return (True, f"z-check saltato ({e})")
+
+
+def check_loudness(video_path: str) -> tuple[bool, str]:
+    """P0: loudness finale −14 ±1 LUFS, true peak ≤ −1.0 dBTP (non fatale)."""
+    try:
+        from core.audio_master import measure_loudness as _ml
+        m = _ml(video_path)
+        if not m:
+            return (True, "loudness non misurabile (skip)")
+        msgs = []
+        ok = True
+        try:
+            lufs = float(m.get("lufs"))
+            msgs.append(f"{lufs:.1f} LUFS")
+            if abs(lufs - (-14.0)) > 1.0:
+                ok = False
+        except (TypeError, ValueError):
+            msgs.append("LUFS n.d.")
+        try:
+            tp = float(m.get("true_peak"))
+            msgs.append(f"TP {tp:.2f} dBTP")
+            if tp > -1.0:
+                ok = False
+        except (TypeError, ValueError):
+            msgs.append("TP n.d.")
+        return (ok, ", ".join(msgs))
+    except Exception as e:
+        return (True, f"loudness check saltato ({e})")
+
+
+def check_color_tags(video_path: str) -> tuple[bool, str]:
+    """P0: tag colore bt709 presenti + yuv420p (non fatale)."""
+    try:
+        res = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=color_space,color_transfer,color_primaries,color_range,pix_fmt,profile",
+             "-of", "default=noprint_wrappers=1", video_path],
+            capture_output=True, text=True, timeout=60,
+        )
+        if res.returncode != 0:
+            return (True, "ffprobe colore indisponibile (skip)")
+        info: dict = {}
+        for line in (res.stdout or "").splitlines():
+            try:
+                k, _, v = line.strip().partition("=")
+                info[k.strip()] = v.strip()
+            except Exception:
+                continue
+        tags_ok = (info.get("color_space") == "bt709" and info.get("color_transfer") == "bt709"
+                   and info.get("color_primaries") == "bt709")
+        pix_ok = info.get("pix_fmt") == "yuv420p"
+        ok = bool(tags_ok and pix_ok)
+        return (ok, f"space={info.get('color_space')} trc={info.get('color_transfer')} "
+                    f"prim={info.get('color_primaries')} range={info.get('color_range')} "
+                    f"pix={info.get('pix_fmt')} profile={info.get('profile')}")
+    except Exception as e:
+        return (True, f"color check saltato ({e})")
 
 
 def run_post_build_checks(
@@ -154,9 +250,22 @@ def run_post_build_checks(
         ok_z, msg_z = check_z_order_safe(chunks)
     except Exception as e:
         ok_z, msg_z = True, f"z-check saltato ({e})"
+    # P0: loudness + tag colore (sempre non fatali: ok resta sui 4 storici
+    # a meno che strict non richieda tutto).
+    try:
+        ok_l, msg_l = check_loudness(video_path)
+    except Exception as e:
+        ok_l, msg_l = True, f"loudness saltato ({e})"
+    try:
+        ok_c, msg_c = check_color_tags(video_path)
+    except Exception as e:
+        ok_c, msg_c = True, f"colori saltati ({e})"
     details = {"av_sync": (ok_av, msg_av), "temp": (ok_tmp, msg_tmp),
-               "timestamps": (ok_ts, msg_ts), "z_order": (ok_z, msg_z)}
+               "timestamps": (ok_ts, msg_ts), "z_order": (ok_z, msg_z),
+               "loudness": (ok_l, msg_l), "color": (ok_c, msg_c)}
     ok = bool(ok_av and ok_tmp and ok_ts and ok_z)
+    if strict:
+        ok = bool(ok and ok_l and ok_c)
     if strict and not ok:
         raise AssertionError(f"invariant checks falliti: {details}")
     return (ok, details)

@@ -29,6 +29,20 @@ from config import (
     TEMP_DIR,
 )
 
+try:
+    from core.export_profile import (
+        build_video_encode_args as _export_encode_args,
+        color_convert_filter as _color_convert_filter,
+        get_export_profile as _get_export_profile,
+        grain_filter as _grain_filter,
+        legacy_encode_args as _legacy_encode_args,
+        probe_encoder_support as _probe_encoder_support,
+        should_use_export_profile as _should_use_export,
+    )
+    _HAS_EXPORT_PROFILE = True
+except Exception:  # modulo opzionale: path legacy invariato
+    _HAS_EXPORT_PROFILE = False
+
 
 class VideoBuildError(Exception):
     """Errore durante la composizione del video con ffmpeg."""
@@ -65,6 +79,90 @@ def _ffmpeg_color(hex_color: str | None) -> str:
     if isinstance(hex_color, str) and re.fullmatch(r"#[0-9A-Fa-f]{6}", hex_color):
         return "0x" + hex_color[1:]
     return "black"
+
+
+def _export_tail_and_filter(
+    filter_parts: list[str],
+    last_label: str,
+    quality: str | None = None,
+    debug_mode: bool = False,
+) -> tuple[list[str], str, list[str]]:
+    """Applica grain (solo fondo) + conversione BT.709 e ritorna gli args encode.
+
+    P0 WS-E1/E2, best-effort: se il modulo export non è disponibile o
+    EXPORT_ENABLED=0, ritorna il path legacy (crf 20, nessun filtro colore).
+
+    Returns:
+        (filter_parts, last_label_finale, encode_args).
+    """
+    if not _HAS_EXPORT_PROFILE:
+        return filter_parts, last_label, _legacy_fallback_args()
+    try:
+        use_export = bool(_should_use_export())
+    except Exception:
+        use_export = True
+    if not use_export:
+        return filter_parts, last_label, _legacy_encode_args_fallback()
+    try:
+        prof = _get_export_profile(quality)
+    except Exception:
+        return filter_parts, last_label, _legacy_encode_args_fallback()
+    # Grain solo sul fondo: inserito come testa del ramo background (dopo
+    # Ken Burns/eq nei composer; qui sullo sfondo tinta unita prima overlay).
+    # Il grain va applicato al flusso [0:v] prima degli overlay: lo si fa
+    # rinominando la sorgente bg in [p0bg] e partendo da lì.
+    try:
+        g = "" if debug_mode else _grain_filter()
+    except Exception:
+        g = ""
+    if g:
+        try:
+            filter_parts = [f"[0:v]{g}[p0bg]"] + [
+                p.replace("[0:v]", "[p0bg]", 1) if p.startswith("[0:v]") else p
+                for p in filter_parts
+            ]
+            if last_label == "0:v":
+                last_label = "p0bg"
+        except Exception:
+            pass
+    # Conversione BT.709 corretta come ULTIMO filtro video.
+    try:
+        conv = _color_convert_filter()
+        out_label = "p0out"
+        filter_parts = list(filter_parts) + [f"[{last_label}]{conv}[{out_label}]"]
+        last_label = out_label
+    except Exception:
+        pass
+    try:
+        caps = _probe_encoder_support()
+    except Exception:
+        caps = {"high": True, "level": True}
+    try:
+        args = _export_encode_args(prof, VIDEO_FPS, caps)
+    except Exception:
+        return filter_parts, last_label, _legacy_encode_args_fallback()
+    return filter_parts, last_label, args
+
+
+def _legacy_fallback_args() -> list[str]:
+    """Args legacy inline (se export_profile manca del tutto)."""
+    import os as _os2
+    _preset = (_os2.environ.get("FFMPEG_PRESET", "veryfast") or "veryfast").strip() or "veryfast"
+    if _preset not in ("ultrafast", "superfast", "veryfast", "faster", "fast", "medium"):
+        _preset = "veryfast"
+    return [
+        "-c:v", "libx264", "-preset", _preset, "-crf", "20",
+        "-g", "60", "-keyint_min", "30", "-pix_fmt", "yuv420p",
+        "-movflags", "+faststart",
+        "-c:a", "aac", "-b:a", "192k", "-shortest",
+    ]
+
+
+def _legacy_encode_args_fallback() -> list[str]:
+    try:
+        return _legacy_encode_args()
+    except Exception:
+        return _legacy_fallback_args()
 
 
 def _chunk_frame_pattern(frame_paths: list[str]) -> str | None:
@@ -223,6 +321,7 @@ def build_video(
     subtitle_chunks: list[dict],
     output_filename: str = "output_video.mp4",
     background_color: str | None = None,
+    quality: str | None = None,
 ) -> str:
     """
     Costruisce il video finale: sfondo colorato, audio narrato, sottotitoli
@@ -411,32 +510,21 @@ def build_video(
 
     output_path = os.path.join(OUTPUT_DIR, output_filename)
 
-    # Preset finale configurabile: FFMPEG_PRESET=veryfast default (qualita' invariata),
-    # ultrafast per bozze veloci. Threads espliciti per filter+encode.
-    import os as _os2
-    _preset = (_os2.environ.get("FFMPEG_PRESET", "veryfast") or "veryfast").strip() or "veryfast"
-    if _preset not in ("ultrafast", "superfast", "veryfast", "faster", "fast", "medium"):
-        _preset = "veryfast"
+    # P0 WS-E1: parametri di encode centralizzati (stessi per builder/composer).
     # Keyframe ottimizzati per short verticali: GOP 60 (2s a 30fps) invece del
     # default 250 (8s): seeking/scrub precisi sulle caption, overhead minimo
     # su video brevi. I chunk restano sincronizzati via setpts (frame 0 =
     # chunk.start) con overlay contigui (hold nei gap, niente blink).
+    filter_parts, last_label, _encode_args = _export_tail_and_filter(
+        filter_parts, last_label, quality)
+    filter_complex = ";".join(filter_parts)
     cmd = ["ffmpeg", "-y", "-threads", "auto"] + inputs + [
         "-filter_complex", filter_complex,
         "-map", f"[{last_label}]",
         "-map", "1:a",
-        "-c:v", "libx264",
-        "-preset", _preset,
-        "-crf", "20",
-        "-g", "60",
-        "-keyint_min", "30",
-        "-pix_fmt", "yuv420p",
-        "-movflags", "+faststart",
+    ] + _encode_args + [
         "-filter_threads", "auto",
         "-threads", "auto",
-        "-c:a", "aac",
-        "-b:a", "192k",
-        "-shortest",
         output_path,
     ]
 
@@ -448,14 +536,29 @@ def build_video(
     return output_path
 
 
-def cleanup_temp_files():
-    """Rimuove i file temporanei generati durante il processo (audio, PNG, MOV/WebM, liste concat)."""
+def cleanup_temp_files(keep_audio_debug: bool = False):
+    """Rimuove i file temporanei generati durante il processo (audio, PNG, MOV/WebM, liste concat).
+
+    P0: con keep_audio_debug=True (CLI --audio-debug) conserva i WAV intermedi
+    (narration_*_raw/edit/polish/master*.wav, mix, stem) + audio_debug*.json.
+    """
     if not os.path.isdir(TEMP_DIR):
         return
+    try:
+        keep = bool(keep_audio_debug)
+    except Exception:
+        keep = False
     for root, dirs, files in os.walk(TEMP_DIR, topdown=False):
         for fname in files:
             fpath = os.path.join(root, fname)
             try:
+                if keep and (fname.startswith("audio_debug") and fname.endswith(".json")):
+                    continue
+                if keep and fname.startswith("narration_") and fname.endswith(".wav"):
+                    continue
+                if keep and fname in ("mix_final.wav", "voice.wav", "music_processed.wav",
+                                      "narration_mix.wav", "narration_sfx.wav", "narration_premaster.wav"):
+                    continue
                 if os.path.isfile(fpath):
                     os.remove(fpath)
             except OSError:
@@ -463,6 +566,8 @@ def cleanup_temp_files():
         for dname in dirs:
             dpath = os.path.join(root, dname)
             try:
+                if keep and dname.startswith("audio_debug_"):
+                    continue
                 os.rmdir(dpath)
             except OSError:
                 pass

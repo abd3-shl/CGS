@@ -283,9 +283,55 @@ def _load_font_scaled(base_size: int, scale: float):
 # deve superarli: limite dinamico 80% larghezza, auto-scaling fino a 40px min,
 # poi wrapping forzato sulla pausa piu' vicina. Z-index verificato:
 # bg(0) < character(10) < dimmer(20) < subtitles(30) < debug(99).
+#
+# P0 WS-C: le riserve UI derivano dal profilo piattaforma (core/safe_zones.py,
+# universal di default: top 150, bottom 420, laterali 120). Con
+# SAFE_ZONES_ENABLED=0 valgono i legacy (150/320/80).
+def _ui_reserved() -> tuple[int, int, int]:
+    """(top, bottom, side) dal profilo attivo. Mai eccezioni."""
+    try:
+        from core.safe_zones import get_profile, should_use_safe_zones
+        if should_use_safe_zones():
+            p = get_profile()
+            return (max(0, int(p.get("top", 150))), max(0, int(p.get("bottom", 420))),
+                    max(0, int(p.get("left", 120))))
+    except Exception:
+        pass
+    return (150, 320, 80)
+
+
+def _ui_constants() -> tuple[int, int, int]:
+    return _ui_reserved()
+
+
 UI_TOP_RESERVED_PX = 150     # overlay sopra (titolo/progresso)
 UI_BOTTOM_RESERVED_PX = 320  # overlay sotto (like/commenti/CTA mobile)
 UI_SIDE_RESERVED_PX = 80     # bottoni laterali TikTok/Reels
+# I valori effettivi si leggono con ui_top()/ui_bottom()/ui_side() (profilo P0).
+
+
+def ui_top() -> int:
+    """Riserva UI superiore effettiva (profilo o legacy). Mai eccezioni."""
+    try:
+        return int(_ui_reserved()[0])
+    except Exception:
+        return UI_TOP_RESERVED_PX
+
+
+def ui_bottom() -> int:
+    """Riserva UI inferiore effettiva (profilo o legacy). Mai eccezioni."""
+    try:
+        return int(_ui_reserved()[1])
+    except Exception:
+        return UI_BOTTOM_RESERVED_PX
+
+
+def ui_side() -> int:
+    """Riserva UI laterale effettiva (profilo o legacy). Mai eccezioni."""
+    try:
+        return int(_ui_reserved()[2])
+    except Exception:
+        return UI_SIDE_RESERVED_PX
 
 
 def dynamic_max_text_width(canvas_w: int | None = None) -> int:
@@ -405,17 +451,39 @@ def verify_z_order(
             violations.append("z-stack-inconsistente")
     except Exception:
         pass
+    # P0 WS-C: riserve dal profilo + rail (best-effort, legacy se spento).
+    try:
+        _prof = None
+        _rails: list = []
+        from core.safe_zones import get_profile as _gp, rail_rects as _rr, \
+            rect_violations as _rv, should_use_safe_zones as _use_sz
+        if _use_sz():
+            _prof = _gp()
+    except Exception:
+        _prof, _rails, _rv = None, [], None
+    try:
+        _top, _bottom, _side = (ui_top(), ui_bottom(), ui_side())
+    except Exception:
+        _top, _bottom, _side = (UI_TOP_RESERVED_PX, UI_BOTTOM_RESERVED_PX, UI_SIDE_RESERVED_PX)
     try:
         if text_bbox is not None:
             x0, y0, x1, y1 = (int(text_bbox[0]), int(text_bbox[1]), int(text_bbox[2]), int(text_bbox[3]))
-            if x0 < UI_SIDE_RESERVED_PX or x1 > w - UI_SIDE_RESERVED_PX:
+            if x0 < _side or x1 > w - _side:
                 violations.append("testo-oltre-bottoni-laterali")
-            if y0 < UI_TOP_RESERVED_PX:
+            if y0 < _top:
                 violations.append("testo-in-overlay-superiore")
-            if y1 > h - UI_BOTTOM_RESERVED_PX:
+            if y1 > h - _bottom:
                 violations.append("testo-in-fascia-ui-inferiore")
             if x0 < 0 or y0 < 0 or x1 > w or y1 > h:
                 violations.append("testo-fuori-canvas")
+            # P0: rail del profilo (fascia pulsanti y 700-1600).
+            if _prof is not None and _rv is not None:
+                try:
+                    for _v in _rv((x0, y0, x1, y1), _prof, w, h):
+                        if _v not in violations:
+                            violations.append(_v)
+                except Exception:
+                    pass
         if text_bbox is not None and char_bbox is not None:
             try:
                 _tx0, _ty0, _tx1, _ty1 = text_bbox
@@ -437,7 +505,8 @@ def debug_safezone_boxes(
 ) -> list[dict]:
     """Box rossi semi-trasparenti delle safe zone UI (solo debug_safezones).
 
-    Ritorna [{x0,y0,x1,y1,label}] per overlay sopra/sotto/laterali.
+    P0 WS-C: disegna le zone del profilo selezionato (top/bottom/left/right/
+    rail/cover-safe) con etichette. Ritorna [{x0,y0,x1,y1,label}].
     Mai eccezioni.
     """
     try:
@@ -445,6 +514,34 @@ def debug_safezone_boxes(
         h = int(canvas_h) if canvas_h else int(VIDEO_HEIGHT)
     except Exception:
         w, h = 1080, 1920
+    try:
+        from core.safe_zones import cover_safe_rect, get_profile, rail_rects, \
+            should_use_safe_zones
+        if should_use_safe_zones():
+            p = get_profile()
+            sx = w / 1080.0
+            sy = h / 1920.0
+            top = int(round(p.get("top", 150) * sy))
+            bottom = int(round(p.get("bottom", 420) * sy))
+            left = int(round(p.get("left", 120) * sx))
+            right = int(round(p.get("right", 120) * sx))
+            boxes = [
+                {"x0": 0, "y0": 0, "x1": w, "y1": top, "label": f"UI-TOP-{p.get('name', '')}"},
+                {"x0": 0, "y0": h - bottom, "x1": w, "y1": h, "label": f"UI-BOTTOM-{p.get('name', '')}"},
+                {"x0": 0, "y0": top, "x1": left, "y1": h - bottom, "label": "UI-LEFT"},
+                {"x0": w - right, "y0": top, "x1": w, "y1": h - bottom, "label": "UI-RIGHT"},
+            ]
+            for (rx0, ry0, rx1, ry1) in rail_rects(p, w, h):
+                boxes.append({"x0": rx0, "y0": ry0, "x1": rx1, "y1": ry1, "label": "RAIL"})
+            try:
+                cx0, cy0, cx1, cy1 = cover_safe_rect(w, h)
+                boxes.append({"x0": 0, "y0": 0, "x1": w, "y1": cy0, "label": "COVER-TOP"})
+                boxes.append({"x0": 0, "y0": cy1, "x1": w, "y1": h, "label": "COVER-BOTTOM"})
+            except Exception:
+                pass
+            return boxes
+    except Exception:
+        pass
     try:
         return [
             {"x0": 0, "y0": 0, "x1": w, "y1": UI_TOP_RESERVED_PX, "label": "UI-TOP"},
@@ -960,9 +1057,30 @@ def build_realtime_plan(
         before = sum(int(p.get("overlap_before_px", 0) or 0) for p in plans)
     except Exception:
         guaranteed, fixed, hidden, intentional, before = 0, 0, 0, 0, 0
+    # P0 WS-C: violazioni safe zone del profilo (safe_area finale fuori dal
+    # safe_rect → il testo rischierebbe di finire sotto la UI).
+    ui_violations = 0
+    try:
+        from core.safe_zones import get_profile as _gp2, safe_rect as _sr2, \
+            should_use_safe_zones as _use2
+        if _use2():
+            _sx0, _sy0, _sx1, _sy1 = _sr2(_gp2(), VIDEO_WIDTH, VIDEO_HEIGHT)
+            for p in plans:
+                try:
+                    _sa = p.get("safe_area")
+                    if _sa is None:
+                        continue
+                    if (int(_sa[0]) < _sx0 or int(_sa[1]) < _sy0
+                            or int(_sa[2]) > _sx1 or int(_sa[3]) > _sy1):
+                        ui_violations += 1
+                except Exception:
+                    continue
+    except Exception:
+        pass
     summary = {
         "total": n, "guaranteed": guaranteed, "fixed": fixed,
         "hidden": hidden, "intentional": intentional, "overlaps_before": before,
+        "ui_violations": ui_violations,
     }
     return plans, summary
 

@@ -1220,8 +1220,13 @@ def _render_styled_scaled_word(
     shadow_fill,
     opacity: int,
     scale: float,
+    redraw_size: int | None = None,
 ) -> None:
-    """Come _render_scaled_word ma con drop shadow inclusa nella tile scalata."""
+    """Come _render_scaled_word ma con drop shadow inclusa nella tile scalata.
+
+    P0 WS-D: con `redraw_size` il glifo viene ridisegnato alla dimensione
+    effettiva (quantizzata, con cache) invece del resize bitmap.
+    """
     if opacity <= 0 or scale <= 0:
         return
     if abs(scale - 1.0) < 1e-3:
@@ -1229,6 +1234,16 @@ def _render_styled_scaled_word(
         _draw_styled_word_direct(draw, display, x, y, font, fill, stroke_color,
                                  stroke_width, shadow_offset, shadow_fill, opacity)
         return
+    if redraw_size is not None:
+        try:
+            if _draw_word_redrawn(
+                frame_img, display, x + word_w / 2.0, y + word_h / 2.0,
+                font, int(redraw_size), float(scale),
+                fill, stroke_color, int(stroke_width or 0), opacity,
+            ):
+                return
+        except Exception:
+            pass
     try:
         _sw = int(stroke_width or 0)
     except (TypeError, ValueError):
@@ -1312,6 +1327,267 @@ def enrich_chunk_words(chunk: dict, keyword_colors: dict | None = None) -> list[
     return enriched
 
 
+# ---------------------------------------------------------------------------
+# P0 WS-D — Leggibilità adattiva + redraw a scala quantizzata
+# ---------------------------------------------------------------------------
+# Cache varianti font per il redraw nitido: {(path_o_id, size): font}.
+_variant_cache: dict[tuple, object] = {}
+
+
+def _font_variant_at(font, size_px):
+    """Variante del font alla dimensione data (per redraw nitido, cachata).
+
+    Usa font_variant (stesso file, nuova size). Ritorna None se non possibile
+    (il chiamante usa il resize bitmap legacy). Mai eccezioni.
+    """
+    try:
+        size_px = max(8, int(round(size_px)))
+    except (TypeError, ValueError):
+        return None
+    try:
+        cur = int(getattr(font, "size", 0) or 0)
+        if cur == size_px:
+            return font
+        key = (str(getattr(font, "path", None) or id(font)), size_px)
+        hit = _variant_cache.get(key)
+        if hit is not None:
+            return hit
+        if len(_variant_cache) >= 64:
+            _variant_cache.clear()
+        try:
+            variant = font.font_variant(size=size_px)
+        except (AttributeError, OSError, ValueError):
+            return None
+        _variant_cache[key] = variant
+        return variant
+    except Exception:
+        return None
+
+
+def _draw_word_redrawn(
+    frame_img,
+    display: str,
+    cx: float,
+    cy: float,
+    font,
+    base_size: int,
+    scale: float,
+    fill: tuple,
+    stroke_color: tuple,
+    stroke_width: int,
+    opacity: int,
+) -> bool:
+    """Ridisegna il glifo alla dimensione effettiva (quantizzata a passi 2%).
+
+    Ritorna True se disegnato (nitido), False se ripiegare sul resize bitmap.
+    Il centro (cx, cy) resta fisso: il layout non si muove mai.
+    """
+    try:
+        if abs(scale - 1.0) < 0.02:
+            return False
+        q = round(float(scale) / 0.02) * 0.02
+        ns = max(8, int(round(float(base_size) * q)))
+        vf = _font_variant_at(font, ns)
+        if vf is None:
+            return False
+        from core.renderer import draw_word as _dw
+        probe = _get_probe_draw()
+        try:
+            nw = float(probe.textlength(display, font=vf))
+            bb = probe.textbbox((0, 0), display, font=vf)
+            nh = int(bb[3] - bb[1])
+        except Exception:
+            nw, nh = float(len(display) * ns * 0.6), ns
+        nx = int(round(cx - nw / 2.0))
+        ny = int(round(cy - nh / 2.0))
+        draw = ImageDraw.Draw(frame_img)
+        _dw(draw, display, (nx, ny), vf, fill, stroke_color, stroke_width, opacity=opacity)
+        return True
+    except Exception:
+        return False
+
+
+def _draw_blurred_shadow(
+    frame_img,
+    display: str,
+    x: int,
+    y: int,
+    word_w: int,
+    word_h: int,
+    font,
+    dx: int,
+    dy: int,
+    blur: int,
+    alpha01: float,
+    opacity: int,
+    scale: float = 1.0,
+) -> None:
+    """Ombra morbida: copia sfocata della maschera alfa, composta SOTTO il testo.
+
+    Segue stesso alpha/fade del glifo (nessun alone fisso su testo
+    semitrasparente) e stessa scala pop. Mai eccezioni.
+    """
+    try:
+        if opacity <= 0 or alpha01 <= 0:
+            return
+        a = max(0.0, min(1.0, float(alpha01))) * max(0.0, min(1.0, float(opacity) / 255.0))
+        if a <= 0.01:
+            return
+        pad = max(8, int(blur) * 2 + 8)
+        tile_w = max(1, int(word_w + pad * 2))
+        tile_h = max(1, int(word_h + pad * 2))
+        tile = Image.new("RGBA", (tile_w, tile_h), (0, 0, 0, 0))
+        td = ImageDraw.Draw(tile)
+        from core.renderer import _normalize_rgba
+        try:
+            fill = (0, 0, 0, int(round(255 * a)))
+        except Exception:
+            fill = (0, 0, 0, 115)
+        try:
+            td.text((pad, pad), display, font=font, fill=fill)
+        except Exception:
+            return
+        try:
+            from PIL import ImageFilter as _IF
+            tile = tile.filter(_IF.GaussianBlur(max(1, int(blur))))
+        except Exception:
+            pass
+        # Stessa scala del glifo (l'ombra sfocata nasconde il resize).
+        if abs(scale - 1.0) >= 1e-3:
+            try:
+                nw = max(1, int(round(tile_w * scale)))
+                nh = max(1, int(round(tile_h * scale)))
+                tile = tile.resize((nw, nh), _fast_resample_for_scale(scale))
+                cx = x + word_w / 2.0
+                cy = y + word_h / 2.0
+                tcx = (pad + word_w / 2.0) * scale
+                tcy = (pad + word_h / 2.0) * scale
+                px = int(round(cx - tcx)) + int(dx)
+                py = int(round(cy - tcy)) + int(dy)
+            except Exception:
+                px, py = int(x) + int(dx), int(y) + int(dy)
+        else:
+            px, py = int(x) + int(dx), int(y) + int(dy)
+        try:
+            frame_img.alpha_composite(tile, (px, py))
+        except (ValueError, AttributeError):
+            try:
+                frame_img.paste(tile, (px, py), tile)
+            except ValueError:
+                pass
+    except Exception:
+        pass
+
+
+def _draw_scrim_band(frame_img, bbox, alpha: float) -> None:
+    """Scrim: gradiente scuro dietro la fascia del testo (alpha 0.30-0.50).
+
+    Banda orizzontale a larghezza piena sulla fascia y del testo, con
+    dissolvenza verticale ai bordi (gradiente). Disegnata PRIMA del testo
+    (equivale al layer dimmer Z=20 per la fascia). Mai eccezioni.
+    """
+    try:
+        a = max(0.0, min(0.6, float(alpha)))
+        if a <= 0.01:
+            return
+        W, H = frame_img.size
+        x0, y0, x1, y1 = (int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3]))
+        pad = 24
+        y0 = max(0, y0 - pad)
+        y1 = min(H, y1 + pad)
+        if y1 <= y0:
+            return
+        n = y1 - y0
+        peak = int(round(255 * a))
+        try:
+            from PIL import Image as _Image
+            band = _Image.new("RGBA", (W, n), (0, 0, 0, 0))
+            px = band.load()
+            for yy in range(n):
+                # Gradiente: 0 ai bordi, peak al centro (smoothstep).
+                t = yy / max(1, n - 1)
+                edge = min(t, 1.0 - t) * 2.0
+                edge = max(0.0, min(1.0, edge))
+                s = edge * edge * (3.0 - 2.0 * edge)
+                val = int(round(peak * s))
+                if val <= 0:
+                    continue
+                for xx in range(W):
+                    px[xx, yy] = (0, 0, 0, val)
+            try:
+                frame_img.alpha_composite(band, (0, y0))
+            except (ValueError, AttributeError):
+                frame_img.paste(band, (0, y0), band)
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+
+def _legi_effects_for_chunk(
+    layout, tiers, fills, font_sizes, background_color,
+    background_source=None, chunk_t: float = 0.0,
+) -> tuple[list[dict] | None, dict | None]:
+    """Effetti di leggibilità per-parola per UN chunk (best-effort).
+
+    Ritorna (per_word_effects, scrim) o (None, None) se path legacy
+    (LEGIBILITY disattivato → comportamento precedente identico).
+    per_word_effects[i] = TextEffects dict (vedi core/legibility).
+    scrim = {"alpha": float, "bbox": (...)} o None.
+    """
+    try:
+        from core.legibility import decide_text_effects, should_apply_legibility
+        if not should_apply_legibility():
+            return None, None
+    except Exception:
+        return None, None
+    try:
+        from core.background_probe import make_probe
+        probe = make_probe(background_source, background_color)
+    except Exception:
+        return None, None
+    try:
+        # Bbox testo (dalla layout reale, inclusa nel probe).
+        xs = [int(it.get("x", 0)) for it in (layout or [])]
+        ys = [int(it.get("y", 0)) for it in (layout or [])]
+        x1s = [int(it.get("x", 0)) + int(it.get("width", 0)) for it in (layout or [])]
+        y1s = [int(it.get("y", 0)) + int(it.get("height", 0)) for it in (layout or [])]
+        if not xs:
+            return None, None
+        bbox = (min(xs), min(ys), max(x1s), max(y1s))
+        stats = probe.stats_for(bbox, chunk_t)
+        try:
+            bg_rgb = tuple(probe.bg_rgb)  # FlatBackgroundProbe
+        except Exception:
+            from core.legibility import relative_luminance as _rl
+            bg_rgb = background_color
+        per_word: list[dict] = []
+        for i, (_s, _h, _n) in enumerate(list(tiers or [])):
+            try:
+                tier = "hero" if _h else ("impact" if _s == "impact" else ("accent" if _s == "accent" else "base"))
+                fill = fills[i] if i < len(fills or []) else (255, 255, 255, 255)
+                text_rgb = (int(fill[0]), int(fill[1]), int(fill[2]))
+                fsize = int(font_sizes[i]) if i < len(font_sizes or []) else 84
+                eff = decide_text_effects(stats, text_rgb, fsize, tier, bg_rgb)
+                # Il colore keyword/accent con contrasto < 3:1 viene corretto
+                # prima con stroke/ombra; color_override solo se flip abilitato.
+                per_word.append(eff)
+            except Exception:
+                per_word.append({"level": 0, "stroke_px": 0, "stroke_rgba": (0, 0, 0, 0),
+                                 "shadow": None, "pill": False, "scrim_alpha": 0.0,
+                                 "color_override": None})
+        # Scrim: max alpha tra le parole, sulla fascia del testo.
+        alpha = 0.0
+        try:
+            alpha = max(float(e.get("scrim_alpha", 0.0) or 0.0) for e in per_word)
+        except Exception:
+            alpha = 0.0
+        scrim = {"alpha": alpha, "bbox": bbox} if alpha > 0.01 else None
+        return per_word, scrim
+    except Exception:
+        return None, None
+
+
 def _render_scaled_word(
     frame_img: Image.Image,
     word: str,
@@ -1325,12 +1601,17 @@ def _render_scaled_word(
     stroke_width: int,
     opacity: int,
     scale: float,
+    redraw_size: int | None = None,
 ) -> None:
     """Disegna una parola con scala via resize LANCZOS, centro fisso.
 
     Disegna la parola a dimensione base su una tile temporanea, la ridimensiona
     col fattore `scale` e la incolla sul frame mantenendo il centro originale
     (il layout delle altre parole non si muove mai).
+
+    P0 WS-D: con `redraw_size` (dimensione base px) il glifo viene ridisegnato
+    alla dimensione effettiva (quantizzata a passi del 2%, con cache) invece
+    di ridimensionare la bitmap → testo e stroke restano nitidi nel pop.
     """
     if opacity <= 0:
         return
@@ -1341,6 +1622,17 @@ def _render_scaled_word(
         draw = ImageDraw.Draw(frame_img)
         draw_word(draw, word, (x, y), font, fill, stroke_color, stroke_width, opacity=opacity)
         return
+    # Redraw nitido (P0): ridisegna alla scala quantizzata, centro fisso.
+    if redraw_size is not None:
+        try:
+            if _draw_word_redrawn(
+                frame_img, word, x + word_w / 2.0, y + word_h / 2.0,
+                font, int(redraw_size), float(scale),
+                fill, stroke_color, int(stroke_width or 0), opacity,
+            ):
+                return
+        except Exception:
+            pass
     pad = 24 + int(stroke_width) * 2
     tile_w = max(1, int(word_w + pad * 2))
     tile_h = max(1, int(word_h + pad * 2))
@@ -1834,6 +2126,7 @@ def generate_animated_chunk_frames(
     tail_hold_duration: float = 0.0,
     char_prev_layer=None,
     char_micro_blend: bool = False,
+    background_source: str | None = None,
 ) -> list[dict]:
     """Genera la sequenza di frame PNG per un chunk con animazione per-parola.
 
@@ -2154,6 +2447,36 @@ def generate_animated_chunk_frames(
         _tiers = [("base", False, False)] * len(words)
         _entry_per_word = [entry_dur] * len(words)
         _scale_per_word = [1.0] * len(words)
+
+    # --- P0 WS-D: leggibilità adattiva (best-effort, mai fatale) ---
+    # Probe dello sfondo dietro il testo → effetti per-parola (tier-aware).
+    # Sfondo piatto ad alto contrasto = livello 0 = look identico a oggi
+    # (con stroke avanzato azzerato). _legi_fx=None → path legacy invariato.
+    _legi_fx, _legi_scrim = None, None
+    _legi_sizes: list[int] = []
+    try:
+        if use_typography and isinstance(typo_fonts, dict):
+            _sz = typo_fonts.get("sizes", {}) if isinstance(typo_fonts.get("sizes"), dict) else {}
+            for (_s, _h, _n) in _tiers:
+                _role = "impact" if _s == "impact" else ("accent" if _s == "accent" else "base")
+                try:
+                    _legi_sizes.append(int(_sz.get(_role, TYPOGRAPHY_BASE_FONT_SIZE)))
+                except (TypeError, ValueError):
+                    _legi_sizes.append(TYPOGRAPHY_BASE_FONT_SIZE)
+        else:
+            try:
+                _legi_sizes = [int(text_font_size)] * len(words)
+            except (NameError, TypeError, ValueError):
+                _legi_sizes = [SUBTITLE_FONT_SIZE] * len(words)
+        try:
+            _chunk_t = float(chunk.get("start", 0.0))
+        except (TypeError, ValueError, AttributeError):
+            _chunk_t = 0.0
+        _legi_fx, _legi_scrim = _legi_effects_for_chunk(
+            layout, _tiers, fills, _legi_sizes, background_color,
+            background_source, _chunk_t)
+    except Exception:
+        _legi_fx, _legi_scrim = None, None
 
     # --- Full Engine Upgrade Fase 2: cinetica avanzata (opt-in, mai regressioni) ---
     # T0/T1 fade-in 2 frame, T2 brand accent con picco 110%, T3 badge+shake.
@@ -2534,6 +2857,14 @@ def generate_animated_chunk_frames(
         elif needs_pill:
             draw_text_background(frame_img, layout)
 
+        # P0 WS-D: scrim adattivo (gradiente scuro dietro la fascia del testo,
+        # equivale al layer dimmer Z=20 per la fascia; solo livello 3).
+        if _legi_scrim is not None:
+            try:
+                _draw_scrim_band(frame_img, _legi_scrim.get("bbox"), _legi_scrim.get("alpha", 0.0))
+            except Exception:
+                pass
+
         for wi, w in enumerate(words):
             if t < word_starts[wi]:
                 continue  # non ancora iniziata
@@ -2648,12 +2979,45 @@ def generate_animated_chunk_frames(
                             _sc = (0, 0, 0, 255)
                     except Exception:
                         pass
+                # P0 WS-D: override adattivo (livello 0 = look pulito, azzera
+                # anche lo stroke avanzato; livelli 1-3 = stroke/ombra adattivi).
+                _legi_shadow = None
+                _legi_redraw_size = None
+                if _legi_fx is not None and wi < len(_legi_fx):
+                    try:
+                        _fxw = _legi_fx[wi]
+                        if int(_fxw.get("level", 0)) <= 0:
+                            _sw, _sc = 0, (0, 0, 0, 0)
+                        else:
+                            _sw = int(_fxw.get("stroke_px", 0) or 0)
+                            _sc = _fxw.get("stroke_rgba", (0, 0, 0, 0))
+                            _legi_shadow = _fxw.get("shadow")
+                        try:
+                            _legi_redraw_size = int(_legi_sizes[wi]) if wi < len(_legi_sizes) else None
+                        except (TypeError, ValueError, IndexError):
+                            _legi_redraw_size = None
+                    except Exception:
+                        pass
+                _shadow_off_w, _shadow_fill_w = _shadow_off, _shadow_fill
+                if _legi_shadow is not None:
+                    # Ombra sfocata adattiva (segue alpha/fade/pop, nessun alone).
+                    try:
+                        _draw_blurred_shadow(
+                            frame_img, w["word"], _rx, _ry,
+                            item["width"], item["height"], wfont,
+                            int(_legi_shadow.get("dx", 0)), int(_legi_shadow.get("dy", 4)),
+                            int(_legi_shadow.get("blur", 6)), float(_legi_shadow.get("alpha", 0.45)),
+                            opacity, scale)
+                    except Exception:
+                        pass
+                    _shadow_off_w, _shadow_fill_w = None, None
                 _render_styled_scaled_word(
                     frame_img, w["word"], _rx, _ry,
                     item["width"], item["height"], wfont,
                     fills[wi], _sc, _sw,
-                    _shadow_off, _shadow_fill,
+                    _shadow_off_w, _shadow_fill_w,
                     opacity=opacity, scale=scale,
+                    redraw_size=_legi_redraw_size,
                 )
             else:
                 _sw_legacy, _sc_legacy = SUBTITLE_STROKE_WIDTH, SUBTITLE_STROKE_COLOR
@@ -2664,11 +3028,39 @@ def generate_animated_chunk_frames(
                             _sc_legacy = (0, 0, 0, 255)
                     except Exception:
                         pass
+                _legi_shadow_l = None
+                _legi_redraw_l = None
+                if _legi_fx is not None and wi < len(_legi_fx):
+                    try:
+                        _fxl = _legi_fx[wi]
+                        if int(_fxl.get("level", 0)) <= 0:
+                            _sw_legacy = 0
+                        else:
+                            _sw_legacy = int(_fxl.get("stroke_px", 0) or 0)
+                            _sc_legacy = _fxl.get("stroke_rgba", (0, 0, 0, 0))
+                            _legi_shadow_l = _fxl.get("shadow")
+                        try:
+                            _legi_redraw_l = int(_legi_sizes[wi]) if wi < len(_legi_sizes) else None
+                        except (TypeError, ValueError, IndexError):
+                            _legi_redraw_l = None
+                    except Exception:
+                        pass
+                if _legi_shadow_l is not None:
+                    try:
+                        _draw_blurred_shadow(
+                            frame_img, w["word"], _rx, _ry,
+                            item["width"], item["height"], _word_fonts[wi],
+                            int(_legi_shadow_l.get("dx", 0)), int(_legi_shadow_l.get("dy", 4)),
+                            int(_legi_shadow_l.get("blur", 6)), float(_legi_shadow_l.get("alpha", 0.45)),
+                            opacity, scale)
+                    except Exception:
+                        pass
                 _render_scaled_word(
                     frame_img, w["word"], _rx, _ry,
                     item["width"], item["height"], _word_fonts[wi],
                     fills[wi], _sc_legacy, _sw_legacy,
                     opacity=opacity, scale=scale,
+                    redraw_size=_legi_redraw_l,
                 )
 
         fname = f"chunk_{chunk_index:04d}_frame_{fi:05d}.png"

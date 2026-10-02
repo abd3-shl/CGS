@@ -147,6 +147,96 @@ def _write_audio_sidecar(output_filename: str, choice: dict | None, plan: dict |
         return None
 
 
+def _parse_p0_cli() -> dict:
+    """Opzioni P0 da CLI (headless e GUI): --quality, --platform, --no-pause-engine, --audio-debug.
+
+    Ritorna {"quality", "platform", "no_pause_engine", "audio_debug"} (None/False se assenti).
+    Mai eccezioni.
+    """
+    opts: dict = {"quality": None, "platform": None, "no_pause_engine": False, "audio_debug": False}
+    try:
+        import sys as _sys
+        args = list(_sys.argv[1:])
+        i = 0
+        while i < len(args):
+            a = args[i]
+            if a.startswith("--quality="):
+                v = a.split("=", 1)[1].strip().lower()
+                if v in ("draft", "standard", "final"):
+                    opts["quality"] = v
+            elif a == "--quality" and i + 1 < len(args):
+                i += 1
+                v = args[i].strip().lower()
+                if v in ("draft", "standard", "final"):
+                    opts["quality"] = v
+            elif a.startswith("--platform="):
+                v = a.split("=", 1)[1].strip().lower()
+                if v in ("universal", "tiktok", "reels", "shorts"):
+                    opts["platform"] = v
+            elif a == "--platform" and i + 1 < len(args):
+                i += 1
+                v = args[i].strip().lower()
+                if v in ("universal", "tiktok", "reels", "shorts"):
+                    opts["platform"] = v
+            elif a == "--no-pause-engine":
+                opts["no_pause_engine"] = True
+            elif a == "--audio-debug":
+                opts["audio_debug"] = True
+            i += 1
+    except Exception:
+        pass
+    try:
+        if not opts["audio_debug"]:
+            if str(os.environ.get("AUDIO_DEBUG", "")).strip().lower() in ("1", "true", "yes", "on"):
+                opts["audio_debug"] = True
+    except Exception:
+        pass
+    return opts
+
+
+def _apply_p0_cli_overrides() -> dict:
+    """Applica gli override CLI P0 a env + config live. Ritorna le opzioni. Mai eccezioni."""
+    opts = _parse_p0_cli()
+    try:
+        import config as _cfg
+        if opts.get("quality"):
+            os.environ["EXPORT_QUALITY"] = str(opts["quality"])
+            try:
+                _cfg.EXPORT_QUALITY = str(opts["quality"])
+            except Exception:
+                pass
+        if opts.get("platform"):
+            os.environ["PLATFORM_PROFILE"] = str(opts["platform"])
+            try:
+                _cfg.PLATFORM_PROFILE = str(opts["platform"])
+            except Exception:
+                pass
+        if opts.get("no_pause_engine"):
+            os.environ["PAUSE_ENGINE_ENABLED"] = "0"
+            try:
+                _cfg.PAUSE_ENGINE_ENABLED = False
+            except Exception:
+                pass
+        if opts.get("audio_debug"):
+            os.environ["AUDIO_DEBUG"] = "1"
+    except Exception:
+        pass
+    return opts
+
+
+def _p0_cli_summary() -> str:
+    """Riga di riepilogo per i log (qualità/piattaforma/pause). Mai eccezioni."""
+    try:
+        o = _parse_p0_cli()
+        import config as _cfg
+        q = o.get("quality") or getattr(_cfg, "EXPORT_QUALITY", "final")
+        p = o.get("platform") or getattr(_cfg, "PLATFORM_PROFILE", "universal")
+        pe = "off" if o.get("no_pause_engine") else ("on" if getattr(_cfg, "PAUSE_ENGINE_ENABLED", True) else "off")
+        return f"[P0] quality={q} platform={p} pause={pe}"
+    except Exception:
+        return "[P0] default"
+
+
 def _render_mode() -> str:
     """Render-mode attivo: CLI --render-mode > env RENDER_MODE > 'full'.
 
@@ -468,12 +558,12 @@ class VideoGeneratorApp:
                     self._log(f"\n❌ Video {idx}/{total} errore inatteso: {err_msg}\n{tb}")
                 finally:
                     # Isolamento temp tra video: evita collisioni chunk/audio e spreco disco.
-                    # Con --audio-debug i stem vengono mantenuti (nessuna pulizia).
+                    # P0: con --audio-debug i WAV intermedi vengono preservati (PNG puliti comunque).
                     try:
-                        if not self._audio_debug_active():
-                            cleanup_temp_files()
-                        else:
-                            self._log("      Stem/debug mantenuti in temp/ (--audio-debug).")
+                        _keep = bool(self._audio_debug_active()) if hasattr(self, "_audio_debug_active") else False
+                        cleanup_temp_files(keep_audio_debug=_keep)
+                        if _keep:
+                            self._log("      WAV intermedi preservati in temp/ (--audio-debug).")
                     except Exception:
                         pass
             # --- Riepilogo batch ---
@@ -606,12 +696,29 @@ class VideoGeneratorApp:
         tag = f"[Video {index}/{total}] " if total > 1 else ""
         output_filename = suggest_output_filename(index, script_text, total, OUTPUT_DIR)
         audio_filename = f"narration_{index:03d}.mp3" if total > 1 else "narration.mp3"
+        # P0: base nomi per gli intermedi WAV (un solo encode lossy finale).
+        _stem = os.path.splitext(audio_filename)[0]
+        _raw_wav = os.path.join(TEMP_DIR, f"{_stem}_raw.wav")
+        _edit_wav = os.path.join(TEMP_DIR, f"{_stem}_edit.wav")
+        _polish_wav = os.path.join(TEMP_DIR, f"{_stem}_polish.wav")
+        _master_wav = os.path.join(TEMP_DIR, f"{_stem}_master.wav")
+        _pause_plan: dict | None = None
+        _pause_stats: dict = {}
 
-        self._log(f"{tag}[1-2/8] Tema Groq + audio ElevenLabs in parallelo...")
+        # P0 WS-B: nicchia euristica PRIMA del TTS (nessuna chiamata LLM:
+        # wrapper deterministico sulle keyword di text_tagger). La stessa
+        # nicchia viene poi passata a valle per coerenza.
+        try:
+            from core.text_tagger import _heuristic_niche as _pre_niche
+            _tts_niche = _pre_niche(script_text)
+        except Exception:
+            _tts_niche = None
+
+        self._log(f"{tag}[1-2/8] Tema Groq + audio ElevenLabs in parallelo... {_p0_cli_summary()}")
         import concurrent.futures as _fut
         with _fut.ThreadPoolExecutor(max_workers=2) as _ex:
             _f_theme = _ex.submit(generate_theme, script_text, self._log_attempt)
-            _f_audio = _ex.submit(generate_audio, script_text, audio_filename, self._log_attempt)
+            _f_audio = _ex.submit(generate_audio, script_text, audio_filename, self._log_attempt, _tts_niche)
             theme = _f_theme.result()
             audio_path = _f_audio.result()
         text_rgba = hex_to_rgba(theme["text_color"])
@@ -621,6 +728,13 @@ class VideoGeneratorApp:
             f"{len(theme['keyword_colors'])} colori keyword."
         )
         self._log(f"      Audio generato: {audio_path}")
+        # P0: log dei voice_settings effettivamente inviati (o downgrade).
+        try:
+            from core.tts import build_voice_settings as _bvs
+            from config import ELEVENLABS_MODEL_ID as _mid
+            self._log(f"      TTS nicchia={_tts_niche} model={_mid} settings={_bvs(_tts_niche, _mid)}")
+        except Exception:
+            pass
 
         self._log(f"{tag}[3/8] Trascrizione audio con Groq Whisper...")
         words = transcribe_audio(audio_path, on_attempt=self._log_attempt)
@@ -637,6 +751,96 @@ class VideoGeneratorApp:
             )
         except AlignmentError as e:
             self._log(f"      ⚠️ Allineamento saltato ({e}), uso la trascrizione così com'è.")
+
+        # --- P0 WS-B: Pause Engine (dopo align, prima di tutto ciò che usa i tempi) ---
+        # La trascrizione Whisper resta sulla voce originale pulita; il piano applica
+        # un time-warp deterministico UNA volta (orig_start/orig_end conservati).
+        # Tutto best-effort: se fallisce → warning + audio/timeline originali.
+        self._log(f"{tag}[4.5/8] Pause Engine (montaggio pause)...")
+        try:
+            import config as _cfg_pe
+            _pe_on = bool(getattr(_cfg_pe, "PAUSE_ENGINE_ENABLED", True))
+        except Exception:
+            _pe_on = True
+        if _pe_on:
+            try:
+                from core.audio_master import decode_to_wav as _dec
+                from core.pause_planner import plan_pauses as _plan
+                from core.pause_editor import apply_pause_plan as _apply, retime_words as _retime
+                _raw = _dec(audio_path, _raw_wav)
+                try:
+                    import subprocess as _sp
+                    _dur_probe = _sp.run(
+                        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                         "-of", "default=noprint_wrappers=1:nokey=1", _raw],
+                        capture_output=True, text=True, timeout=60)
+                    _dur_s = float(_dur_probe.stdout.strip())
+                except Exception:
+                    _dur_s = float(words[-1].get("end", 0.0)) if words else 0.0
+                _plan_obj = _plan(words, script_text, _dur_s, _tts_niche, None)
+                if _plan_obj and not _plan_obj.get("no_change"):
+                    _eff = _apply(_raw, _edit_wav, _plan_obj, self._log)
+                    if _eff and not _eff.get("no_change"):
+                        _pause_plan = _eff
+                        words = _retime(words, _eff)
+                        audio_path = _edit_wav
+                        _st = _eff.get("stats", {}) if isinstance(_eff, dict) else {}
+                        _pause_stats = dict(_st)
+                        try:
+                            _cuts_n = int(_st.get("shortened", 0) or 0)
+                            _ins_n = int(_st.get("lengthened", 0) or 0)
+                            _cs = float(_st.get("shorten_s", 0.0) or 0.0)
+                            _ls = float(_st.get("lengthen_s", 0.0) or 0.0)
+                            _hd = float(_st.get("head_delta_s", 0.0) or 0.0)
+                            _td = float(_st.get("tail_delta_s", 0.0) or 0.0)
+                            _sd = float(_eff.get("src_duration", _dur_s) or _dur_s)
+                            _dd = float(_eff.get("dst_duration", _sd) or _sd)
+                            _prof = str(_eff.get("profile", "balanced"))
+                            self._log(
+                                f"      [Pause] profilo {_prof} | {_cuts_n} accorciate (−{_cs:.2f}s) | "
+                                f"{_ins_n} allungate (+{_ls:.2f}s) | head {_hd:+.2f}s | "
+                                f"tail {_td:+.2f}s | durata {_sd:.1f}s → {_dd:.1f}s")
+                        except Exception:
+                            self._log("      [Pause] piano applicato.")
+                        # P0 opzionale: verifica con Whisper sull'audio editato (tolleranza 80ms).
+                        try:
+                            import config as _cfg_vw
+                            if bool(getattr(_cfg_vw, "PAUSE_VERIFY_WITH_WHISPER", False)):
+                                from core.transcription import transcribe_audio as _re_tr
+                                _vw = _re_tr(_edit_wav)
+                                _tol = 0.080
+                                _bad = 0
+                                _cmp = min(len(_vw), len(words))
+                                for _a, _b in zip(_vw[:_cmp], words[:_cmp]):
+                                    try:
+                                        if abs(float(_a.get("start", 0)) - float(_b.get("start", 0))) > _tol:
+                                            _bad += 1
+                                    except Exception:
+                                        continue
+                                self._log(f"      [Pause-verify] {_bad}/{_cmp} parole oltre 80ms vs Whisper edit.")
+                        except Exception as _e_vw:
+                            self._log(f"      [Pause-verify] saltata ({_e_vw}).")
+                    else:
+                        self._log("      [Pause] nessun taglio applicabile (audio invariato).")
+                else:
+                    self._log("      [Pause] piano vuoto (pause già ottimali).")
+            except Exception as _e_pe:
+                self._log(f"      ⚠️ Pause Engine saltato ({_e_pe}), uso audio/timeline originali.")
+                _pause_plan = None
+        else:
+            self._log("      Pause Engine disabilitato (PAUSE_ENGINE_ENABLED=0 / --no-pause-engine).")
+
+        # --- P0 WS-A: voice polish lieve sulla voce editata (best-effort) ---
+        # highpass + compressione leggera, mai sulla voce originale per Whisper
+        # (già trascritta sopra). Non altera la durata.
+        try:
+            from core.audio_master import voice_polish as _polish
+            _polished = _polish(audio_path, _polish_wav)
+            if _polished and _polished != audio_path:
+                audio_path = _polished
+                self._log(f"      Voice polish: {audio_path}")
+        except Exception as _e_pol:
+            self._log(f"      ⚠️ Voice polish saltato ({_e_pol}).")
 
         # --- Fase 1: arricchimento timestamp (tier/vfx/sfx, start/end invariati) ---
         try:
@@ -697,7 +901,8 @@ class VideoGeneratorApp:
             _kw_future = _ex2.submit(extract_keywords, script_text, self._log_attempt, theme["keyword_colors"])
             if TYPOGRAPHY_ENGINE_ENABLED:
                 from core.text_tagger import enrich_chunks_with_typography as _enrich_typo
-                _typo_future = _ex2.submit(_enrich_typo, chunks_base, script_text, None, self._log_attempt)
+                # P0: nicchia già stimata prima del TTS (coerenza voce/grafica, nessun LLM extra).
+                _typo_future = _ex2.submit(_enrich_typo, chunks_base, script_text, _tts_niche, self._log_attempt)
             # --- Raccogli personaggi ---
             character_plan = []
             if _char_future is not None:
@@ -948,6 +1153,26 @@ class VideoGeneratorApp:
         except Exception as _e_sfx:
             self._log(f"      ⚠️ SFX/musica saltati ({_e_sfx}), uso voce originale.")
             _mix_audio = audio_path
+        # --- P0 WS-A: audio master (stadio finale condiviso, un solo encode lossy) ---
+        # Il ramo musica è già masterizzato nel mixer (stessa funzione); qui si
+        # masterizza solo il ramo voce+SFX (che non fa loudnorm). Best-effort.
+        _premaster_for_remux = _mix_audio
+        try:
+            from core.audio_master import master_audio as _master_fn, \
+                measure_loudness as _meas_fn, should_use_audio_master as _use_master
+            if _use_master() and not _music_choice:
+                _mastered = _master_fn(_mix_audio, _master_wav)
+                if _mastered:
+                    _mix_audio = _mastered
+                    try:
+                        _m = _meas_fn(_mix_audio) or {}
+                        self._log(
+                            f"      Master: {_m.get('lufs', '?')} LUFS, "
+                            f"TP {_m.get('true_peak', '?')} dBTP, LRA {_m.get('lra', '?')}")
+                    except Exception:
+                        self._log(f"      Master: {_mix_audio}")
+        except Exception as _e_mast:
+            self._log(f"      ⚠️ Audio master saltato ({_e_mast}), uso mix originale.")
         # --- Sidecar di attribuzione (sempre, anche senza musica) ---
         try:
             _sidecar = _write_audio_sidecar(output_filename, _music_choice, _music_plan, self._log)
@@ -956,21 +1181,92 @@ class VideoGeneratorApp:
         except Exception:
             pass
         # --- Compose video (Ken Burns + dimmer + overlay, mux atomico) ---
+        # P0: --audio-debug conserva WAV intermedi + audio_debug.json (vedi sotto).
         try:
-            from core.video_composer import build_composed_video as _compose
-            output_path = _compose(
-                _mix_audio, enriched_chunks,
-                output_filename=output_filename,
-                background_color=theme["background_color"],
-                debug_safezones=(_mode == "debug_safezones"),
-            )
+            _audio_dbg = bool(self._audio_debug_active()) if hasattr(self, "_audio_debug_active") else bool(_parse_p0_cli().get("audio_debug"))
         except Exception:
-            output_path = build_video(
-                _mix_audio, enriched_chunks,
-                output_filename=output_filename,
-                background_color=theme["background_color"],
-            )
+            _audio_dbg = False
+        try:
+            import config as _cfg_q
+            _quality = str(getattr(_cfg_q, "EXPORT_QUALITY", "final") or "final")
+        except Exception:
+            _quality = "final"
+        try:
+            _cli_q = _parse_p0_cli().get("quality")
+            if _cli_q:
+                _quality = _cli_q
+        except Exception:
+            pass
+        def _compose_once(_audio_in: str) -> str:
+            try:
+                from core.video_composer import build_composed_video as _compose
+                return _compose(
+                    _audio_in, enriched_chunks,
+                    output_filename=output_filename,
+                    background_color=theme["background_color"],
+                    debug_safezones=(_mode == "debug_safezones"),
+                    quality=_quality,
+                )
+            except Exception:
+                return build_video(
+                    _audio_in, enriched_chunks,
+                    output_filename=output_filename,
+                    background_color=theme["background_color"],
+                    quality=_quality,
+                )
+        output_path = _compose_once(_mix_audio)
         self._log(f"      Video completato: {output_path}")
+        # --- P0 WS-A §5.2.6: verifica post-encode sull'mp4 (l'AAC può fare overshoot) ---
+        # Se TP finale > −1.0 dBTP: UN solo re-master con true_peak ridotto + re-mux.
+        try:
+            from core.audio_master import post_encode_check as _post_chk, master_audio as _re_mast
+            _chk = _post_chk(output_path, _mix_audio)
+            try:
+                self._log(f"      Post-encode: {_chk.get('lufs', '?')} LUFS, TP {_chk.get('true_peak', '?')} dBTP")
+            except Exception:
+                pass
+            if _chk.get("need_remaster"):
+                _sugg = _chk.get("suggest_tp")
+                self._log(f"      ⚠️ Overshoot AAC (TP > −1.0 dBTP): re-master una volta con TP={_sugg}...")
+                try:
+                    _re_out = os.path.join(TEMP_DIR, f"{_stem}_master_v2.wav")
+                    _re = _re_mast(_premaster_for_remux, _re_out, true_peak=float(_sugg))
+                    if _re:
+                        output_path = _compose_once(_re)
+                        _chk2 = _post_chk(output_path, _re)
+                        self._log(f"      Re-mux: {_chk2.get('lufs', '?')} LUFS, TP {_chk2.get('true_peak', '?')} dBTP → {output_path}")
+                except Exception as _e_re:
+                    self._log(f"      ⚠️ Re-master saltato ({_e_re}), tengo il primo mux.")
+        except Exception as _e_chk:
+            self._log(f"      ⚠️ Post-encode check saltato ({_e_chk}).")
+        # --- P0: audio_debug.json + conservazione WAV intermedi ---
+        try:
+            if _audio_dbg:
+                import json as _json_dbg
+                import shutil as _sh_dbg
+                _dbg_info = {
+                    "tts_niche": _tts_niche,
+                    "pause": _pause_stats,
+                    "post_encode": {k: _chk.get(k) for k in ("lufs", "true_peak", "lra", "ok")},
+                    "files": {},
+                }
+                for _label, _p in (("tts_mp3", os.path.join(TEMP_DIR, audio_filename)),
+                                   ("raw_wav", _raw_wav), ("edit_wav", _edit_wav),
+                                   ("polish_wav", _polish_wav), ("mix", _premaster_for_remux),
+                                   ("master_wav", _mix_audio)):
+                    try:
+                        _dbg_info["files"][_label] = _p if os.path.isfile(_p) else None
+                    except Exception:
+                        _dbg_info["files"][_label] = None
+                _dbg_path = os.path.join(TEMP_DIR, f"audio_debug_{index:03d}.json")
+                try:
+                    with open(_dbg_path, "w", encoding="utf-8") as _f:
+                        _json_dbg.dump(_dbg_info, _f, indent=2, ensure_ascii=False, default=str)
+                    self._log(f"      audio_debug.json: {_dbg_path} (WAV conservati: cleanup li preserva)")
+                except Exception as _e_j:
+                    self._log(f"      ⚠️ audio_debug.json non scritto ({_e_j}).")
+        except Exception:
+            pass
         # --- Test di invariante post-build (assertion automatiche, non fatali) ---
         try:
             from core.invariant_checks import run_post_build_checks
@@ -994,6 +1290,12 @@ class VideoGeneratorApp:
 
 def main():
     import sys as _sys
+    # P0: applica subito gli override CLI (--quality/--platform/--no-pause-engine/
+    # --audio-debug) così valgono per GUI e headless. Aggiorna anche l'help.
+    try:
+        _apply_p0_cli_overrides()
+    except Exception:
+        pass
     # CLI: --render-mode=full|text_only|debug_safezones (default full, GUI).
     # Headless opzionale: --script path [--bulk] per batch senza Tk.
     _script = None
@@ -1032,6 +1334,8 @@ def main():
             app._log = print
             app._log_attempt = lambda i, t, ok, d: print(f"   {'OK' if ok else '..'} chiave {i}/{t}: {d[:120]}")
             app._set_ui_busy = lambda b: None
+            # P0 headless: _audio_debug_active esiste già come metodo (solo CLI/env),
+            # nessun patch necessario; _music_enabled ha fallback a config.
             from core.script_loader import preview_of as _pv
             _ok = 0
             for _idx, _s in enumerate(_scripts, start=1):
@@ -1043,8 +1347,8 @@ def main():
                     print(f"FAIL [{_idx}] {_e}")
                     _tb.print_exc()
                 try:
-                    if not app._audio_debug_active():
-                        cleanup_temp_files()
+                    _keep_h = bool(app._audio_debug_active()) if hasattr(app, "_audio_debug_active") else False
+                    cleanup_temp_files(keep_audio_debug=_keep_h)
                 except Exception:
                     pass
             print(f"Completati {_ok}/{len(_scripts)}")
