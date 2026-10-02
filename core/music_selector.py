@@ -108,8 +108,10 @@ def _probe_format(path: str) -> dict:
         for line in res.stdout.splitlines():
             try:
                 k, _, v = line.strip().partition("=")
-                if k in info and v:
-                    info[k] = int(v) if k in ("sample_rate", "channels") else v
+                if k == "codec_name" and v:
+                    info["codec"] = v
+                elif k in ("sample_rate", "channels") and v:
+                    info[k] = int(v)
             except Exception:
                 continue
     except Exception:
@@ -218,6 +220,23 @@ def _save_cache(data: dict, music_dir: str | Path | None = None) -> None:
         pass
 
 
+def _cache_key(p: Path, music_dir: str | Path | None = None) -> str:
+    """Chiave cache portabile: relpath (se sotto la libreria) + size + mtime."""
+    try:
+        st = p.stat()
+        suffix = f"|{st.st_size}|{int(st.st_mtime)}"
+    except Exception:
+        return str(p)
+    try:
+        rel = p.resolve().relative_to(_music_root(music_dir).resolve())
+        return rel.as_posix() + suffix
+    except Exception:
+        try:
+            return p.resolve().name + suffix
+        except Exception:
+            return p.name + suffix
+
+
 def analyze_track(path: str, music_dir: str | Path | None = None) -> dict | None:
     """Analizza una traccia (con cache `_analysis.json` su path+size+mtime).
 
@@ -228,11 +247,7 @@ def analyze_track(path: str, music_dir: str | Path | None = None) -> dict | None
         p = Path(path)
         if not p.is_file():
             return None
-        try:
-            st = p.stat()
-            key = f"{p.resolve()}|{st.st_size}|{int(st.st_mtime)}"
-        except Exception:
-            key = str(p)
+        key = _cache_key(p, music_dir)
         cache = _load_cache(music_dir)
         if isinstance(cache, dict) and key in cache and isinstance(cache[key], dict):
             hit = dict(cache[key])

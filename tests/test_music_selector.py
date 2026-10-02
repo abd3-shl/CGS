@@ -90,8 +90,7 @@ class TestMusicSelector(unittest.TestCase):
     def test_cache_usata_senza_ffmpeg(self):
         _make_lib(self.root, {"educational": ["t.mp3"]})
         p = str(self.root / "educational" / "t.mp3")
-        st = os.stat(p)
-        key = f"{Path(p).resolve()}|{st.st_size}|{int(st.st_mtime)}"
+        key = ms._cache_key(Path(p), str(self.root))
         cached = {"duration": 120.0, "lufs": -13.0, "true_peak": -1.0, "lra": 7.0,
                   "lead_silence": 0.0, "tail_silence": 0.0, "sample_rate": 44100,
                   "channels": 2, "codec": "mp3", "valid": True}
