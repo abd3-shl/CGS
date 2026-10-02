@@ -103,6 +103,101 @@ class TestMusicPlan(unittest.TestCase):
         self.assertLessEqual(len(e), 3500)
         self.assertIn("t", e)
 
+    def _eval_expr(self, expr: str, t: float) -> float:
+        """Valutatore minimale della grammatica if(lt(a,b),x,y) con numeri e t."""
+        import re as _re
+        ex = _re.sub(r"\bt\b", f"({t})", expr)
+
+        def _split_top(s: str) -> list[str]:
+            parts, depth, cur = [], 0, ""
+            for ch in s:
+                if ch == "(":
+                    depth += 1
+                elif ch == ")":
+                    depth -= 1
+                if ch == "," and depth == 0:
+                    parts.append(cur)
+                    cur = ""
+                else:
+                    cur += ch
+            parts.append(cur)
+            return parts
+
+        def _ev(s: str) -> float:
+            s = s.strip()
+            # Toglie parentesi ridondanti attorno a numeri/espressioni atomiche.
+            while len(s) > 2 and s.startswith("(") and s.endswith(")"):
+                depth = 0
+                balanced = True
+                for i, ch in enumerate(s):
+                    if ch == "(":
+                        depth += 1
+                    elif ch == ")":
+                        depth -= 1
+                    if depth == 0 and i < len(s) - 1:
+                        balanced = False
+                        break
+                if balanced and depth == 0:
+                    s = s[1:-1].strip()
+                else:
+                    break
+            if s.startswith("if(") and s.endswith(")"):
+                cond, x, y = _split_top(s[3:-1])
+                c = cond.strip()
+                if c.startswith("lt(") and c.endswith(")"):
+                    a, b = _split_top(c[3:-1])
+                    ok = _ev(a) < _ev(b)
+                else:
+                    ok = bool(_ev(c))
+                return _ev(x) if ok else _ev(y)
+            if s.startswith("lt(") and s.endswith(")"):
+                a, b = _split_top(s[3:-1])
+                return 1.0 if _ev(a) < _ev(b) else 0.0
+            # Aritmetica di primo livello (+ e - binari, poi * e /).
+            for ops in (("+", "-"), ("*", "/")):
+                depth, idx, op = 0, -1, ""
+                for i, ch in enumerate(s):
+                    if ch == "(":
+                        depth += 1
+                    elif ch == ")":
+                        depth -= 1
+                    elif depth == 0 and ch in ops:
+                        if ch in ("+", "-") and i == 0:
+                            continue
+                        prev = s[i - 1] if i > 0 else ""
+                        if ch == "-" and prev in ("e", "E"):
+                            continue
+                        idx, op = i, ch
+                if idx > 0:
+                    l, r = _ev(s[:idx]), _ev(s[idx + 1:])
+                    if op == "+":
+                        return l + r
+                    if op == "-":
+                        return l - r
+                    if op == "*":
+                        return l * r
+                    return l / r if r else 0.0
+            return float(s)
+
+        return _ev(ex)
+
+    def test_gain_expr_lineare_coerente(self):
+        # volume con eval=frame vuole guadagni LINEARI >= 0, coerenti con gain_at.
+        from core.music_plan import _db_to_lin
+        w = _words()
+        p = build_music_plan(_chunks(w), w, 20.0, {"duration": 200.0, "lufs": -12.0}, -16.0, None)
+        e = build_gain_expr(p)
+        import math as _math
+        for t in (0.0, 0.2, 0.8, 1.2, 2.5, 4.5, 10.0, 19.9):
+            got = self._eval_expr(e, t)
+            want = _db_to_lin(gain_at(p, t))
+            self.assertGreaterEqual(got, 0.0)
+            # L'expr interpola in lineare, gain_at in dB: sulle rampe ripide
+            # (dip hero 60 ms) divergono fino a ~1 dB, irrilevante all'ascolto.
+            got_db = 20 * _math.log10(max(got, 1e-9))
+            want_db = 20 * _math.log10(max(want, 1e-9))
+            self.assertLessEqual(abs(got_db - want_db), 1.0)
+
     def test_determinismo(self):
         w = _words()
         c = _chunks(w)

@@ -370,21 +370,33 @@ def gain_at(plan: dict, t: float) -> float:
         return 0.0
 
 
-def build_gain_expr(plan: dict, max_chars: int = 3500) -> str:
-    """Espressione ffmpeg `volume=...:eval=frame` da keyframe (lineare in dB).
+def _db_to_lin(g_db: float) -> float:
+    """dB -> guadagno lineare per il filtro ffmpeg `volume` (eval=frame)."""
+    try:
+        return 10.0 ** (float(g_db) / 20.0)
+    except Exception:
+        return 1.0
 
-    Forma annidata `if(lt(t,t1), g0+(g1-g0)*(t-t0)/(t1-t0), ...)` tra apici singoli
+
+def build_gain_expr(plan: dict, max_chars: int = 3500) -> str:
+    """Espressione ffmpeg `volume=...:eval=frame` da keyframe.
+
+    IMPORTANTE: `volume` con `eval=frame` valuta l'espressione in guadagno
+    LINEARE (non dB: un valore negativo verrebbe clippato). I keyframe in dB
+    sono quindi convertiti in lineare e interpolati in lineare; le rampe brevi
+    (0.06-0.6 s) restano psicoacusticamente corrette.
+    Forma annidata `if(lt(t,t1), l0+(l1-l0)*(t-t0)/(t1-t0), ...)` tra apici singoli
     a cura del chiamante. Se troppo lunga, decimazione interna (mai eccezioni,
     al peggio guadagno costante).
     """
     try:
-        kf = [[float(t), float(g)] for t, g in (plan.get("keyframes") or [])]
+        kf = [[float(t), _db_to_lin(float(g))] for t, g in (plan.get("keyframes") or [])]
     except Exception:
         kf = []
     try:
         if len(kf) < 2:
-            g = kf[0][1] if kf else float(plan.get("track_gain_db", 0.0))
-            return f"{g:.2f}"
+            l = kf[0][1] if kf else _db_to_lin(float(plan.get("track_gain_db", 0.0)))
+            return f"{l:.6f}"
         # Decima finché entra nel budget (tieni sempre primo e ultimo).
         while len(kf) > 2:
             # Stima rozza: ~64 char per segmento.
@@ -412,21 +424,21 @@ def build_gain_expr(plan: dict, max_chars: int = 3500) -> str:
                 if dt <= 0:
                     continue
                 slope = (g1 - g0) / dt
-                segs.append((t1, f"{g0:.2f}+({slope:.4f})*(t-{t0:.3f})"))
+                segs.append((t1, f"{g0:.6f}+({slope:.6f})*(t-{t0:.3f})"))
             except Exception:
                 continue
         if not segs:
-            return f"{kf[0][1]:.2f}"
+            return f"{kf[0][1]:.6f}"
         last_g = kf[-1][1]
-        expr = f"{last_g:.2f}"
+        expr = f"{last_g:.6f}"
         for t1, body in reversed(segs):
             expr = f"if(lt(t,{t1:.3f}),{body},{expr})"
         if len(expr) > max_chars:  # ultima rete: costante media
             avg = sum(g for _, g in kf) / len(kf)
-            return f"{avg:.2f}"
+            return f"{avg:.6f}"
         return expr
     except Exception:
         try:
-            return f"{float(plan.get('track_gain_db', 0.0)):.2f}"
+            return f"{_db_to_lin(float(plan.get('track_gain_db', 0.0))):.6f}"
         except Exception:
-            return "0.00"
+            return "1.000000"

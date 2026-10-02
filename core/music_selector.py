@@ -429,9 +429,14 @@ def choose_track(
             _log(f"Nessuna traccia valida (≥ {min_s:.0f}s) in '{category}'.")
             return None
 
-        # 3. Anti-ripetizione: escludi le ultime N, salvo restarne senza.
+        # 3. Anti-ripetizione: escludi le ultime N; se restano senza candidati,
+        # escludi comunque l'ultima usata (alternanza, mai repeat immediato con ≥2 tracce).
         fresh = [a for a in analyzed if a.get("path") not in hist and Path(a["path"]).name not in hist]
-        pool = fresh or analyzed
+        pool = fresh
+        if not pool:
+            last = hist[-1] if hist else None
+            pool = [a for a in analyzed
+                    if a.get("path") != last and Path(a["path"]).name != last] or analyzed
 
         # 4. Preferisci durata ≥ video + fade (evita loop); a parità, LUFS vicini alla voce.
         try:

@@ -77,6 +77,29 @@ class TestMusicSelector(unittest.TestCase):
             self.assertIsNotNone(t)
             self.assertEqual(t["category"], "dark_motivational")
 
+    def test_mai_ripetizione_immediata_con_due_tracce(self):
+        _make_lib(self.root, {"dark_motivational": ["a.mp3", "b.mp3"]})
+        fake = {"duration": 200.0, "lufs": -14.0, "true_peak": -1.0, "lra": 8.0,
+                "lead_silence": 0.0, "tail_silence": 0.0, "sample_rate": 44100,
+                "channels": 2, "codec": "mp3", "valid": True}
+
+        def _fake_analyze(path, music_dir=None):
+            info = dict(fake)
+            info["path"] = str(path)
+            return info
+
+        with mock.patch.object(ms, "analyze_track", side_effect=_fake_analyze):
+            hist: list[str] = []
+            seq = []
+            for i in range(6):
+                t = ms.choose_track("dark_motivational", f"script {i}", hist,
+                                    music_dir=str(self.root), history_size=3)
+                seq.append(t["path"])
+                hist.append(t["path"])
+                hist = hist[-3:]
+            for a, b in zip(seq, seq[1:]):
+                self.assertNotEqual(a, b)
+
     def test_scarta_tracce_corte(self):
         _make_lib(self.root, {"educational": ["short.mp3"]})
 

@@ -228,7 +228,7 @@ def _sfx_chain(idx: int, kind: str, at_sec: float, vol_db: float) -> str:
 
 
 def _music_chain(track_path: str, duration: float, plan: dict | None,
-                 voice_lufs: float | None) -> tuple[str, dict]:
+                 voice_lufs: float | None, in_label: str = "[1:a]") -> tuple[str, dict]:
     """Catena filtro musica: uniforma + trim lead + loop + inviluppo + fade.
 
     Ritorna (filter_snippet_con_[mus]_finale, debug_info). Mai eccezioni
@@ -270,7 +270,7 @@ def _music_chain(track_path: str, duration: float, plan: dict | None,
     # qui resta solo documentato per il debug.
     dbg["lead_trim_s"] = round(lead if lead >= 0.4 else 0.0, 3)
     parts = [
-        f"[1:a]{_UNIFORM}",
+        f"{in_label}{_UNIFORM}",
         "atrim=0:{:.3f}".format(duration + 0.5),
         "asetpts=PTS-STARTPTS",
         "highpass=f={:.0f}".format(max(20.0, min(200.0, lowcut))),
@@ -503,32 +503,58 @@ def mix_audio_with_music(
             except Exception:
                 pass
 
-        # Passaggio 2: misura premaster; passaggio 3: loudnorm lineare misurato.
-        final_lufs, final_tp = None, None
-        meas = measure_loudness(premaster)
-        if meas and meas.get("measured"):
-            m = meas["measured"]
-            filt = (f"loudnorm=I={target_i}:TP={target_tp}:LRA=11:"
-                    f"measured_I={m['measured_I']:.2f}:measured_TP={m['measured_TP']:.2f}:"
-                    f"measured_LRA={m['measured_LRA']:.2f}:measured_thresh={m['measured_thresh']:.2f}:"
-                    f"offset={m['offset']:.2f}:linear=true")
-            cmd2 = [ff, "-y", "-i", premaster, "-af", filt,
-                    "-c:a", "pcm_s16le", "-ar", "44100", "-ac", "2", "-t", dur_s, out]
-            ok2, _ = _run(cmd2)
-            if not ok2:
-                meas = None
-        if not (meas and meas.get("measured")):
-            # Fallback: loudnorm singolo passaggio.
-            filt1 = f"loudnorm=I={target_i}:TP={target_tp}:LRA=11"
-            cmd2 = [ff, "-y", "-i", premaster, "-af", filt1,
-                    "-c:a", "pcm_s16le", "-ar", "44100", "-ac", "2", "-t", dur_s, out]
-            ok2, _ = _run(cmd2)
-            if not ok2:
-                # Ultima rete: premaster così com'è.
+        # Passaggio 2: master P0 condiviso (alimiter + loudnorm 2-pass).
+        # Stadio finale unico: riusa gli stessi nomi di config
+        # (FINAL_LOUDNESS_LUFS / FINAL_TRUE_PEAK_DB). Best-effort.
+        try:
+            from core.audio_master import master_audio as _master_audio
+            from core.audio_master import should_use_audio_master as _use_master
+            _use = _use_master()
+        except Exception:
+            _master_audio = None
+            _use = False
+        if _use and _master_audio is not None:
+            try:
+                _mastered = _master_audio(premaster, out, target_i, target_tp)
+                if _mastered and os.path.isfile(_mastered) and _mastered != premaster:
+                    pass  # out scritto dal master (o fallback premaster)
+                elif _mastered == premaster and premaster != out:
+                    # Il master ha fallito: copia il premaster così com'è.
+                    try:
+                        shutil.copyfile(premaster, out)
+                    except Exception:
+                        pass
+                meas = None  # misurato sotto dal post-check
+            except Exception:
                 try:
                     shutil.copyfile(premaster, out)
                 except Exception:
-                    return voice_path
+                    pass
+        else:
+            meas = measure_loudness(premaster)
+            if meas and meas.get("measured"):
+                m = meas["measured"]
+                filt = (f"loudnorm=I={target_i}:TP={target_tp}:LRA=11:"
+                        f"measured_I={m['measured_I']:.2f}:measured_TP={m['measured_TP']:.2f}:"
+                        f"measured_LRA={m['measured_LRA']:.2f}:measured_thresh={m['measured_thresh']:.2f}:"
+                        f"offset={m['offset']:.2f}:linear=true")
+                cmd2 = [ff, "-y", "-i", premaster, "-af", filt,
+                        "-c:a", "pcm_s16le", "-ar", "44100", "-ac", "2", "-t", dur_s, out]
+                ok2, _ = _run(cmd2)
+                if not ok2:
+                    meas = None
+            if not (meas and meas.get("measured")):
+                # Fallback: loudnorm singolo passaggio.
+                filt1 = f"loudnorm=I={target_i}:TP={target_tp}:LRA=11"
+                cmd2 = [ff, "-y", "-i", premaster, "-af", filt1,
+                        "-c:a", "pcm_s16le", "-ar", "44100", "-ac", "2", "-t", dur_s, out]
+                ok2, _ = _run(cmd2)
+                if not ok2:
+                    # Ultima rete: premaster così com'è.
+                    try:
+                        shutil.copyfile(premaster, out)
+                    except Exception:
+                        return voice_path
         try:
             if os.path.isfile(premaster) and not debug_stems_dir:
                 os.remove(premaster)
@@ -549,6 +575,7 @@ def mix_audio_with_music(
             pass
         try:
             post = measure_loudness(out)
+            final_lufs, final_tp = None, None
             if post:
                 final_lufs, final_tp = post.get("lufs"), post.get("true_peak")
         except Exception:
@@ -587,7 +614,7 @@ def _export_stems(ff: str, voice_path: str, track_path: str | None, duration: fl
                  "-t", dur_s, os.path.join(stems_dir, "voice.wav")]
         _run(cmd_v)
         if track_path and os.path.isfile(track_path):
-            mus_chain, _ = _music_chain(track_path, duration, plan, vlufs)
+            mus_chain, _ = _music_chain(track_path, duration, plan, vlufs, "[0:a]")
             # Stessa catena senza sidechain (musica processata con inviluppo).
             cmd_m = [ff, "-y", "-i", track_path, "-filter_complex", mus_chain,
                      "-map", "[mus]", "-c:a", "pcm_s16le", "-ar", "44100", "-ac", "2",
