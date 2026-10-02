@@ -44,7 +44,107 @@ from core.narrative_structure import classify_narrative
 from core.renderer import render_all_subtitles
 from core.text_animator import render_all_chunks_animated, TextAnimationError
 from core.video_builder import build_video, cleanup_temp_files, VideoBuildError
-from config import TEMP_DIR, OUTPUT_DIR, VIDEO_FPS, TEXT_ANIMATION_ENABLED, CHARACTER_ENABLED, TYPOGRAPHY_ENGINE_ENABLED, NARRATIVE_ENABLED
+from config import TEMP_DIR, OUTPUT_DIR, VIDEO_FPS, TEXT_ANIMATION_ENABLED, CHARACTER_ENABLED, TYPOGRAPHY_ENGINE_ENABLED, NARRATIVE_ENABLED, ENABLE_BG_MUSIC
+
+
+def _parse_music_cli() -> dict:
+    """Opzioni musica da CLI (headless e GUI): --no-music, --music-track, --music-category, --audio-debug."""
+    opts: dict = {"no_music": False, "track": None, "category": None, "audio_debug": False}
+    try:
+        import sys as _sys
+        args = list(_sys.argv[1:])
+        i = 0
+        while i < len(args):
+            a = args[i]
+            if a == "--no-music":
+                opts["no_music"] = True
+            elif a == "--audio-debug":
+                opts["audio_debug"] = True
+            elif a.startswith("--music-track="):
+                opts["track"] = a.split("=", 1)[1].strip() or None
+            elif a == "--music-track" and i + 1 < len(args):
+                i += 1
+                opts["track"] = args[i].strip() or None
+            elif a.startswith("--music-category="):
+                opts["category"] = a.split("=", 1)[1].strip() or None
+            elif a == "--music-category" and i + 1 < len(args):
+                i += 1
+                opts["category"] = args[i].strip() or None
+            i += 1
+    except Exception:
+        pass
+    try:
+        if not opts["audio_debug"]:
+            opts["audio_debug"] = str(os.environ.get("AUDIO_DEBUG", "")).strip().lower() in ("1", "true", "yes", "on")
+    except Exception:
+        pass
+    return opts
+
+
+def _write_audio_sidecar(output_filename: str, choice: dict | None, plan: dict | None,
+                         on_log=None) -> str | None:
+    """Sidecar `outputs/<video>.audio.json` con attribuzione + misure. Mai eccezioni."""
+    try:
+        import json as _json
+        base = os.path.splitext(str(output_filename))[0] + ".audio.json"
+        path = os.path.join(OUTPUT_DIR, base)
+        stats: dict = {}
+        try:
+            from core.audio_mixer import last_mix_stats as _stats
+            stats = _stats() or {}
+        except Exception:
+            stats = {}
+        title = "sconosciuto"
+        author = "sconosciuto"
+        lic = "sconosciuta"
+        page = ""
+        track = None
+        category = None
+        try:
+            if choice:
+                track = os.path.basename(str(choice.get("path", ""))) or None
+                category = choice.get("category")
+                title = choice.get("title") or (os.path.splitext(track or "")[0] or title)
+                author = choice.get("author", author)
+                lic = choice.get("license", lic)
+                page = choice.get("source_page", "") or ""
+        except Exception:
+            pass
+        offs = {}
+        try:
+            offs = dict((plan or {}).get("offsets_lu", {}) or {})
+        except Exception:
+            offs = {}
+        data = {
+            "track": track,
+            "category": category,
+            "title": title,
+            "author": author,
+            "license": lic,
+            "source_page": page,
+            "attribution_text": f"Music: {title} by {author} ({lic})",
+            "final_lufs": stats.get("final_lufs"),
+            "true_peak": stats.get("final_tp"),
+            "music_offset_lu": {"hook": offs.get("hook", -17), "body": offs.get("body", -20),
+                                "cta": offs.get("cta", -18)},
+            "track_gain_db": (plan or {}).get("track_gain_db"),
+            "pause_count": (plan or {}).get("pause_count", 0),
+            "hero_count": (plan or {}).get("hero_count", 0),
+            "fade_in_s": (plan or {}).get("fade_in_s"),
+            "fade_out_s": (plan or {}).get("fade_out_s"),
+            "loop": bool((plan or {}).get("loop", False)),
+        }
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            _json.dump(data, f, indent=2, ensure_ascii=False)
+        return path
+    except Exception as e:
+        try:
+            if on_log:
+                on_log(f"      ⚠️ Sidecar audio non scritto ({e}).")
+        except Exception:
+            pass
+        return None
 
 
 def _render_mode() -> str:
@@ -79,10 +179,14 @@ class VideoGeneratorApp:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title("Video Generator - v2")
-        self.root.geometry("640x580")
+        self.root.geometry("640x610")
         self.root.resizable(False, False)
         # Bulk: una riga non vuota = uno script = un video (default: singolo).
         self.bulk_mode = tk.BooleanVar(value=False)
+        # Musica: default da config, override da GUI; history anti-ripetizione bulk.
+        self.music_enabled = tk.BooleanVar(value=bool(ENABLE_BG_MUSIC))
+        self.music_category = tk.StringVar(value="Auto")
+        self._music_history: list[str] = []
         self._refresh_job: str | None = None
 
         self._build_ui()
@@ -134,6 +238,26 @@ class VideoGeneratorApp:
             bulk_frame, text="", fg="#2d6cdf", font=("Segoe UI", 9, "bold")
         )
         self.script_count_label.pack(side="left", padx=10)
+
+        # --- Musica di sottofondo (default da ENABLE_BG_MUSIC) ---
+        music_frame = tk.Frame(self.root)
+        music_frame.pack(fill="x", padx=20, pady=(5, 0))
+
+        self.music_check = tk.Checkbutton(
+            music_frame,
+            text="Musica di sottofondo",
+            variable=self.music_enabled,
+            font=("Segoe UI", 10),
+        )
+        self.music_check.pack(side="left")
+
+        try:
+            from core.typography_presets import VALID_NICHES as _NICHES
+            _cats = ["Auto"] + [str(n) for n in _NICHES]
+        except Exception:
+            _cats = ["Auto"]
+        self.music_menu = tk.OptionMenu(music_frame, self.music_category, *_cats)
+        self.music_menu.pack(side="left", padx=10)
 
         # --- Anteprima testo ---
         self.preview_label = tk.Label(self.root, text="Anteprima script:", anchor="w")
@@ -344,8 +468,12 @@ class VideoGeneratorApp:
                     self._log(f"\n❌ Video {idx}/{total} errore inatteso: {err_msg}\n{tb}")
                 finally:
                     # Isolamento temp tra video: evita collisioni chunk/audio e spreco disco.
+                    # Con --audio-debug i stem vengono mantenuti (nessuna pulizia).
                     try:
-                        cleanup_temp_files()
+                        if not self._audio_debug_active():
+                            cleanup_temp_files()
+                        else:
+                            self._log("      Stem/debug mantenuti in temp/ (--audio-debug).")
                     except Exception:
                         pass
             # --- Riepilogo batch ---
@@ -369,6 +497,103 @@ class VideoGeneratorApp:
                 self.root.after(0, lambda m=msg: messagebox.showerror("Errore", m))
         finally:
             self._set_ui_busy(False)
+
+    # ------------------------------------------------------------ Musica
+
+    def _music_enabled(self) -> bool:
+        """Musica attiva? CLI --no-music > GUI checkbox > ENABLE_BG_MUSIC."""
+        try:
+            if _parse_music_cli().get("no_music"):
+                return False
+        except Exception:
+            pass
+        try:
+            return bool(self.music_enabled.get())
+        except Exception:
+            pass
+        try:
+            return bool(ENABLE_BG_MUSIC)
+        except Exception:
+            return True
+
+    def _music_overrides(self) -> tuple[str | None, str | None]:
+        """(categoria, traccia forzata) da CLI > GUI. Mai eccezioni."""
+        cat: str | None = None
+        track: str | None = None
+        try:
+            cli = _parse_music_cli()
+            cat = cli.get("category") or None
+            track = cli.get("track") or None
+        except Exception:
+            pass
+        if not cat:
+            try:
+                g = str(self.music_category.get() or "").strip()
+                cat = g if g and g.lower() != "auto" else None
+            except Exception:
+                pass
+        return cat, track
+
+    def _audio_debug_active(self) -> bool:
+        try:
+            return bool(_parse_music_cli().get("audio_debug"))
+        except Exception:
+            return False
+
+    def _select_music(self, tag: str, audio_path: str, chunks: list,
+                      script_text: str, niche: str | None) -> tuple[dict | None, dict | None]:
+        """Sceglie traccia + piano (best-effort). Ritorna (choice, plan) o (None, None)."""
+        try:
+            if _render_mode() == "text_only":
+                return None, None
+            if not self._music_enabled():
+                return None, None
+            from core.music_selector import choose_track
+            from core.music_plan import build_music_plan
+            from core.audio_mixer import _ffprobe_duration, measure_loudness
+            cat_cli, forced = self._music_overrides()
+            niche_eff = (cat_cli or niche or "").strip() or None
+            dur = _ffprobe_duration(audio_path)
+            vlufs = None
+            try:
+                m = measure_loudness(audio_path)
+                vlufs = float(m["lufs"]) if m else None
+            except Exception:
+                vlufs = None
+            try:
+                history = list(getattr(self, "_music_history", None) or [])
+            except Exception:
+                history = []
+            choice = choose_track(niche_eff, script_text, history, forced, dur, vlufs,
+                                  on_log=lambda msg: self._log(f"      {msg}"))
+            if not choice:
+                self._log("      ⚠️ Musica non usata (nessuna traccia valida), proseguo con voce+SFX.")
+                return None, None
+            words_flat: list = []
+            try:
+                for ch in (chunks or []):
+                    if isinstance(ch, dict):
+                        words_flat.extend(ch.get("words") or [])
+            except Exception:
+                pass
+            plan = build_music_plan(chunks, words_flat, float(dur or 10.0), choice,
+                                    vlufs if vlufs is not None else -16.0, None)
+            try:
+                plan["track_info"] = choice
+            except Exception:
+                pass
+            try:
+                dur_t = float(choice.get("duration", 0.0) or 0.0)
+                lufs_t = choice.get("lufs")
+                lufs_s = f"{float(lufs_t):.1f} LUFS" if lufs_t is not None else "LUFS n.d."
+                self._log(f"{tag}[8/8] Musica: {choice.get('category')}/{os.path.basename(str(choice.get('path', '')))} "
+                          f"({dur_t:.0f}s, {lufs_s}) → gain {float(plan.get('track_gain_db', 0.0)):+.1f} dB")
+            except Exception:
+                pass
+            return choice, plan
+        except Exception as e:
+            self._log(f"      ⚠️ Musica saltata ({e}), uso voce+SFX.")
+            return None, None
 
     def _process_one_script(self, script_text: str, index: int = 1, total: int = 1) -> str:
         """Pipeline completa per UN singolo script. Ritorna il path del video.
@@ -651,16 +876,85 @@ class VideoGeneratorApp:
                 return _preview
             except Exception as _e_to:
                 self._log(f"      ⚠️ text_only fallito ({_e_to}), proseguo full.")
-        # --- SFX mix best-effort (voce+SFX, mai bloccante) ---
+        # --- Mix audio best-effort (voce+SFX, + musica se abilitata) ---
         _mix_audio = audio_path
+        _music_choice: dict | None = None
+        _music_plan: dict | None = None
         try:
-            from core.audio_mixer import mix_sfx as _mix_sfx
-            _mix_audio = _mix_sfx(audio_path, enriched_chunks) or audio_path
-            if _mix_audio != audio_path:
-                self._log(f"      Audio mix con SFX: {_mix_audio}")
+            _music_choice, _music_plan = self._select_music(
+                tag, audio_path, enriched_chunks, script_text, typography_niche)
+        except Exception as _e_mus:
+            self._log(f"      ⚠️ Musica saltata ({_e_mus}), uso voce+SFX.")
+            _music_choice, _music_plan = None, None
+        try:
+            if _music_choice:
+                from core.audio_mixer import mix_audio_with_music, last_mix_stats
+                _words_flat = [w for _c in (enriched_chunks or [])
+                               for w in (((_c or {}).get("words")) or [])]
+                _stems = None
+                if self._audio_debug_active():
+                    _stems = os.path.join(TEMP_DIR, f"audio_debug_{index:03d}")
+                    try:
+                        os.makedirs(_stems, exist_ok=True)
+                    except Exception:
+                        _stems = None
+                _mix_audio = mix_audio_with_music(
+                    audio_path, enriched_chunks, _words_flat,
+                    _music_choice, _music_plan, None, None, None, None,
+                    self._log, _stems) or audio_path
+                if _mix_audio != audio_path:
+                    try:
+                        _hist = getattr(self, "_music_history", None)
+                        if _hist is None:
+                            _hist = self._music_history = []
+                        _hist.append(os.path.basename(str(_music_choice.get("path", ""))))
+                        from config import MUSIC_HISTORY_SIZE as _HS
+                        del _hist[:-max(1, int(_HS))]
+                    except Exception:
+                        pass
+                    try:
+                        _st = last_mix_stats()
+                        _off = (_music_plan or {}).get("offsets_lu", {}) or {}
+                        self._log(
+                            f"      Musica: hook {_off.get('hook', -17):+.0f} / "
+                            f"body {_off.get('body', -20):+.0f} / cta {_off.get('cta', -18):+.0f} LU | "
+                            f"{int((_music_plan or {}).get('pause_count', 0))} pause boost, "
+                            f"{int((_music_plan or {}).get('hero_count', 0))} hero dip | "
+                            f"fade-in {float((_music_plan or {}).get('fade_in_s', 0.8)):.1f}s / "
+                            f"fade-out {float((_music_plan or {}).get('fade_out_s', 2.0)):.1f}s | "
+                            f"loudness finale {(_st.get('final_lufs') if _st.get('final_lufs') is not None else '?')} LUFS, "
+                            f"TP {(_st.get('final_tp') if _st.get('final_tp') is not None else '?')} dB")
+                    except Exception:
+                        self._log(f"      Audio mix con musica: {_mix_audio}")
+                    if _stems:
+                        try:
+                            import json as _json
+                            import shutil as _sh
+                            _sh.copyfile(_mix_audio, os.path.join(_stems, "mix_final.wav"))
+                            with open(os.path.join(_stems, "audio_debug.json"), "w", encoding="utf-8") as _f:
+                                _json.dump({"track": _music_choice, "plan": _music_plan,
+                                            "stats": last_mix_stats()}, _f, indent=2, ensure_ascii=False,
+                                           default=str)
+                            self._log(f"      Stem debug mantenuti in: {_stems}")
+                        except Exception as _e_dbg:
+                            self._log(f"      ⚠️ Stem debug non salvati ({_e_dbg}).")
+                else:
+                    self._log("      ⚠️ Mix musica fallito, uso voce originale.")
+            else:
+                from core.audio_mixer import mix_sfx as _mix_sfx
+                _mix_audio = _mix_sfx(audio_path, enriched_chunks) or audio_path
+                if _mix_audio != audio_path:
+                    self._log(f"      Audio mix con SFX: {_mix_audio}")
         except Exception as _e_sfx:
-            self._log(f"      ⚠️ SFX saltati ({_e_sfx}), uso voce originale.")
+            self._log(f"      ⚠️ SFX/musica saltati ({_e_sfx}), uso voce originale.")
             _mix_audio = audio_path
+        # --- Sidecar di attribuzione (sempre, anche senza musica) ---
+        try:
+            _sidecar = _write_audio_sidecar(output_filename, _music_choice, _music_plan, self._log)
+            if _sidecar:
+                self._log(f"      Sidecar audio: {_sidecar}")
+        except Exception:
+            pass
         # --- Compose video (Ken Burns + dimmer + overlay, mux atomico) ---
         try:
             from core.video_composer import build_composed_video as _compose
@@ -732,6 +1026,9 @@ def main():
             app.root = _root
             app.bulk_mode = _types.SimpleNamespace(get=lambda: _bulk)
             app._refresh_job = None
+            app._music_history = []
+            # Headless: nessuna widget GUI (checkbox/categoria assenti -> default da
+            # config; override solo da CLI --no-music/--music-track/--music-category).
             app._log = print
             app._log_attempt = lambda i, t, ok, d: print(f"   {'OK' if ok else '..'} chiave {i}/{t}: {d[:120]}")
             app._set_ui_busy = lambda b: None
@@ -746,7 +1043,8 @@ def main():
                     print(f"FAIL [{_idx}] {_e}")
                     _tb.print_exc()
                 try:
-                    cleanup_temp_files()
+                    if not app._audio_debug_active():
+                        cleanup_temp_files()
                 except Exception:
                     pass
             print(f"Completati {_ok}/{len(_scripts)}")
@@ -766,5 +1064,7 @@ if __name__ == "__main__":
     if any(a in ("-h", "--help") for a in _sys2.argv[1:]):
         print("Uso: python main.py [--render-mode=full|text_only|debug_safezones] [--script file.txt [--bulk]]")
         print("  GUI default; --script esegue headless senza Tk.")
+        print("  --no-music: nessun sottofondo (voce+SFX). --music-track=<path>: traccia forzata.")
+        print("  --music-category=<nicchia>: categoria forzata. --audio-debug: stem+JSON in temp/ (mantenuti).")
         raise SystemExit(0)
     main()

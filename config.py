@@ -75,6 +75,16 @@ def _get_float(key: str, default: float) -> float:
         return default
 
 
+def _get_bool(key: str, default: bool) -> bool:
+    try:
+        raw = os.environ.get(key, "")
+        if raw is None or not str(raw).strip():
+            return bool(default)
+        return str(raw).strip().lower() not in ("0", "false", "no", "off", "")
+    except Exception:
+        return bool(default)
+
+
 def _get_tuple(key: str, default: tuple) -> tuple:
     raw = os.environ.get(key, "")
     if not raw or not raw.strip():
@@ -201,7 +211,7 @@ VIDEO_FPS = _get_int("VIDEO_FPS", 30)
 
 # ---- Sottotitoli ----
 SUBTITLE_FONT_PATH = _get_str_or_none("SUBTITLE_FONT_PATH")  # None = usa un font di default del sistema, vedi core/renderer.py
-SUBTITLE_FONT_SIZE = _get_int("SUBTITLE_FONT_SIZE", 64)
+SUBTITLE_FONT_SIZE = _get_int("SUBTITLE_FONT_SIZE", 84)
 SUBTITLE_COLOR = _get_tuple("SUBTITLE_COLOR", (255, 255, 255, 255))  # bianco RGBA
 SUBTITLE_STROKE_COLOR = _get_tuple("SUBTITLE_STROKE_COLOR", (0, 0, 0, 255))  # contorno nero per leggibilità
 SUBTITLE_STROKE_WIDTH = _get_int("SUBTITLE_STROKE_WIDTH", 0)  # 0 = nessun contorno sul testo
@@ -401,7 +411,47 @@ ENABLE_DYNAMIC_BACKGROUNDS = os.environ.get("ENABLE_DYNAMIC_BACKGROUNDS", "1").s
 # SFX automatici su parole T3 / cambi posa (mix a SFX_VOLUME_DB). 0 = nessun SFX.
 ENABLE_AUTO_SFX = os.environ.get("ENABLE_AUTO_SFX", "1").strip().lower() not in ("0", "false", "no", "off", "")
 SFX_VOLUME_DB = _get_float("SFX_VOLUME_DB", -15.0)  # mix SFX whoosh/pop/click
-BG_MUSIC_DUCKING_DB = _get_float("BG_MUSIC_DUCKING_DB", -12.0)  # ducking musica sotto voce
+# Alias storico deprecato: era il gain statico della musica (non la profondità
+# di ducking). Restata per retrocompatibilità: se personalizzata (diversa da
+# -12), sposta uniformemente gli offset MUSIC_OFFSET_* di sezione.
+BG_MUSIC_DUCKING_DB = _get_float("BG_MUSIC_DUCKING_DB", -12.0)  # DEPRECATO, vedi sopra
+
+# ---- Musica di sottofondo (Background Music) ----
+# 1 = inviluppo deterministico hook/body/CTA + sidechain fine + loudnorm -14 LUFS.
+ENABLE_BG_MUSIC = _get_bool("ENABLE_BG_MUSIC", True)
+MUSIC_DIR = Path(os.environ.get("MUSIC_DIR", os.path.join(BASE_DIR, "assets", "music")))
+MUSIC_FALLBACK_CATEGORY = (os.environ.get("MUSIC_FALLBACK_CATEGORY", "dark_motivational") or "dark_motivational").strip()
+MUSIC_MIN_TRACK_S = _get_float("MUSIC_MIN_TRACK_S", 30.0)  # tracce più corte scartate
+MUSIC_HISTORY_SIZE = _get_int("MUSIC_HISTORY_SIZE", 3)  # anti-ripetizione nel bulk
+# Livelli musica in LU sotto il loudness integrato della voce (per sezione).
+MUSIC_OFFSET_HOOK_LU = _get_float("MUSIC_OFFSET_HOOK_LU", -17.0)
+MUSIC_OFFSET_BODY_LU = _get_float("MUSIC_OFFSET_BODY_LU", -20.0)
+MUSIC_OFFSET_CTA_LU = _get_float("MUSIC_OFFSET_CTA_LU", -18.0)
+MUSIC_CTA_RAMP_S = _get_float("MUSIC_CTA_RAMP_S", 0.6)  # rampa graduale verso la CTA
+# Pause tra parole: la musica sale durante la pausa e riscende sulla parola.
+MUSIC_PAUSE_MIN_S = _get_float("MUSIC_PAUSE_MIN_S", 0.35)
+MUSIC_PAUSE_BOOST_DB = _get_float("MUSIC_PAUSE_BOOST_DB", 4.0)
+MUSIC_PAUSE_ATTACK_S = _get_float("MUSIC_PAUSE_ATTACK_S", 0.12)
+MUSIC_PAUSE_RELEASE_S = _get_float("MUSIC_PAUSE_RELEASE_S", 0.25)
+# Parola hero (T3) / impatto SFX: dip breve per far uscire l'effetto.
+MUSIC_HERO_DIP_DB = _get_float("MUSIC_HERO_DIP_DB", -4.0)
+MUSIC_HERO_DIP_S = _get_float("MUSIC_HERO_DIP_S", 0.35)
+# Fade curati (curva qsin); video < 8 s: fade ridotti e nessun dip hero.
+MUSIC_FADE_IN_S = _get_float("MUSIC_FADE_IN_S", 0.8)
+MUSIC_FADE_OUT_S = _get_float("MUSIC_FADE_OUT_S", 2.0)
+MUSIC_OUTRO_TAIL_S = _get_float("MUSIC_OUTRO_TAIL_S", 0.0)  # coda solo-musica (0 = OFF)
+# Ducking residuo fine via sidechain (il grosso lo fa l'inviluppo deterministico).
+MUSIC_SIDECHAIN_THRESHOLD = _get_float("MUSIC_SIDECHAIN_THRESHOLD", 0.04)
+MUSIC_SIDECHAIN_RATIO = _get_float("MUSIC_SIDECHAIN_RATIO", 2.5)
+MUSIC_SIDECHAIN_ATTACK_MS = _get_float("MUSIC_SIDECHAIN_ATTACK_MS", 15.0)
+MUSIC_SIDECHAIN_RELEASE_MS = _get_float("MUSIC_SIDECHAIN_RELEASE_MS", 450.0)
+# EQ musica: taglia-bassi + buco di presenza per far spazio alla voce.
+MUSIC_LOW_CUT_HZ = _get_float("MUSIC_LOW_CUT_HZ", 35.0)
+MUSIC_PRESENCE_CUT_DB = _get_float("MUSIC_PRESENCE_CUT_DB", -3.0)
+# Loudness finale conforme TikTok/Reels/Shorts + formato intermedi.
+FINAL_LOUDNESS_LUFS = _get_float("FINAL_LOUDNESS_LUFS", -14.0)
+FINAL_TRUE_PEAK_DB = _get_float("FINAL_TRUE_PEAK_DB", -1.5)
+AUDIO_INTERMEDIATE_FORMAT = (os.environ.get("AUDIO_INTERMEDIATE_FORMAT", "wav") or "wav").strip().lower()
 # Font dedicati per cinetica avanzata (fallback automatico via FontManager se assenti).
 HERO_WORD_FONT_PATH = (os.environ.get("HERO_WORD_FONT_PATH", "assets/fonts/Montserrat-Black.ttf") or "assets/fonts/Montserrat-Black.ttf").strip()
 BASE_WORD_FONT_PATH = (os.environ.get("BASE_WORD_FONT_PATH", "assets/fonts/Inter-Bold.ttf") or "assets/fonts/Inter-Bold.ttf").strip()
@@ -463,6 +513,91 @@ TEMP_DIR = os.environ.get("TEMP_DIR", os.path.join(BASE_DIR, "temp"))
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 os.makedirs(TEMP_DIR, exist_ok=True)
+
+
+# ============================================================
+# P0 — Pacchetto qualità (audio master, TTS/pause, safe zone,
+# leggibilità, export). Priorità: env > .env > default.
+# Ogni comportamento ha un flag per tornare al path legacy (=0):
+# con tutti i flag a 0 il risultato equivale al comportamento precedente.
+# ============================================================
+
+def _get_bool(key: str, default: bool) -> bool:
+    raw = os.environ.get(key)
+    if raw is None:
+        return default
+    return raw.strip().lower() not in ("0", "false", "no", "off", "")
+
+
+# ---- Audio master (WS-A) ----
+FINAL_LOUDNESS_LUFS = _get_float("FINAL_LOUDNESS_LUFS", -14.0)
+FINAL_TRUE_PEAK_DB = _get_float("FINAL_TRUE_PEAK_DB", -1.5)
+FINAL_LRA = _get_float("FINAL_LRA", 11.0)
+AUDIO_INTERMEDIATE_FORMAT = (os.environ.get("AUDIO_INTERMEDIATE_FORMAT", "wav") or "wav").strip().lower()
+AUDIO_SAMPLE_RATE = _get_int("AUDIO_SAMPLE_RATE", 44100)
+AUDIO_FINAL_BITRATE = (os.environ.get("AUDIO_FINAL_BITRATE", "192k") or "192k").strip()
+LOUDNORM_TWO_PASS = _get_int("LOUDNORM_TWO_PASS", 1)
+VOICE_POLISH = _get_int("VOICE_POLISH", 1)
+VOICE_HIGHPASS_HZ = _get_int("VOICE_HIGHPASS_HZ", 70)
+AUDIO_MASTER_ENABLED = _get_bool("AUDIO_MASTER_ENABLED", True)
+# Futuro multi-piattaforma (oggi ignorato: un solo master -14 LUFS).
+PLATFORM_LOUDNESS = (os.environ.get("PLATFORM_LOUDNESS", "") or "").strip()
+
+# ---- TTS ElevenLabs (WS-B) ----
+TTS_STABILITY = _get_float("TTS_STABILITY", 0.5)
+TTS_SIMILARITY = _get_float("TTS_SIMILARITY", 0.75)
+TTS_STYLE = _get_float("TTS_STYLE", 0.25)
+TTS_SPEED = _get_float("TTS_SPEED", 1.08)
+TTS_USE_SPEAKER_BOOST = _get_bool("TTS_USE_SPEAKER_BOOST", True)
+TTS_SPEED_MIN = _get_float("TTS_SPEED_MIN", 1.0)
+TTS_SPEED_MAX = _get_float("TTS_SPEED_MAX", 1.15)
+TTS_PROFILES_JSON = (os.environ.get("TTS_PROFILES_JSON", "") or "").strip()
+ELEVENLABS_MODEL_CAPABILITIES_JSON = (os.environ.get("ELEVENLABS_MODEL_CAPABILITIES_JSON", "") or "").strip()
+
+# ---- Pause Engine (WS-B) ----
+PAUSE_ENGINE_ENABLED = _get_bool("PAUSE_ENGINE_ENABLED", True)
+PAUSE_PACE_PROFILE = (os.environ.get("PAUSE_PACE_PROFILE", "auto") or "auto").strip().lower()
+PAUSE_HEAD_TARGET_S = _get_float("PAUSE_HEAD_TARGET_S", 0.06)
+PAUSE_TAIL_TARGET_S = _get_float("PAUSE_TAIL_TARGET_S", 0.35)
+PAUSE_MAX_S = _get_float("PAUSE_MAX_S", 0.60)
+PAUSE_SENTENCE_TARGET_S = _get_float("PAUSE_SENTENCE_TARGET_S", 0.32)
+PAUSE_CLAUSE_TARGET_S = _get_float("PAUSE_CLAUSE_TARGET_S", 0.14)
+PAUSE_NONE_MAX_S = _get_float("PAUSE_NONE_MAX_S", 0.10)
+PAUSE_DRAMATIC_EXTRA_S = _get_float("PAUSE_DRAMATIC_EXTRA_S", 0.18)
+PAUSE_TOLERANCE_S = _get_float("PAUSE_TOLERANCE_S", 0.06)
+PAUSE_MIN_EDIT_S = _get_float("PAUSE_MIN_EDIT_S", 0.05)
+PAUSE_MAX_TOTAL_CHANGE_RATIO = _get_float("PAUSE_MAX_TOTAL_CHANGE_RATIO", 0.12)
+PAUSE_JOIN_FADE_MS = _get_int("PAUSE_JOIN_FADE_MS", 12)
+PAUSE_VERIFY_WITH_WHISPER = _get_bool("PAUSE_VERIFY_WITH_WHISPER", False)
+
+# ---- Safe zone UI (WS-C) ----
+PLATFORM_PROFILE = (os.environ.get("PLATFORM_PROFILE", "universal") or "universal").strip().lower()
+SAFE_ZONE_PADDING_PX = _get_int("SAFE_ZONE_PADDING_PX", 24)
+SAFE_ZONE_OVERRIDES_JSON = (os.environ.get("SAFE_ZONE_OVERRIDES_JSON", "") or "").strip()
+SAFE_ZONES_ENABLED = _get_bool("SAFE_ZONES_ENABLED", True)
+
+# ---- Tipografia / leggibilità (WS-D) ----
+# NOTA: i default 84/56 sono applicati qui (era 60/40).
+TYPOGRAPHY_BASE_FONT_SIZE = _get_int("TYPOGRAPHY_BASE_FONT_SIZE", 84)
+LAYOUT_MIN_FONT_PX = _get_int("LAYOUT_MIN_FONT_PX", 56)
+LEGIBILITY_MODE = (os.environ.get("LEGIBILITY_MODE", "auto") or "auto").strip().lower()
+LEGIBILITY_FORCE_LEVEL = (os.environ.get("LEGIBILITY_FORCE_LEVEL", "") or "").strip()
+LEGIBILITY_SCRIM = _get_bool("LEGIBILITY_SCRIM", True)
+LEGIBILITY_ALLOW_COLOR_FLIP = _get_bool("LEGIBILITY_ALLOW_COLOR_FLIP", False)
+LEGIBILITY_ENABLED = _get_bool("LEGIBILITY_ENABLED", True)
+
+# ---- Export video (WS-E) ----
+EXPORT_QUALITY = (os.environ.get("EXPORT_QUALITY", "final") or "final").strip().lower()
+EXPORT_CRF = _get_int("EXPORT_CRF", 17)
+EXPORT_PRESET = (os.environ.get("EXPORT_PRESET", "") or "").strip()
+EXPORT_PROFILE = (os.environ.get("EXPORT_PROFILE", "high") or "high").strip()
+EXPORT_LEVEL = (os.environ.get("EXPORT_LEVEL", "4.2") or "4.2").strip()
+EXPORT_MAXRATE = (os.environ.get("EXPORT_MAXRATE", "16M") or "16M").strip()
+EXPORT_BUFSIZE = (os.environ.get("EXPORT_BUFSIZE", "32M") or "32M").strip()
+EXPORT_X264_TUNE = (os.environ.get("EXPORT_X264_TUNE", "") or "").strip()
+EXPORT_COLOR_TAGS = _get_bool("EXPORT_COLOR_TAGS", True)
+EXPORT_GRAIN_STRENGTH = _get_int("EXPORT_GRAIN_STRENGTH", 5)
+EXPORT_ENABLED = _get_bool("EXPORT_ENABLED", True)
 
 
 def _mask_secret(value: str) -> str:
