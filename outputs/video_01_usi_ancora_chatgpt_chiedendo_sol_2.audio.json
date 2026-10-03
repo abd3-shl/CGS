@@ -1,0 +1,22 @@
+{
+  "track": "the_mind_trap_part_1_ovaffd77a6-fdf.mp3",
+  "category": "dark_motivational",
+  "title": "the_mind_trap_part_1_ovaffd77a6-fdf",
+  "author": "sconosciuto",
+  "license": "sconosciuta",
+  "source_page": "",
+  "attribution_text": "Music: the_mind_trap_part_1_ovaffd77a6-fdf by sconosciuto (sconosciuta)",
+  "final_lufs": -14.01,
+  "true_peak": -1.5,
+  "music_offset_lu": {
+    "hook": -17.0,
+    "body": -20.0,
+    "cta": -18.0
+  },
+  "track_gain_db": -15.15,
+  "pause_count": 1,
+  "hero_count": 1,
+  "fade_in_s": 0.8,
+  "fade_out_s": 1.601,
+  "loop": false
+}
